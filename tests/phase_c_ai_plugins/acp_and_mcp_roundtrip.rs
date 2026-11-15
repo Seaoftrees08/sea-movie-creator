@@ -96,7 +96,7 @@ fn antigravity_plugin_streams_agy_output_and_errors_cleanly_when_missing()
     let provider = registry
         .resolve_provider("sea.ai.antigravity")?
         .with_external_cli(fixture_bin.display().to_string())
-        .with_env("SEA_AI_FIXTURE_MODE", "agy-stream-json");
+        .with_env("SEA_AI_FIXTURE_MODE", "acp-agy-sandbox");
 
     let doc = ProjectDocument::new("Antigravity Test");
     let req = build_ai_request(&doc, FrameIndex::ZERO, None, None, &[], "Add Agy layer")?;

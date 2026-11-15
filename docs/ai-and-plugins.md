@@ -28,8 +28,14 @@ API キーなどの機密情報は **絶対に `.smc.json` プロジェクトフ
 | `Local` | Ollama / LM Studio / vLLM (`OpenAI` 互換) | `http://127.0.0.1:11434/v1` | ローカルサーバーは既定で認証キー任意（必要な場合のみ `OPENAI_API_KEY`） |
 | `Gemini` | Google Gemini REST API | `generativelanguage.googleapis.com` | `GEMINI_API_KEY` |
 | `Claude` | Anthropic Messages API | `api.anthropic.com` | `ANTHROPIC_API_KEY` |
-| `Antigravity` | Google Antigravity CLI (`sea.ai.antigravity`) | `agy --print --input-format stream-json --output-format stream-json` | サインイン済み `agy` CLI を `PATH` に配置、または `SEA_ANTIGRAVITY_CLI` で実行ファイルパスを指定 |
+| `Antigravity` | Google Antigravity CLI (`sea.ai.antigravity`) | `agy acp --sandbox --stdio` | 公式外部エディタ向け ACP プロトコル使用。先に `agy`（または `agy acp --login`）でサインインし `PATH` を通す（パス上書きは `SEA_ANTIGRAVITY_CLI`）。※ 安全注意事項は下記参照 |
 | `ACP CLI` | 外部エージェント (`sea.ai.acp` / ACP over stdio) | `claude` / `codex` / `copilot` | 各公式 CLI が内部で使用するプロファイルに従います。CLI パスは `SEA_ACP_CMD`、引数は `SEA_ACP_ARGS` で上書き可能 |
+
+> [!WARNING]
+> **Antigravity (`agy acp`) 利用時の利用規約・アカウント保護に関する注意**
+> - 本アプリの `sea-ai-antigravity` は OAuth トークンの抜き取りや非公開 API 直叩きを一切行わず、Google Antigravity が外部エディタ統合用として公式提供する **`agy acp --sandbox --stdio`**（一時サンドボックスディレクトリ・ツール権限拒否構成）のみを呼び出します。
+> - ただし Google Antigravity 利用規約（Section 6 等）は不正アクセスや過剰な自動リクエストを禁止しているため、短時間の連続送信やスクリプトによる自動ループ利用は、誤検知を含めアカウント側（Antigravity / Gemini CLI / Gemini Code Assist 共通）の `403` 利用制限につながるリスクをゼロにできません。
+> - アプリ内の日常的・高頻度な AI 編集支援には **Google AI Studio / Vertex AI の `GEMINI_API_KEY`（`Gemini` ボタン）** または **ローカル LLM（`Local` ボタン）** の利用を推奨します。また、普段お使いの Antigravity IDE / CLI 側から本アプリの MCP サーバー（`sea-movie-creator mcp --project ...`）へ接続する構成も安全に利用できます。
 
 > [!TIP]
 > **Windows PowerShell での環境変数設定例（起動前の一時設定）:**

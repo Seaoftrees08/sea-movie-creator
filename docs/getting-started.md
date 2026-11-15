@@ -18,7 +18,7 @@
 ├── sea-export-h265.exe          # 書き出しプラグイン: H.265 (OS HW HEVC / 外部 ffmpeg)
 ├── sea-audio-host.exe           # 音声プラグイン隔離ホスト (VST3 / CLAP)
 ├── sea-ai-acp.exe               # AI CLI プラグイン: ACP Stdio (Claude / Codex / Copilot)
-├── sea-ai-antigravity.exe       # AI CLI プラグイン: Antigravity CLI (agy)
+├── sea-ai-antigravity.exe       # AI CLI プラグイン: Antigravity 公式 ACP (agy acp --sandbox)
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
 └── plugins/

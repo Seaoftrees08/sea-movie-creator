@@ -433,6 +433,15 @@ fn format_ai_error(err: &AiError) -> String {
     err.to_string()
 }
 
+fn provider_safety_notice(provider: &AiProviderKind) -> Option<&'static str> {
+    match provider {
+        AiProviderKind::Plugin { plugin_id } if plugin_id == "sea.ai.antigravity" => Some(
+            "注意: 公式 agy acp (--sandbox) で実行します。高頻度な連続送信・自動実行はアカウント制限の対象となる恐れがあるため、高頻度用途では Gemini API キー方式をご検討ください。",
+        ),
+        _ => None,
+    }
+}
+
 struct FailedPluginProvider {
     id: String,
     message: String,
@@ -485,8 +494,19 @@ pub fn render_ai_chat_panel(
                 .text_color(theme.muted_foreground)
                 .child(format!("Model: {}", chat.model_name))
                 .child(cred_label),
-        )
-        .child(render_thread_box(chat, cx));
+        );
+    if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
+        panel = panel.child(
+            div()
+                .p_2()
+                .border_1()
+                .border_color(theme.border)
+                .rounded_md()
+                .text_color(theme.muted_foreground)
+                .child(notice),
+        );
+    }
+    panel = panel.child(render_thread_box(chat, cx));
 
     if let Some(proposal) = &chat.pending_proposal {
         panel = panel.child(render_diff_card(proposal, cx));
@@ -680,4 +700,21 @@ fn render_prompt_bar(
                     cx.notify();
                 })),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_safety_notice;
+    use crate::ai::provider::AiProviderKind;
+
+    #[test]
+    fn antigravity_provider_exposes_safety_notice() {
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        let notice = provider_safety_notice(&agy);
+        assert!(notice.is_some());
+        assert!(notice.is_some_and(|text| text.contains("agy acp") && text.contains("Gemini")));
+        assert_eq!(provider_safety_notice(&AiProviderKind::Gemini), None);
+    }
 }

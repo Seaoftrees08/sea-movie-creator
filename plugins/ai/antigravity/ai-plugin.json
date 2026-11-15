@@ -10,9 +10,9 @@
   "profiles": [
     {
       "id": "agy-default",
-      "label": "Antigravity Headless Stream-JSON",
+      "label": "Antigravity Official ACP (--sandbox)",
       "cli": "agy",
-      "args": []
+      "args": ["acp", "--sandbox", "--stdio"]
     }
   ]
 }

@@ -49,9 +49,10 @@
   - それぞれ `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY` を起動前シェルで設定するか、OS 資格情報ストアに登録してください（[AI 連携・MCP ガイド](ai-and-plugins.md) 参照）。
 - **`Local` (Ollama / LM Studio / vLLM)**:
   - 既定では `http://127.0.0.1:11434/v1` に接続します。ローカル LLM サーバーが起動しているか確認してください。
-- **`Antigravity` (`agy`) / `ACP CLI`**:
-  - `agy`, `claude`, `codex`, `copilot` 等の外部公式 CLI をあらかじめインストールし、各自の公式手順でサインインを完了した状態で `PATH` を通してください（本ソフト側でログインや認証バイパスは行いません）。
+- **`Antigravity` (`agy acp --sandbox`) / `ACP CLI`**:
+  - `agy`, `claude`, `codex`, `copilot` 等の外部公式 CLI をあらかじめインストールし、各自の公式手順（`Antigravity` の場合は `agy acp --login` 等）でサインインを完了した状態で `PATH` を通してください（本ソフト側でログインや OAuth トークン取得は行いません）。
   - 実行コマンドパスを明示したい場合は `SEA_ANTIGRAVITY_CLI` / `SEA_ACP_CMD` を設定してください。
+  - `Antigravity` タブは公式の `agy acp --sandbox --stdio` を呼び出しますが、過度な連続送信による利用制限リスクを避けたい場合は `Gemini` タブ（`GEMINI_API_KEY`）または `Local`（Ollama）をご利用ください。
 
 ---
 

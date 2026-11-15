@@ -1,41 +1,44 @@
-//! `sea-movie-creator` 用 Google Antigravity (`agy --print stream-json`) ヘッドレス CLI アダプタプラグイン。
+//! `sea-movie-creator` 用 Google Antigravity (`agy acp --sandbox --stdio`) 公式 ACP アダプタプラグイン。
 //!
-//! 認証バイパス・内部トークン読み取り等は一切行わず、公式 `agy` CLI バイナリの標準入出力を呼び出します。
+//! 認証バイパス・OAuth トークン読み取り・内部エンドポイント直叩きは一切行わず、
+//! 公式 `agy` CLI が提供する外部エディタ向け ACP (Agent Client Protocol) サーバーを
+//! `--sandbox`＋空の一時作業ディレクトリで起動して JSON-RPC 通信を行います。
 
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-const INLINE_SCHEMA_LIMIT_BYTES: usize = 2048;
-static SCHEMA_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempSchemaFile(Option<PathBuf>);
-
-impl Drop for TempSchemaFile {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-fn prepare_schema_arg(schema_str: &str) -> Result<(String, TempSchemaFile), String> {
-    if schema_str.len() <= INLINE_SCHEMA_LIMIT_BYTES {
-        return Ok((schema_str.to_owned(), TempSchemaFile(None)));
-    }
-    let seq = SCHEMA_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = env::temp_dir().join(format!("sea_agy_schema_{}_{seq}.json", std::process::id()));
-    fs::write(&path, schema_str.as_bytes())
-        .map_err(|err| format!("一時 JSON Schema ファイル作成に失敗しました: {err}"))?;
-    let arg = path.to_string_lossy().into_owned();
-    Ok((arg, TempSchemaFile(Some(path))))
-}
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+static SANDBOX_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempSandboxDir {
+    path: PathBuf,
+}
+
+impl TempSandboxDir {
+    fn create() -> Result<Self, String> {
+        let seq = SANDBOX_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("sea_agy_acp_{}_{seq}", std::process::id()));
+        fs::create_dir_all(&path)
+            .map_err(|err| format!("一時サンドボックスディレクトリ作成失敗: {err}"))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSandboxDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct RequestEnvelope {
@@ -64,19 +67,23 @@ fn emit_event(event: &Value) {
     }
 }
 
-fn build_agy_command_args(schema_json_str: &str, model: Option<&str>) -> Vec<String> {
+fn normalize_requested_model(model: Option<&str>) -> Option<&str> {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "plugin-default")
+}
+
+fn build_agy_acp_args(external_args: &[String]) -> Vec<String> {
     let mut args = vec![
-        "--print".to_owned(),
-        "--input-format".to_owned(),
-        "stream-json".to_owned(),
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-        "--json-schema".to_owned(),
-        schema_json_str.to_owned(),
+        "acp".to_owned(),
+        "--sandbox".to_owned(),
+        "--stdio".to_owned(),
     ];
-    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        args.push("--model".to_owned());
-        args.push(m.to_owned());
+    for extra in external_args {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            args.push(trimmed.to_owned());
+        }
     }
     args
 }
@@ -121,39 +128,266 @@ fn resolve_agy_cli(override_cli: Option<&str>) -> Result<PathBuf, String> {
     }
     resolve_executable_in_path("agy").ok_or_else(|| {
         "Antigravity CLI (`agy`) が PATH 上に見つかりませんでした。\
-         Antigravity をインストールし `agy` にサインインした状態で PATH を設定してください。"
+         Antigravity をインストールし `agy acp --login` 等でサインインした状態で PATH を設定してください。"
             .to_owned()
     })
 }
 
-fn parse_agy_stream_json_line(trimmed: &str) -> Result<(Option<String>, Option<String>), String> {
-    let val: Value = serde_json::from_str(trimmed)
-        .map_err(|err| format!("`agy` stream-json 解析エラー: {err}"))?;
-    if let Some(delta) = val["delta"]["text"].as_str() {
-        return Ok((Some(delta.to_owned()), None));
+fn build_initialize_request(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {
+                "name": "sea-movie-creator",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    })
+}
+
+fn build_session_new_request(id: u64, sandbox_cwd: &Path) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/new",
+        "params": {
+            "cwd": sandbox_cwd.display().to_string(),
+            "mcpServers": []
+        }
+    })
+}
+
+fn session_supports_model_config(session_resp: &Value) -> bool {
+    session_resp["result"]["configOptions"]
+        .as_array()
+        .is_some_and(|opts| opts.iter().any(|opt| opt["id"].as_str() == Some("model")))
+}
+
+fn build_set_model_config_request(id: u64, session_id: &str, model_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": "model",
+            "value": model_id,
+        }
+    })
+}
+
+fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) -> Value {
+    let prompt_text = format!(
+        "{}\n\n# Sandbox Constraints\n\
+         Do NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.\n\
+         Respond ONLY with valid JSON matching the EditCommand schema below.\n\n\
+         # EditCommand JSON Schema\n{}\n\n\
+         # Timeline Context\n{}\n\n\
+         # Instruction\n{}",
+        params.system_prompt,
+        params.command_schema_json,
+        params.context_summary,
+        params.user_prompt
+    );
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt_text }]
+        }
+    })
+}
+
+fn extract_acp_message_delta(msg: &Value) -> Option<String> {
+    if msg["method"].as_str() != Some("session/update") {
+        return None;
     }
-    if val["type"].as_str() == Some("assistant")
-        && let Some(content) = val["message"]["content"].as_array()
+    let params = &msg["params"];
+    let update = params.get("update").unwrap_or(params);
+    if let Some(kind) = update["sessionUpdate"].as_str()
+        && kind != "agent_message_chunk"
     {
+        return None;
+    }
+    update["content"]["text"]
+        .as_str()
+        .or_else(|| update["text"].as_str())
+        .or_else(|| update["delta"].as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn build_permission_deny_response(id: &Value, params: &Value) -> Value {
+    let reject_id = params["options"].as_array().and_then(|opts| {
+        opts.iter().find_map(|opt| {
+            let kind = opt["kind"].as_str()?;
+            if kind == "reject_once" || kind == "reject_always" {
+                opt["optionId"].as_str().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+    });
+
+    let outcome = match reject_id {
+        Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
+        None => json!({ "outcome": "cancelled" }),
+    };
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "outcome": outcome }
+    })
+}
+
+fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), String> {
+    let text = serde_json::to_string(payload)
+        .map_err(|err| format!("Antigravity ACP JSON エンコード失敗: {err}"))?;
+    writeln!(stdin, "{text}")
+        .and_then(|()| stdin.flush())
+        .map_err(|err| format!("Antigravity ACP stdin 書き込み失敗: {err}"))
+}
+
+fn handle_server_request(stdin: &mut ChildStdin, msg: &Value) -> Result<bool, String> {
+    let Some(req_id) = msg.get("id").filter(|v| !v.is_null()) else {
+        return Ok(false);
+    };
+    let Some(method) = msg["method"].as_str() else {
+        return Ok(false);
+    };
+
+    let reply = if method == "session/request_permission" {
+        build_permission_deny_response(req_id, &msg["params"])
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32601,
+                "message": "method not supported by sea-movie-creator ACP host"
+            }
+        })
+    };
+    write_jsonrpc_line(stdin, &reply)?;
+    Ok(true)
+}
+
+fn format_acp_rpc_error(err_obj: &Value) -> String {
+    let lower = err_obj.to_string().to_lowercase();
+    if lower.contains("auth") || lower.contains("login") || lower.contains("-32000") {
+        return format!(
+            "Antigravity ACP 認証エラー: {err_obj}（先にターミナルで `agy acp --login` を実行してサインインするか、Gemini API キー方式をご利用ください）"
+        );
+    }
+    format!("Antigravity ACP エラー応答: {err_obj}")
+}
+
+fn read_acp_until_response<R: BufRead>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    expected_id: u64,
+    streamed: &mut String,
+) -> Result<Value, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("Antigravity ACP stdout 読取エラー: {err}"))?;
+        if read == 0 {
+            return Err(format!(
+                "Antigravity ACP (`agy acp`) が id={expected_id} 応答前に終了しました"
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let msg: Value = serde_json::from_str(trimmed)
+            .map_err(|err| format!("Antigravity ACP JSON 解析エラー: {err} (line: {trimmed})"))?;
+
+        if handle_server_request(stdin, &msg)? {
+            continue;
+        }
+        if let Some(chunk) = extract_acp_message_delta(&msg) {
+            streamed.push_str(&chunk);
+            emit_event(&json!({ "event": "delta", "text": chunk }));
+            continue;
+        }
+        if msg["id"].as_u64() == Some(expected_id) {
+            if let Some(err_obj) = msg.get("error").filter(|v| !v.is_null()) {
+                return Err(format_acp_rpc_error(err_obj));
+            }
+            return Ok(msg);
+        }
+    }
+}
+
+fn extract_fallback_result_text(prompt_resp: &Value) -> String {
+    if let Some(text) = prompt_resp["result"]["text"].as_str() {
+        return text.to_owned();
+    }
+    if let Some(items) = prompt_resp["result"]["content"].as_array() {
         let mut buf = String::new();
-        for item in content {
+        for item in items {
             if let Some(text) = item["text"].as_str() {
                 buf.push_str(text);
             }
         }
         if !buf.is_empty() {
-            return Ok((Some(buf), None));
+            return buf;
         }
     }
-    if let Some(text) = val["text"].as_str() {
-        return Ok((Some(text.to_owned()), None));
-    }
-    if val["type"].as_str() == Some("result")
-        && let Some(res) = val["result"].as_str()
+    String::new()
+}
+
+fn execute_acp_conversation(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    stdin: &mut ChildStdin,
+    sandbox_cwd: &Path,
+    params: &CallParams,
+    streamed: &mut String,
+) -> Result<(String, String), String> {
+    write_jsonrpc_line(stdin, &build_initialize_request(1))?;
+    let _init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
+
+    write_jsonrpc_line(stdin, &build_session_new_request(2, sandbox_cwd))?;
+    let session_resp = read_acp_until_response(reader, stdin, 2, streamed)?;
+    let session_id = session_resp["result"]["sessionId"]
+        .as_str()
+        .unwrap_or("default-session")
+        .to_owned();
+
+    let requested_model = normalize_requested_model(params.model.as_deref());
+    let mut next_id = 3_u64;
+    if let Some(model_id) = requested_model
+        && session_supports_model_config(&session_resp)
     {
-        return Ok((None, Some(res.to_owned())));
+        write_jsonrpc_line(
+            stdin,
+            &build_set_model_config_request(next_id, &session_id, model_id),
+        )?;
+        let _cfg_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
+        next_id += 1;
     }
-    Ok((None, None))
+
+    write_jsonrpc_line(
+        stdin,
+        &build_session_prompt_request(next_id, &session_id, params),
+    )?;
+    let prompt_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
+    let active_model = requested_model
+        .or_else(|| session_resp["result"]["models"]["currentModelId"].as_str())
+        .unwrap_or("antigravity")
+        .to_owned();
+
+    Ok((extract_fallback_result_text(&prompt_resp), active_model))
 }
 
 fn run_request(params: &CallParams) -> Result<(), String> {
@@ -166,84 +400,74 @@ fn run_request(params: &CallParams) -> Result<(), String> {
         msg
     })?;
 
-    let schema_str = serde_json::to_string(&params.command_schema_json)
-        .map_err(|err| format!("コマンドスキーマの直列化に失敗しました: {err}"))?;
-    let (schema_arg, _schema_guard) = prepare_schema_arg(&schema_str)?;
-    let mut args = build_agy_command_args(&schema_arg, params.model.as_deref());
-    args.extend(params.external_args.iter().cloned());
+    let sandbox_dir = TempSandboxDir::create()?;
+    let args = build_agy_acp_args(&params.external_args);
 
     emit_event(&json!({
         "event": "status",
-        "message": format!("Antigravity CLI ({}) を起動中...", agy_bin.display()),
+        "message": format!("Antigravity 公式 ACP ({}) に接続中...", agy_bin.display()),
     }));
 
     let mut child = Command::new(&agy_bin)
         .args(&args)
+        .current_dir(sandbox_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("`agy` 起動に失敗しました: {err}"))?;
+        .map_err(|err| format!("`agy acp` 起動に失敗しました: {err}"))?;
 
-    let full_prompt = format!(
-        "{}\n\n# Timeline Context\n{}\n\n# Edit Request\n{}",
-        params.system_prompt, params.context_summary, params.user_prompt
-    );
-    let input_frame = json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [{ "type": "text", "text": full_prompt }]
-        }
-    });
-    if let Some(mut child_stdin) = child.stdin.take() {
-        let encoded = serde_json::to_string(&input_frame)
-            .map_err(|err| format!("`agy` stream-json 入力生成失敗: {err}"))?;
-        writeln!(child_stdin, "{encoded}")
-            .and_then(|()| child_stdin.flush())
-            .map_err(|err| format!("`agy` stdin 書き込み失敗: {err}"))?;
-    }
-
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "`agy acp` stdin パイプ取得失敗".to_owned())?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "`agy` stdout パイプ取得失敗".to_owned())?;
-    let reader = BufReader::new(stdout);
+        .ok_or_else(|| "`agy acp` stdout パイプ取得失敗".to_owned())?;
+    let mut reader = BufReader::new(stdout);
     let mut streamed = String::new();
-    let mut final_result = None;
 
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("`agy` stdout 読取エラー: {err}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (delta_opt, result_opt) = parse_agy_stream_json_line(trimmed)?;
-        if let Some(delta) = delta_opt {
-            streamed.push_str(&delta);
-            emit_event(&json!({ "event": "delta", "text": delta }));
-        }
-        if result_opt.is_some() {
-            final_result = result_opt;
-        }
-    }
+    let conv_res = execute_acp_conversation(
+        &mut reader,
+        &mut child_stdin,
+        sandbox_dir.path(),
+        params,
+        &mut streamed,
+    );
+    drop(child_stdin);
 
     let output = child
         .wait_with_output()
-        .map_err(|err| format!("`agy` 終了待機エラー: {err}"))?;
+        .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+
+    let (fallback_text, active_model) = match conv_res {
+        Ok(res) => res,
+        Err(err) => {
+            if stderr.is_empty() {
+                return Err(err);
+            }
+            return Err(format!("{err} ({stderr})"));
+        }
+    };
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!(
-            "`agy` が終了コード {} で失敗しました: {stderr}",
+            "`agy acp` が終了コード {} で失敗しました: {stderr}",
             output.status
         ));
     }
 
-    let chosen = final_result.unwrap_or(streamed);
+    let raw_text = if streamed.is_empty() {
+        fallback_text
+    } else {
+        streamed
+    };
     emit_event(&json!({
         "event": "completed",
-        "raw_text": chosen,
-        "model": params.model.clone().unwrap_or_else(|| "antigravity".to_owned()),
+        "raw_text": raw_text,
+        "model": format!("antigravity:{active_model}"),
     }));
     Ok(())
 }
@@ -278,48 +502,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_agy_command_args_includes_stream_json_and_schema() {
-        let args = build_agy_command_args(r#"{"title":"EditCommand"}"#, Some("gemini-2.5-pro"));
-        assert_eq!(args[0], "--print");
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--input-format", "stream-json"])
+    fn build_agy_acp_args_uses_official_acp_sandbox_stdio() {
+        let args = build_agy_acp_args(&["--disable-telemetry".to_owned(), "  ".to_owned()]);
+        assert_eq!(
+            args,
+            vec!["acp", "--sandbox", "--stdio", "--disable-telemetry"]
         );
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--output-format", "stream-json"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--json-schema", r#"{"title":"EditCommand"}"#])
-        );
-        assert!(args.windows(2).any(|w| w == ["--model", "gemini-2.5-pro"]));
+        assert!(!args.iter().any(|a| a == "--print" || a == "-p"));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]
-    fn parse_agy_stream_json_line_handles_delta_and_result() -> Result<(), String> {
-        let (d1, r1) = parse_agy_stream_json_line(
-            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\"type\":"}}"#,
-        )?;
-        assert_eq!(d1.as_deref(), Some("{\"type\":"));
-        assert!(r1.is_none());
-
-        let (d2, r2) =
-            parse_agy_stream_json_line(r#"{"type":"result","result":"{\"type\":\"undo\"}"}"#)?;
-        assert!(d2.is_none());
-        assert_eq!(r2.as_deref(), Some("{\"type\":\"undo\"}"));
-        Ok(())
+    fn normalize_requested_model_skips_plugin_default() {
+        assert_eq!(normalize_requested_model(None), None);
+        assert_eq!(normalize_requested_model(Some("   ")), None);
+        assert_eq!(normalize_requested_model(Some("plugin-default")), None);
+        assert_eq!(
+            normalize_requested_model(Some(" gemini-4-argon ")),
+            Some("gemini-4-argon")
+        );
     }
 
     #[test]
-    fn prepare_schema_arg_spills_large_schema_to_temp_file_and_cleans_up() -> Result<(), String> {
-        let large = "x".repeat(INLINE_SCHEMA_LIMIT_BYTES + 256);
-        let (arg, guard) = prepare_schema_arg(&large)?;
-        let path = PathBuf::from(&arg);
-        assert!(path.is_file());
-        assert_eq!(fs::read_to_string(&path).map_err(|e| e.to_string())?, large);
-        drop(guard);
-        assert!(!path.exists());
-        Ok(())
+    fn extract_acp_message_delta_ignores_thoughts_and_tool_calls() {
+        let thought = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking not json {" }
+                }
+            }
+        });
+        assert_eq!(extract_acp_message_delta(&thought), None);
+
+        let tool_call = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "content": { "type": "text", "text": "running tool" }
+                }
+            }
+        });
+        assert_eq!(extract_acp_message_delta(&tool_call), None);
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "{\"type\":\"undo\"}" }
+                }
+            }
+        });
+        assert_eq!(
+            extract_acp_message_delta(&message).as_deref(),
+            Some("{\"type\":\"undo\"}")
+        );
+    }
+
+    #[test]
+    fn build_permission_deny_response_prefers_reject_option_and_falls_back_to_cancelled() {
+        let with_reject = build_permission_deny_response(
+            &json!(99),
+            &json!({
+                "options": [
+                    { "optionId": "allow_once", "kind": "allow_once" },
+                    { "optionId": "reject_once", "kind": "reject_once" }
+                ]
+            }),
+        );
+        assert_eq!(with_reject["id"], json!(99));
+        assert_eq!(
+            with_reject["result"]["outcome"],
+            json!({ "outcome": "selected", "optionId": "reject_once" })
+        );
+
+        let fallback = build_permission_deny_response(&json!("req-2"), &json!({ "options": [] }));
+        assert_eq!(fallback["id"], json!("req-2"));
+        assert_eq!(
+            fallback["result"]["outcome"],
+            json!({ "outcome": "cancelled" })
+        );
     }
 }
