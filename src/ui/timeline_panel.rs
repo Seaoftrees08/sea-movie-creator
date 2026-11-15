@@ -6,13 +6,13 @@ use gpui_kit::component::{
     ActiveTheme as _, VirtualListScrollHandle, h_flex, v_flex, v_virtual_list,
 };
 use gpui_kit::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, Pixels, Size, Styled as _, div, px, rgba, size,
+    AnyElement, Context, ExternalPaths, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Size, Styled as _,
+    Window, div, px, rgba, size,
 };
 
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::{MouseMoveEvent, MouseUpEvent};
 
 use crate::core::ids::ClipId;
 use crate::core::time::{FrameCount, FrameIndex};
@@ -26,7 +26,7 @@ use crate::ui::window::SeaEditorWindow;
 const TRACK_HEADER_WIDTH: f32 = 136.0;
 const TRACK_ROW_HEIGHT: f32 = 44.0;
 
-/// 下部タイムライン領域（ルーラー＋仮想スクロールトラック＋再生ヘッド）を描画する。
+/// 下部タイムライン領域（ルーラー＋仮想スクロールトラック＋再生ヘッド＋外部ファイルドロップ）を描画する。
 pub fn render_timeline_panel(
     controller: &AppController,
     scroll_handle: &VirtualListScrollHandle,
@@ -43,14 +43,72 @@ pub fn render_timeline_panel(
         .bg(theme.background)
         .border_t_1()
         .border_color(theme.border)
+        .drag_over::<ExternalPaths>(|style, _, _, _| {
+            style
+                .bg(rgba(0x0f17_2a33))
+                .border_1()
+                .border_color(rgba(0x38bd_f899))
+        })
+        .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+            handle_timeline_file_drop(this, paths, None, window, cx);
+        }))
         .child(render_timeline_ruler(controller, cx))
         .child(render_track_area(
+            controller,
             layer_count,
             view_entity,
             scroll_handle,
             item_sizes,
             cx,
         ))
+}
+
+/// ウィンドウ座標 `X` からタイムラインレーン上のドロップ先フレーム位置を算出する。
+///
+/// 左端トラックヘッダ領域 (`x < TRACK_HEADER_WIDTH`) 上に落とされた場合は `None` を返し、
+/// 呼び出し側で対象トラック末尾への追加として扱えるようにする。
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn frame_at_timeline_window_x(
+    window_x: f32,
+    scroll_x_frames: u64,
+    px_per_frame: f32,
+) -> Option<FrameIndex> {
+    if window_x < TRACK_HEADER_WIDTH {
+        return None;
+    }
+    let local_x = window_x - TRACK_HEADER_WIDTH;
+    let safe_ppf = px_per_frame.max(0.5);
+    let delta = (local_x / safe_ppf).round() as u64;
+    Some(FrameIndex::new(scroll_x_frames.saturating_add(delta)))
+}
+
+fn handle_timeline_file_drop(
+    view: &mut SeaEditorWindow,
+    paths: &ExternalPaths,
+    target_layer: Option<&crate::core::ids::LayerId>,
+    window: &mut Window,
+    cx: &mut Context<SeaEditorWindow>,
+) {
+    let cursor_x = f32::from(window.mouse_position().x);
+    let drop_frame = frame_at_timeline_window_x(
+        cursor_x,
+        view.controller.timeline_scroll_x_frames,
+        view.controller.timeline_px_per_frame,
+    );
+    match view
+        .controller
+        .import_media_files_at_drop(paths.paths(), target_layer, drop_frame)
+    {
+        Ok(_) => {
+            view.controller.inspector.invalidate_sync();
+            view.sync_sliders_now(window, cx);
+        }
+        Err(err) => {
+            view.controller.status_message = format!("ドロップ追加失敗: {err}");
+        }
+    }
+    cx.notify();
 }
 
 fn render_timeline_ruler(
@@ -329,6 +387,7 @@ impl TimelineDragState {
 }
 
 fn render_track_area(
+    controller: &AppController,
     layer_count: usize,
     view_entity: gpui_kit::Entity<SeaEditorWindow>,
     scroll_handle: &VirtualListScrollHandle,
@@ -340,7 +399,7 @@ fn render_track_area(
         return v_flex()
             .flex_1()
             .w_full()
-            .child(render_timeline_toolbar(cx))
+            .child(render_timeline_toolbar(controller, cx))
             .child(
                 div()
                     .flex_1()
@@ -350,7 +409,7 @@ fn render_track_area(
                     .justify_center()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("タイムラインは空です。「ファイル > メディアを読み込む...」から素材を追加できます。"),
+                    .child("タイムラインは空です。「ファイル > メディアを読み込む...」またはここへドラッグ＆ドロップで素材を追加できます。"),
             )
             .into_any_element();
     }
@@ -392,7 +451,7 @@ fn render_track_area(
                 }
             }),
         )
-        .child(render_timeline_toolbar(cx))
+        .child(render_timeline_toolbar(controller, cx))
         .child(
             div().flex_1().w_full().overflow_hidden().child(
                 v_virtual_list(
@@ -411,12 +470,29 @@ fn render_track_area(
         .into_any_element()
 }
 
-fn render_timeline_toolbar(cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
+fn render_timeline_toolbar(
+    controller: &AppController,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
     let theme = cx.theme().clone();
+    let msg = controller.status_message.as_str();
+    let (status_text, status_color) = if msg.starts_with("ドロップ") || msg.starts_with("編集制約")
+    {
+        (msg.to_owned(), theme.danger)
+    } else if msg.contains("素材を追加") || msg.contains("タイムラインに追加") {
+        (msg.to_owned(), theme.foreground)
+    } else {
+        (
+            "ファイル D&D で素材追加可".to_owned(),
+            theme.muted_foreground,
+        )
+    };
+
     h_flex()
         .px_2()
         .py_1()
         .gap_1()
+        .items_center()
         .border_b_1()
         .border_color(theme.border)
         .text_xs()
@@ -470,6 +546,8 @@ fn render_timeline_toolbar(cx: &mut Context<SeaEditorWindow>) -> impl IntoElemen
             this.sync_sliders_now(window, cx);
             cx.notify();
         }))
+        .child(div().flex_1())
+        .child(div().text_color(status_color).child(status_text))
 }
 
 fn toolbar_btn(
@@ -548,12 +626,24 @@ fn render_track_row(
         );
     }
 
+    let target_layer_id = layer.id.clone();
     Some(
         h_flex()
             .h(px(TRACK_ROW_HEIGHT))
             .w_full()
             .border_b_1()
             .border_color(border_color)
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style
+                    .bg(rgba(0x1d4e_d833))
+                    .border_1()
+                    .border_color(rgba(0x38bd_f8ee))
+            })
+            .on_drop::<ExternalPaths>(cx.listener(
+                move |this, paths: &ExternalPaths, window, cx| {
+                    handle_timeline_file_drop(this, paths, Some(&target_layer_id), window, cx);
+                },
+            ))
             .child(track_row_header(layer, border_color, fg_color))
             .child(lane)
             .into_any_element(),
@@ -847,5 +937,19 @@ mod tests {
             .map_err(std::io::Error::other)?;
         assert_eq!(controller.document.layers[1].clips[0].duration.get(), 50);
         Ok(())
+    }
+
+    #[test]
+    fn frame_at_timeline_window_x_handles_header_scroll_and_zoom() {
+        assert_eq!(frame_at_timeline_window_x(0.0, 0, 2.0), None);
+        assert_eq!(frame_at_timeline_window_x(135.9, 100, 2.0), None);
+        assert_eq!(
+            frame_at_timeline_window_x(TRACK_HEADER_WIDTH, 100, 2.0),
+            Some(FrameIndex::new(100))
+        );
+        assert_eq!(
+            frame_at_timeline_window_x(TRACK_HEADER_WIDTH + 60.0, 120, 2.0),
+            Some(FrameIndex::new(150))
+        );
     }
 }

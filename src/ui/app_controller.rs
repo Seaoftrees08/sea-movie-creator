@@ -311,72 +311,145 @@ impl AppController {
     ///
     /// ファイルが存在しない・未対応形式・コマンド実行エラー時。
     pub fn import_media_file(&mut self, path: &Path) -> Result<AssetId, String> {
-        if !path.exists() {
-            return Err(format!("ファイルが見つかりません: {}", path.display()));
+        let mut ids = self.import_media_files_at_drop(&[path.to_path_buf()], None, None)?;
+        ids.pop()
+            .ok_or_else(|| "取り込みアセット ID が生成されませんでした".to_owned())
+    }
+
+    /// タイムラインへのドラッグ＆ドロップで複数メディアファイルを取り込み、指定トラック・開始位置へ配置する。
+    ///
+    /// - `target_layer_id` が `None` の場合は選択中または先頭レイヤーへ配置し、レイヤーが空なら `Track 1` を同時生成します。
+    /// - `requested_start` が `None` の場合は対象レイヤー末尾へ追加し、`Some(frame)` の場合はスナップ判定のうえ
+    ///   既存クリップと衝突しない最初の空き区間へ順に配置します。
+    /// - 成功した全ファイルは 1 つの `EditCommand::Batch` として実行されるため、1 回の Undo で取り消せます。
+    ///
+    /// # Errors
+    ///
+    /// 指定レイヤーがロック中・存在しない場合、または有効なメディアファイルが 1 件も無い場合。
+    pub fn import_media_files_at_drop(
+        &mut self,
+        paths: &[PathBuf],
+        target_layer_id: Option<&LayerId>,
+        requested_start: Option<FrameIndex>,
+    ) -> Result<Vec<AssetId>, String> {
+        if paths.is_empty() {
+            return Err("ドロップされたファイルがありません".to_owned());
         }
-        let kind_category = classify_extension(path);
-        let project_dir = self
-            .project_path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty());
-        let asset_path = build_asset_path(path, project_dir);
-        let display_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Media")
-            .to_owned();
 
-        let (asset_kind, clip_frames, clip_kind) = match kind_category {
-            MediaExtensionKind::Image => self.prepare_image_import(path)?,
-            MediaExtensionKind::Audio => self.prepare_audio_import(path)?,
-            MediaExtensionKind::Video => self.prepare_video_import(path)?,
-        };
-
-        let asset_id = self.allocate_asset_id()?;
-        let layer_id = self.ensure_target_layer_id()?;
-        let start_frame = FrameIndex::new(self.layer_end_frame(&layer_id));
-
-        let clip_kind_cmd = build_new_clip_kind(&asset_id, clip_kind);
-        let cmd = EditCommand::Batch {
-            commands: vec![
-                EditCommand::AddAsset {
-                    temp_id: None,
-                    id: Some(asset_id.clone()),
-                    name: display_name.clone(),
-                    path: asset_path,
-                    kind: asset_kind,
-                },
-                EditCommand::AddClip {
-                    temp_id: Some("imported_clip".to_owned()),
-                    id: None,
-                    layer_id: LayerRef::Id(layer_id.clone()),
-                    clip: Box::new(NewClipSpec {
-                        name: display_name.clone(),
-                        timeline_start: start_frame,
-                        duration: clip_frames,
-                        effect_offset_frames: 0,
-                        effect_duration_frames: None,
-                        kind: clip_kind_cmd,
-                    }),
-                },
-            ],
-        };
+        let (prepared, skipped_errors) = self.prepare_media_import_batch(paths)?;
+        let (layer_id, new_layer_cmd) = self.resolve_drop_target_layer(target_layer_id)?;
+        let cursor_frame = self.resolve_drop_start_frame(&layer_id, requested_start);
+        let (cmd, planned_assets) =
+            self.build_drop_import_batch(&layer_id, new_layer_cmd, cursor_frame, &prepared)?;
 
         let report = self
             .dispatcher
             .dispatch(&mut self.document, &cmd)
             .map_err(|err| err.to_string())?;
-        self.register_decoded_resources_for_asset(&asset_id, path, kind_category);
+
+        for (asset_id, item) in planned_assets.iter().zip(&prepared) {
+            self.register_decoded_resources_for_asset(asset_id, &item.source_path, item.ext_kind);
+        }
         self.selected_layer_id = Some(layer_id);
-        if let Some(new_clip) = report.created_clips.get("imported_clip") {
+        let last_key = format!("imported_clip_{}", prepared.len().saturating_sub(1));
+        if let Some(new_clip) = report.created_clips.get(&last_key) {
             self.selected_clip_id = Some(new_clip.clone());
         }
         self.sync_shared_state();
         self.dirty_preview = true;
         self.refresh_preview_now();
-        self.status_message = format!("素材を追加しました: {display_name}");
-        Ok(asset_id)
+        self.status_message = format_drop_import_status(&prepared, &skipped_errors);
+        Ok(planned_assets)
+    }
+
+    fn prepare_media_import_batch(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<(Vec<PreparedMediaImport>, Vec<String>), String> {
+        let mut prepared = Vec::with_capacity(paths.len());
+        let mut skipped_errors = Vec::new();
+        for path in paths {
+            match self.prepare_media_import(path) {
+                Ok(item) => prepared.push(item),
+                Err(err) => skipped_errors.push(err),
+            }
+        }
+        if prepared.is_empty() {
+            let detail = skipped_errors.into_iter().next().unwrap_or_else(|| {
+                "対応している動画・音声・静止画ファイルが見つかりません".to_owned()
+            });
+            return Err(detail);
+        }
+        Ok((prepared, skipped_errors))
+    }
+
+    fn resolve_drop_start_frame(
+        &self,
+        layer_id: &LayerId,
+        requested_start: Option<FrameIndex>,
+    ) -> u64 {
+        let Some(frame) = requested_start else {
+            return self.layer_end_frame(layer_id);
+        };
+        let raw = frame.get();
+        if !self.snap_config.enabled {
+            return raw;
+        }
+        let anchors = crate::timeline::snap::collect_snap_anchors(
+            &self.document,
+            self.clock.current_frame(),
+            &[],
+            &self.snap_config,
+        );
+        crate::timeline::snap::snap_frame_edge(raw, &anchors, self.snap_config.threshold_frames)
+            .map_or(raw, |hit| hit.frame)
+    }
+
+    fn build_drop_import_batch(
+        &mut self,
+        layer_id: &LayerId,
+        new_layer_cmd: Option<EditCommand>,
+        mut cursor_frame: u64,
+        prepared: &[PreparedMediaImport],
+    ) -> Result<(EditCommand, Vec<AssetId>), String> {
+        let mut occupied = self.collect_layer_intervals(layer_id);
+        let mut commands =
+            Vec::with_capacity(prepared.len() * 2 + usize::from(new_layer_cmd.is_some()));
+        if let Some(add_layer) = new_layer_cmd {
+            commands.push(add_layer);
+        }
+
+        let mut planned_assets = Vec::with_capacity(prepared.len());
+        for (idx, item) in prepared.iter().enumerate() {
+            let asset_id = self.allocate_asset_id()?;
+            let dur_frames = item.clip_frames.get();
+            let start = find_free_interval_start(&occupied, cursor_frame, dur_frames);
+            occupied.push((start, start.saturating_add(dur_frames)));
+            cursor_frame = start.saturating_add(dur_frames);
+
+            commands.push(EditCommand::AddAsset {
+                temp_id: None,
+                id: Some(asset_id.clone()),
+                name: item.display_name.clone(),
+                path: item.asset_path.clone(),
+                kind: item.asset_kind.clone(),
+            });
+            commands.push(EditCommand::AddClip {
+                temp_id: Some(format!("imported_clip_{idx}")),
+                id: None,
+                layer_id: LayerRef::Id(layer_id.clone()),
+                clip: Box::new(NewClipSpec {
+                    name: item.display_name.clone(),
+                    timeline_start: FrameIndex::new(start),
+                    duration: item.clip_frames,
+                    effect_offset_frames: 0,
+                    effect_duration_frames: None,
+                    kind: build_new_clip_kind(&asset_id, item.clip_kind),
+                }),
+            });
+            planned_assets.push(asset_id);
+        }
+        Ok((EditCommand::Batch { commands }, planned_assets))
     }
 
     /// テストおよび欠損リカバリ検証向けに、`AssetStatus::Missing` の動画クリップを配置する。
@@ -934,6 +1007,106 @@ impl AppController {
         }
     }
 
+    fn allocate_layer_id(&mut self) -> Result<LayerId, String> {
+        loop {
+            let candidate = LayerId::new(format!("layer-{}", self.next_seq()))
+                .map_err(|err| err.to_string())?;
+            if self.document.find_layer(&candidate).is_none() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    fn resolve_drop_target_layer(
+        &mut self,
+        requested: Option<&LayerId>,
+    ) -> Result<(LayerId, Option<EditCommand>), String> {
+        if let Some(lid) = requested {
+            let layer = self
+                .document
+                .find_layer(lid)
+                .ok_or_else(|| format!("指定レイヤー `{lid}` が見つかりません"))?;
+            if layer.locked {
+                return Err(format!("トラック `{}` はロックされています", layer.name));
+            }
+            return Ok((lid.clone(), None));
+        }
+        if let Some(lid) = &self.selected_layer_id
+            && self.document.find_layer(lid).is_some_and(|l| !l.locked)
+        {
+            return Ok((lid.clone(), None));
+        }
+        if let Some(unlocked) = self.document.layers.iter().find(|l| !l.locked) {
+            return Ok((unlocked.id.clone(), None));
+        }
+        if let Some(first) = self.document.layers.first() {
+            return Err(format!("トラック `{}` はロックされています", first.name));
+        }
+        let new_id = self.allocate_layer_id()?;
+        let add_layer = EditCommand::AddLayer {
+            temp_id: None,
+            id: Some(new_id.clone()),
+            name: "Track 1".to_owned(),
+            insert_index: None,
+        };
+        Ok((new_id, Some(add_layer)))
+    }
+
+    fn collect_layer_intervals(&self, layer_id: &LayerId) -> Vec<(u64, u64)> {
+        self.document
+            .find_layer(layer_id)
+            .map(|layer| {
+                layer
+                    .clips
+                    .iter()
+                    .map(|c| {
+                        let start = c.timeline_start.get();
+                        (start, start.saturating_add(c.duration.get()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn prepare_media_import(&self, path: &Path) -> Result<PreparedMediaImport, String> {
+        if !path.exists() {
+            return Err(format!("ファイルが見つかりません: {}", path.display()));
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "フォルダや特殊ファイルは追加できません: {}",
+                path.display()
+            ));
+        }
+        let ext_kind = classify_extension(path);
+        let project_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty());
+        let asset_path = build_asset_path(path, project_dir);
+        let display_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Media")
+            .to_owned();
+
+        let (asset_kind, clip_frames, clip_kind) = match ext_kind {
+            MediaExtensionKind::Image => self.prepare_image_import(path)?,
+            MediaExtensionKind::Audio => self.prepare_audio_import(path)?,
+            MediaExtensionKind::Video => self.prepare_video_import(path)?,
+        };
+        Ok(PreparedMediaImport {
+            display_name,
+            asset_path,
+            asset_kind,
+            clip_frames,
+            clip_kind,
+            ext_kind,
+            source_path: path.to_path_buf(),
+        })
+    }
+
     fn ensure_target_layer_id(&mut self) -> Result<LayerId, String> {
         if let Some(lid) = &self.selected_layer_id
             && self.document.find_layer(lid).is_some()
@@ -1253,6 +1426,38 @@ enum PreparedClipKind {
     Video { has_audio: bool },
 }
 
+struct PreparedMediaImport {
+    display_name: String,
+    asset_path: AssetPath,
+    asset_kind: AssetKind,
+    clip_frames: FrameCount,
+    clip_kind: PreparedClipKind,
+    ext_kind: MediaExtensionKind,
+    source_path: PathBuf,
+}
+
+fn find_free_interval_start(
+    occupied: &[(u64, u64)],
+    desired_start: u64,
+    duration_frames: u64,
+) -> u64 {
+    let mut candidate = desired_start;
+    for _ in 0..=occupied.len() {
+        let end = candidate.saturating_add(duration_frames);
+        if let Some((_, ex_end)) = occupied
+            .iter()
+            .copied()
+            .filter(|&(ex_start, ex_end)| candidate < ex_end && ex_start < end)
+            .max_by_key(|&(_, ex_end)| ex_end)
+        {
+            candidate = ex_end.max(candidate.saturating_add(1));
+        } else {
+            return candidate;
+        }
+    }
+    candidate
+}
+
 fn classify_extension(path: &Path) -> MediaExtensionKind {
     let ext = path
         .extension()
@@ -1301,9 +1506,59 @@ fn preview_dimensions(doc: &ProjectDocument) -> (u32, u32) {
     (PREVIEW_CANVAS_MAX_WIDTH, ph)
 }
 
+fn format_drop_import_status(
+    prepared: &[PreparedMediaImport],
+    skipped_errors: &[String],
+) -> String {
+    if prepared.len() == 1 && skipped_errors.is_empty() {
+        format!("素材を追加しました: {}", prepared[0].display_name)
+    } else if skipped_errors.is_empty() {
+        format!("{} 件の素材をタイムラインに追加しました", prepared.len())
+    } else {
+        format!(
+            "{} 件の素材を追加（{} 件スキップ: {}）",
+            prepared.len(),
+            skipped_errors.len(),
+            skipped_errors[0]
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "sea_movie_{prefix}_{}_{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir)?;
+            Ok(Self(dir))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_test_png(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+        img.save(path)?;
+        Ok(())
+    }
 
     #[test]
     fn right_panel_width_uses_one_fifth_default_and_clamps_bounds() {
@@ -1344,6 +1599,135 @@ mod tests {
         controller.stop();
         assert_eq!(controller.playback_state, PlaybackState::Stopped);
         assert_eq!(controller.clock.current_frame(), FrameIndex::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn drop_import_on_empty_timeline_creates_track_and_skips_non_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("dnd_empty")?;
+        let img1 = temp.path().join("clip_a.png");
+        let folder = temp.path().join("not_a_file");
+        write_test_png(&img1)?;
+        std::fs::create_dir_all(&folder)?;
+
+        let mut controller = AppController::new();
+        assert_eq!(controller.document.layers.first(), None);
+
+        let added = controller.import_media_files_at_drop(
+            &[img1, folder],
+            None,
+            Some(FrameIndex::new(30)),
+        )?;
+        assert_eq!(added.len(), 1);
+        assert_eq!(controller.document.layers.len(), 1);
+        assert_eq!(controller.document.layers[0].name, "Track 1");
+        assert_eq!(controller.document.layers[0].clips.len(), 1);
+        assert_eq!(
+            controller.document.layers[0].clips[0].timeline_start,
+            FrameIndex::new(30)
+        );
+        assert!(
+            controller.status_message.contains("スキップ"),
+            "unexpected status_message: {}",
+            controller.status_message
+        );
+
+        assert!(controller.undo()?);
+        assert_eq!(controller.document.layers.first(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn drop_import_multi_collision_snaps_undoes_and_rejects_locked_layer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("dnd_multi")?;
+        let img1 = temp.path().join("clip_a.png");
+        let img2 = temp.path().join("clip_b.png");
+        write_test_png(&img1)?;
+        write_test_png(&img2)?;
+
+        let mut controller = AppController::new();
+        let (_placeholder_asset, _placeholder_clip) =
+            controller.insert_missing_placeholder_clip("Existing", &img1, 60)?;
+        let layer1_id = controller.document.layers[0].id.clone();
+
+        let multi_added = controller.import_media_files_at_drop(
+            &[img1.clone(), img2],
+            Some(&layer1_id),
+            Some(FrameIndex::new(20)),
+        )?;
+        assert_eq!(multi_added.len(), 2);
+        let layer1 = controller
+            .document
+            .find_layer(&layer1_id)
+            .ok_or("Track 1 missing")?;
+        assert_eq!(layer1.clips.len(), 3);
+        assert_eq!(layer1.clips[1].timeline_start, FrameIndex::new(60));
+        let clip1_end = layer1.clips[1].timeline_start.get() + layer1.clips[1].duration.get();
+        assert_eq!(clip1_end, 360);
+        assert_eq!(layer1.clips[2].timeline_start, FrameIndex::new(360));
+
+        assert!(controller.undo()?);
+        let layer1_after_undo = controller
+            .document
+            .find_layer(&layer1_id)
+            .ok_or("Track 1 missing after undo")?;
+        assert_eq!(layer1_after_undo.clips.len(), 1);
+
+        assert!(controller.redo()?);
+        let layer1_after_redo = controller
+            .document
+            .find_layer(&layer1_id)
+            .ok_or("Track 1 missing after redo")?;
+        assert_eq!(layer1_after_redo.clips.len(), 3);
+        assert_eq!(
+            layer1_after_redo.clips[1].timeline_start,
+            FrameIndex::new(60)
+        );
+        assert_eq!(
+            layer1_after_redo.clips[2].timeline_start,
+            FrameIndex::new(360)
+        );
+
+        let layer2_id = controller.add_empty_layer()?;
+        controller.seek_to_frame(FrameIndex::new(120));
+        controller.snap_config.enabled = true;
+        let snapped_added = controller.import_media_files_at_drop(
+            std::slice::from_ref(&img1),
+            Some(&layer2_id),
+            Some(FrameIndex::new(119)),
+        )?;
+        assert_eq!(snapped_added.len(), 1);
+        let layer2 = controller
+            .document
+            .find_layer(&layer2_id)
+            .ok_or("Track 2 missing")?;
+        assert_eq!(layer2.clips.len(), 1);
+        assert_eq!(layer2.clips[0].timeline_start, FrameIndex::new(120));
+
+        let _ = controller.dispatch_command(&EditCommand::SetLayerFlags {
+            layer_id: LayerRef::Id(layer2_id.clone()),
+            name: None,
+            visible: None,
+            muted: None,
+            locked: Some(true),
+        })?;
+        let locked_res = controller.import_media_files_at_drop(
+            std::slice::from_ref(&img1),
+            Some(&layer2_id),
+            Some(FrameIndex::new(500)),
+        );
+        match locked_res {
+            Ok(_) => return Err("locked layer drop unexpectedly succeeded".into()),
+            Err(err) => assert!(err.contains("ロック"), "unexpected locked err: {err}"),
+        }
+        let layer2_after_locked = controller
+            .document
+            .find_layer(&layer2_id)
+            .ok_or("Track 2 missing after locked drop")?;
+        assert_eq!(layer2_after_locked.clips.len(), 1);
+
         Ok(())
     }
 }
