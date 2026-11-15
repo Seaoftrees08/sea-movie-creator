@@ -502,43 +502,79 @@ impl Render for SeaEditorWindow {
     }
 }
 
+/// タイトルバーのウィンドウ操作アイコン等を含む組み込みアセットソースを返す。
+#[must_use]
+fn editor_assets() -> gpui_kit::assets::Assets {
+    gpui_kit::assets::Assets
+}
+
 /// GPUI アプリケーションを起動し、メインエディタウィンドウを表示する。
 #[must_use]
 pub fn launch_app(open_project: Option<PathBuf>, auto_close_ms: Option<u64>) -> i32 {
-    gpui_kit::application().run(move |cx| {
-        gpui_kit::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
-        let menu_bar = setup_menus(cx);
+    gpui_kit::application()
+        .with_assets(editor_assets())
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            Theme::change(ThemeMode::Dark, None, cx);
+            let menu_bar = setup_menus(cx);
 
-        let bounds = Bounds::centered(
-            None,
-            size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
-            cx,
-        );
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            focus: true,
-            show: true,
-            ..TitleBar::window_options()
-        };
+            let bounds = Bounds::centered(
+                None,
+                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+                cx,
+            );
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: true,
+                show: true,
+                ..TitleBar::window_options()
+            };
 
-        if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| SeaEditorWindow::new(menu_bar, open_project, window, cx))
-        }) {
-            eprintln!("failed to open window: {err}");
-            cx.quit();
-            return;
-        }
+            if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| SeaEditorWindow::new(menu_bar, open_project, window, cx))
+            }) {
+                eprintln!("failed to open window: {err}");
+                cx.quit();
+                return;
+            }
 
-        if let Some(ms) = auto_close_ms {
-            cx.spawn(async move |cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(ms))
-                    .await;
-                cx.update(|cx| cx.quit());
-            })
-            .detach();
-        }
-    });
+            if let Some(ms) = auto_close_ms {
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            }
+        });
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::AssetSource as _;
+
+    use super::editor_assets;
+
+    #[test]
+    fn editor_assets_provides_all_window_control_svgs() -> Result<(), Box<dyn std::error::Error>> {
+        let assets = editor_assets();
+        for path in [
+            "icons/window-minimize.svg",
+            "icons/window-maximize.svg",
+            "icons/window-restore.svg",
+            "icons/window-close.svg",
+        ] {
+            let bytes = assets
+                .load(path)?
+                .ok_or_else(|| format!("missing bundled icon asset: {path}"))?;
+            let svg = std::str::from_utf8(bytes.as_ref())?;
+            assert!(
+                svg.contains("<svg"),
+                "expected SVG markup in {path}, got {svg}"
+            );
+        }
+        Ok(())
+    }
 }
