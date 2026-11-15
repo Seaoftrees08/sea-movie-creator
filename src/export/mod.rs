@@ -1,1 +1,10 @@
-//! 動画書き出しおよびプラグイン形式のエンコーダ管理モジュール（Phase A 以降で実装）。
+//! 動画書き出しおよび外部プラグイン形式エンコーダ管理モジュール。
+//!
+//! コア本体から GPL・特許依存コーデックを分離するため、書き出し処理は
+//! `plugin.json` に基づいて発見される別プロセスプラグインへ共有メモリ IPC 経由で委譲する。
+
+pub mod cpu_fallback;
+pub mod manifest;
+pub mod protocol;
+pub mod registry;
+pub mod runner;

@@ -184,6 +184,15 @@ impl FrameCache {
         self.misses
     }
 
+    /// 現在キャッシュされている全キーとフレーム参照のスナップショットを取得する。
+    #[must_use]
+    pub fn snapshot_entries(&self) -> Vec<(FrameCacheKey, Arc<VideoFrameBuffer>)> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(&v.frame)))
+            .collect()
+    }
+
     fn alloc_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);

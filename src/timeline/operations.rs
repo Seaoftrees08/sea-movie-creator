@@ -992,7 +992,12 @@ fn apply_clip_parameter(
         | ParameterPath::AnchorX
         | ParameterPath::AnchorY
         | ParameterPath::Opacity
-        | ParameterPath::BlendMode => {
+        | ParameterPath::BlendMode
+        | ParameterPath::Brightness
+        | ParameterPath::Contrast
+        | ParameterPath::Saturation
+        | ParameterPath::HueDeg
+        | ParameterPath::Gamma => {
             let visual = clip_visual_mut(kind)?;
             apply_visual_parameter(visual, path, value)
         }
@@ -1052,7 +1057,17 @@ fn expect_animated(
 ) -> Result<&crate::core::animation::AnimatedParameter, CommandError> {
     match value {
         ParameterValue::Animated { param } => {
-            if let crate::core::animation::AnimatedParameter::Expression { expr } = param {
+            if let crate::core::animation::AnimatedParameter::Expression {
+                expr,
+                base_offset,
+                scale,
+            } = param
+            {
+                if !base_offset.is_finite() || !scale.is_finite() {
+                    return Err(CommandError::Incompatible(
+                        "expression tuning base_offset and scale must be finite".to_owned(),
+                    ));
+                }
                 crate::core::expression::CompiledExpression::parse(expr)
                     .map_err(|err| CommandError::Incompatible(err.to_string()))?;
             }
@@ -1078,6 +1093,11 @@ fn apply_visual_parameter(
         ParameterPath::AnchorX => visual.anchor_x = expect_animated(value)?.clone(),
         ParameterPath::AnchorY => visual.anchor_y = expect_animated(value)?.clone(),
         ParameterPath::Opacity => visual.opacity = expect_animated(value)?.clone(),
+        ParameterPath::Brightness => visual.brightness = expect_animated(value)?.clone(),
+        ParameterPath::Contrast => visual.contrast = expect_animated(value)?.clone(),
+        ParameterPath::Saturation => visual.saturation = expect_animated(value)?.clone(),
+        ParameterPath::HueDeg => visual.hue_deg = expect_animated(value)?.clone(),
+        ParameterPath::Gamma => visual.gamma = expect_animated(value)?.clone(),
         ParameterPath::BlendMode => {
             let ParameterValue::BlendMode { value: mode } = value else {
                 return Err(CommandError::Incompatible(

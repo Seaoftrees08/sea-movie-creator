@@ -1,45 +1,32 @@
-[package]
-name = "sea-movie-creator"
-version = "0.1.0"
+[workspace]
+members = [
+    ".",
+    "plugins_src/*",
+]
+resolver = "2"
+
+[workspace.package]
 edition = "2024"
 rust-version = "1.92"
-description = "AI-native lightweight movie editor built with Rust"
 license = "MIT OR Apache-2.0"
-publish = false
 
-[dependencies]
-cpal = "0.18.2"
-gpui-kit = "0.9.1"
-image = "0.25"
-matroska-demuxer = "0.8.1"
-rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
-rubato = "5.1.0"
-schemars = "1.2"
+[workspace.dependencies]
+flacenc = "0.5.1"
+matroska-demuxer = "0.8"
+memmap2 = "0.9"
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-smallvec = "1.13"
-symphonia = { version = "0.6.1", features = ["all-codecs", "all-formats"] }
 thiserror = "2"
-
-[target.'cfg(target_os = "windows")'.dependencies]
+sea-export-protocol = { path = "plugins_src/sea-export-protocol" }
+webm-iterable = "0.7.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Variant",
 ] }
 
-[dev-dependencies]
-rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
-
-[profile.dev.package.rav1d]
-opt-level = 2
-
-[profile.dev.package.rav1e]
-opt-level = 2
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "deny"
 unused = { level = "deny", priority = -1 }
 dead_code = "deny"
@@ -51,7 +38,7 @@ unreachable_code = "deny"
 deprecated = "deny"
 missing_docs = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "deny", priority = -1 }
@@ -66,3 +53,53 @@ todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
 module_name_repetitions = "allow"
+
+[package]
+name = "sea-movie-creator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "AI-native lightweight movie editor built with Rust"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+cosmic-text = "0.19"
+cpal = "0.18.2"
+gpui-kit = "0.9.1"
+image = "0.25"
+matroska-demuxer = "0.8.1"
+memmap2.workspace = true
+pollster = "0.4"
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rubato = "5.1.0"
+schemars = "1.2"
+sea-export-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec = "1.13"
+symphonia = { version = "0.6.1", features = ["all-codecs", "all-formats"] }
+thiserror.workspace = true
+wgpu = "30.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+rav1e.workspace = true
+
+[profile.dev.package.rav1d]
+opt-level = 2
+
+[profile.dev.package.rav1e]
+opt-level = 2

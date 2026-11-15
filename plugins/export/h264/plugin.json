@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "id": "sea.export.h264",
+  "name": "H.264 / MP4 (OS Media Foundation / 外部 ffmpeg)",
+  "version": "0.1.0",
+  "kind": "export",
+  "entrypoint": "sea-export-h264",
+  "args": [],
+  "containers": ["mp4"],
+  "license": {
+    "spdx": "MIT OR Apache-2.0",
+    "notice": "既定モードは Windows OS 標準 Media Foundation (HW/SW H.264 + AAC) を使用します。外部 ffmpeg モードはユーザー環境の独立実行ファイルを呼び出すため、本アプリ・プラグインバイナリに GPL / 特許コーデックは同梱されません。",
+    "requires_external_binary": false
+  },
+  "capabilities": {
+    "supports_alpha": false,
+    "supports_audio": true,
+    "pixel_format": "bgra8",
+    "audio_sample_format": "f32_interleaved",
+    "hw_accelerated": true
+  },
+  "presets": [
+    {
+      "id": "h264_mf_hw",
+      "label": "H.264 標準 / HW 支援 (OS Media Foundation + AAC)",
+      "description": "OS Media Foundation (GPU HW MFT 優先) による高速 MP4 書き出し",
+      "video_codec": "H.264 (OS Media Foundation)",
+      "audio_codec": "AAC (OS Media Foundation)",
+      "container_ext": "mp4",
+      "default_options": {
+        "backend_mode": "windows_mf",
+        "bitrate_kbps": 8000,
+        "prefer_hardware": true
+      }
+    },
+    {
+      "id": "h264_external_ffmpeg",
+      "label": "H.264 外部コマンド実行 (ユーザー導入 ffmpeg CLI)",
+      "description": "ユーザーが導入済みの外部 ffmpeg CLI を別プロセス起動して書き出し",
+      "video_codec": "H.264 (外部 ffmpeg CLI)",
+      "audio_codec": "AAC (外部 ffmpeg CLI)",
+      "container_ext": "mp4",
+      "default_options": {
+        "backend_mode": "external_ffmpeg",
+        "bitrate_kbps": 10000,
+        "ffmpeg_path": "ffmpeg"
+      }
+    }
+  ],
+  "option_fields": [
+    {
+      "key": "backend_mode",
+      "label": "エンコードバックエンド",
+      "description": "OS 標準 Media Foundation またはユーザー導入済み外部 ffmpeg CLI を選択します。",
+      "kind": {
+        "type": "select",
+        "choices": [
+          { "value": "windows_mf", "label": "OS Media Foundation (HW/SW H.264 + AAC)" },
+          { "value": "external_ffmpeg", "label": "外部 ffmpeg CLI (ユーザー環境)" }
+        ]
+      },
+      "default_value": "windows_mf"
+    },
+    {
+      "key": "bitrate_kbps",
+      "label": "映像目標ビットレート (kbps)",
+      "description": "出力 H.264 ストリームの平均ビットレートを指定します。",
+      "kind": {
+        "type": "integer",
+        "min": 500,
+        "max": 100000
+      },
+      "default_value": 8000
+    },
+    {
+      "key": "prefer_hardware",
+      "label": "GPU ハードウェア MFT を優先する",
+      "description": "Windows Media Foundation 実行時にハードウェアエンコーダ MFT を優先使用します。",
+      "kind": {
+        "type": "boolean"
+      },
+      "default_value": true
+    },
+    {
+      "key": "ffmpeg_path",
+      "label": "外部 ffmpeg コマンド / パス",
+      "description": "外部 ffmpeg モード時に起動するコマンド名または実行ファイルパスを指定します。",
+      "kind": {
+        "type": "string"
+      },
+      "default_value": "ffmpeg"
+    }
+  ]
+}

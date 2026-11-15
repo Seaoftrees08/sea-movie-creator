@@ -11,9 +11,9 @@ use crate::audio::playback::{
 };
 use crate::core::ids::{AssetId, AssetRef, ClipId, ClipRef, LayerId, LayerRef};
 use crate::core::time::{FrameCount, FrameIndex, PlaybackRate, RationalDuration};
+use crate::media::compositor::WgpuCompositor;
 use crate::media::decoder::{
-    BackendPreference, VideoDecoder, decode_image_file, open_audio_decoder, open_video_decoder,
-    probe_media,
+    BackendPreference, VideoDecoder, open_audio_decoder, open_video_decoder, probe_media,
 };
 use crate::media::frame_cache::{FrameCache, FrameCacheKey};
 use crate::timeline::command::{
@@ -29,7 +29,7 @@ use crate::timeline::serialization::{
     save_project_file,
 };
 use crate::ui::surface_bridge::{
-    PreviewSurfaceBridge, RenderImageSurfaceBridge, composite_timeline_preview,
+    PreviewSurfaceBridge, RenderImageSurfaceBridge, composite_with_gpu_or_fallback,
 };
 
 const DEFAULT_FRAME_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -116,6 +116,10 @@ pub struct AppController {
     pub right_tab: RightPanelTab,
     /// ユーザーが変更した右パネル幅（未設定時は 1/5）。
     pub right_panel_width: Option<f32>,
+    /// クリップインスペクタの編集中下書き状態。
+    pub inspector: crate::ui::inspector_panel::InspectorState,
+    /// 動画書き出し設定モーダルダイアログ状態。
+    pub export_dialog: crate::ui::export_dialog::ExportDialogState,
     /// 画面下部の最新ステータスメッセージ。
     pub status_message: String,
     /// GPUI 用 BGRA ダブルバッファ転送ブリッジ。
@@ -132,9 +136,20 @@ pub struct AppController {
     pub ai_chat_draft: String,
     /// タイムライン 1 フレームあたりの横幅（px）。
     pub timeline_px_per_frame: f32,
+    /// タイムラインの水平スクロール基準フレーム。
+    pub timeline_scroll_x_frames: u64,
+    /// コピーされたクリップ群保持用クリップボード。
+    pub clipboard: Option<crate::timeline::clipboard::ClipClipboard>,
+    /// タイムラインドラッグ時のスナップ設定。
+    pub snap_config: crate::timeline::snap::SnapConfig,
+    /// 現在表示すべきスナップ縦ガイド線のフレーム位置。
+    pub snap_guide_frame: Option<u64>,
+    /// タイムライン上のアクティブなドラッグ編集状態。
+    pub timeline_drag: Option<crate::ui::timeline_panel::TimelineDragState>,
     /// 音声デバイス稼働状態と共有スナップショット。
     audio_shared: SharedPlaybackState,
     audio_handle: Option<AudioOutputHandle>,
+    gpu_compositor: Option<WgpuCompositor>,
     next_id_seq: u64,
 }
 
@@ -181,6 +196,8 @@ impl AppController {
             selected_clip_id,
             right_tab: RightPanelTab::ClipInspector,
             right_panel_width: None,
+            inspector: crate::ui::inspector_panel::InspectorState::default(),
+            export_dialog: crate::ui::export_dialog::ExportDialogState::default(),
             status_message: "準備完了".to_owned(),
             surface_bridge: RenderImageSurfaceBridge::new(),
             has_media_offline_at_playhead: false,
@@ -189,8 +206,14 @@ impl AppController {
             video_decoders: HashMap::new(),
             ai_chat_draft: String::new(),
             timeline_px_per_frame: 3.0,
+            timeline_scroll_x_frames: 0,
+            clipboard: None,
+            snap_config: crate::timeline::snap::SnapConfig::default(),
+            snap_guide_frame: None,
+            timeline_drag: None,
             audio_shared,
             audio_handle: None,
+            gpu_compositor: WgpuCompositor::try_new().ok(),
             next_id_seq: 1,
         };
         controller.refresh_preview_now();
@@ -213,6 +236,12 @@ impl AppController {
     #[must_use]
     pub const fn has_hardware_audio_output(&self) -> bool {
         self.audio_handle.is_some()
+    }
+
+    /// `wgpu` GPU コンポジタが有効化されているかを返す。
+    #[must_use]
+    pub const fn is_gpu_compositor_active(&self) -> bool {
+        self.gpu_compositor.is_some()
     }
 
     /// 新規空プロジェクトへ初期化する。
@@ -505,7 +534,181 @@ impl AppController {
         let _ = self.dispatch_command(&EditCommand::RemoveClip {
             clip_id: ClipRef::Id(clip_id),
         })?;
+        self.inspector.invalidate_sync();
         Ok(())
+    }
+
+    /// 選択中クリップを内部クリップボードへコピーする。
+    ///
+    /// # Errors
+    ///
+    /// クリップ未選択または存在しない ID の場合。
+    pub fn copy_selected_clip(&mut self) -> Result<usize, String> {
+        let clip_id = self
+            .selected_clip_id
+            .clone()
+            .ok_or_else(|| "コピーするクリップが選択されていません".to_owned())?;
+        let cb = crate::timeline::clipboard::copy_clips(&self.document, &[clip_id])
+            .map_err(|e| e.to_string())?;
+        let count = cb.len();
+        self.clipboard = Some(cb);
+        self.status_message = format!("{count} 個のクリップをコピーしました");
+        Ok(count)
+    }
+
+    /// クリップボード内容を現在再生ヘッド（衝突時は空きスロット）へ貼り付ける。
+    ///
+    /// # Errors
+    ///
+    /// クリップボードが空、または貼り付け失敗時。
+    pub fn paste_clipboard_at_playhead(&mut self) -> Result<(), String> {
+        let cb = self
+            .clipboard
+            .as_ref()
+            .ok_or_else(|| "貼り付けるクリップボードが空です".to_owned())?
+            .clone();
+        let base_layer = self
+            .selected_layer_id
+            .as_ref()
+            .and_then(|lid| self.document.layers.iter().position(|l| &l.id == lid))
+            .unwrap_or(0);
+        let head = self.clock.current_frame();
+        let cmd = crate::timeline::clipboard::build_collision_free_paste_command(
+            &cb,
+            &self.document,
+            head,
+            base_layer,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 選択中クリップを即座に複製 (`Ctrl+D`) して空きフレームへ配置する。
+    ///
+    /// # Errors
+    ///
+    /// クリップ未選択または複製エラー時。
+    pub fn duplicate_selected_clip(&mut self) -> Result<(), String> {
+        let clip_id = self
+            .selected_clip_id
+            .clone()
+            .ok_or_else(|| "複製するクリップが選択されていません".to_owned())?;
+        let cmd = crate::timeline::clipboard::build_duplicate_selection_command(
+            &self.document,
+            &[clip_id],
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// スナップ判定を適用しつつ指定クリップを別時間位置・別レイヤーへ移動する。
+    ///
+    /// # Errors
+    ///
+    /// クリップ／レイヤー不在、または既存クリップとの重複・ロックエラー時。
+    pub fn move_clip_with_snap(
+        &mut self,
+        clip_id: &ClipId,
+        target_layer_idx: usize,
+        raw_start: FrameIndex,
+    ) -> Result<FrameIndex, String> {
+        let duration = self
+            .document
+            .find_clip(clip_id)
+            .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?
+            .1
+            .duration;
+        let target_layer_id = self
+            .document
+            .layers
+            .get(target_layer_idx)
+            .ok_or_else(|| format!("レイヤーインデックス {target_layer_idx} が範囲外です"))?
+            .id
+            .clone();
+        let snap = crate::timeline::snap::snap_clip_move(
+            &self.document,
+            self.clock.current_frame(),
+            duration,
+            raw_start,
+            std::slice::from_ref(clip_id),
+            &self.snap_config,
+        );
+        self.snap_guide_frame = snap.guide_frame;
+        let cmd = EditCommand::MoveClip {
+            clip_id: ClipRef::Id(clip_id.clone()),
+            target_layer_id: Some(LayerRef::Id(target_layer_id.clone())),
+            new_timeline_start: snap.snapped_start,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.selected_layer_id = Some(target_layer_id);
+        Ok(snap.snapped_start)
+    }
+
+    /// 指定クリップの左端を指定フレーム数ぶんトリム（正）または延長（負）する。
+    ///
+    /// # Errors
+    ///
+    /// 不正なトリム量またはクリップ長制約違反時。
+    pub fn trim_clip_left_delta(
+        &mut self,
+        clip_id: &ClipId,
+        delta_frames: i64,
+    ) -> Result<(), String> {
+        let cmd = EditCommand::TrimLeft {
+            clip_id: ClipRef::Id(clip_id.clone()),
+            delta_frames,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 指定クリップの右端を指定フレーム数ぶんトリム（正）または延長（負）する。
+    ///
+    /// # Errors
+    ///
+    /// 不正なトリム量またはクリップ長制約違反時。
+    pub fn trim_clip_right_delta(
+        &mut self,
+        clip_id: &ClipId,
+        delta_frames: i64,
+    ) -> Result<(), String> {
+        let cmd = EditCommand::TrimRight {
+            clip_id: ClipRef::Id(clip_id.clone()),
+            delta_frames,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 新しい空トラックレイヤーを末尾へ追加する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド実行失敗時。
+    pub fn add_empty_layer(&mut self) -> Result<LayerId, String> {
+        let new_id =
+            LayerId::new(format!("layer-{}", self.next_seq())).map_err(|e| e.to_string())?;
+        let idx = self.document.layers.len() + 1;
+        let cmd = EditCommand::AddLayer {
+            temp_id: None,
+            id: Some(new_id.clone()),
+            name: format!("Track {idx}"),
+            insert_index: None,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.selected_layer_id = Some(new_id.clone());
+        Ok(new_id)
+    }
+
+    /// タイムラインの表示倍率 (`timeline_px_per_frame`) を安全範囲内で拡大・縮小する。
+    pub fn zoom_timeline(&mut self, factor: f32) {
+        self.timeline_px_per_frame = (self.timeline_px_per_frame * factor).clamp(0.5, 24.0);
     }
 
     /// 選択クリップの不透明度を定数 `AnimatedParameter` として設定する。
@@ -652,11 +855,12 @@ impl AppController {
 
         let (pw, ph) = preview_dimensions(&self.document);
         let cache = &mut self.frame_cache;
-        let output = composite_timeline_preview(
+        let output = composite_with_gpu_or_fallback(
             &self.document,
             playhead,
             pw,
             ph,
+            self.gpu_compositor.as_mut(),
             &mut |asset_id, src_idx| cache.get(&FrameCacheKey::new(asset_id.clone(), src_idx, 100)),
         );
 
@@ -773,13 +977,14 @@ impl AppController {
         &self,
         path: &Path,
     ) -> Result<(AssetKind, FrameCount, PreparedClipKind), String> {
-        let buf = decode_image_file(path).map_err(|e| e.to_string())?;
+        let info =
+            crate::media::image_loader::inspect_image_file(path).map_err(|e| e.to_string())?;
         let frames_count = self.document.fps.numerator().max(1);
         let duration = FrameCount::new(u64::from(frames_count) * 5).map_err(|e| e.to_string())?;
         Ok((
             AssetKind::Image {
-                width: buf.width,
-                height: buf.height,
+                width: info.width,
+                height: info.height,
             },
             duration,
             PreparedClipKind::Image,
@@ -846,7 +1051,7 @@ impl AppController {
     ) {
         match kind {
             MediaExtensionKind::Image => {
-                if let Ok(buf) = decode_image_file(path) {
+                if let Ok(buf) = crate::media::image_loader::load_image_file(path, Some(1920)) {
                     self.frame_cache
                         .insert(FrameCacheKey::new(asset_id.clone(), 0, 100), Arc::new(buf));
                 }
@@ -947,6 +1152,90 @@ impl AppController {
                 }
             }
         }
+    }
+
+    /// 書き出し設定ダイアログを開き、既定パスからプラグイン一覧を自動検出する。
+    pub fn open_export_dialog(&mut self) {
+        let registry = crate::export::registry::PluginRegistry::discover_default();
+        let base_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        self.export_dialog
+            .open_with_registry(registry, base_dir.as_deref());
+    }
+
+    /// 書き出しダイアログの現在設定でバックグラウンドエンコードを開始する。
+    ///
+    /// # Errors
+    ///
+    /// プラグイン／プリセット未選択またはジョブ検証違反時にエラー文字列を返す。
+    pub fn start_export_from_dialog(&mut self) -> Result<(), String> {
+        if self.export_dialog.running_job.is_some() {
+            return Err("すでに書き出しを実行中です".to_owned());
+        }
+        let plugin_id = self
+            .export_dialog
+            .selected_plugin()
+            .map(|p| p.manifest.id.clone())
+            .ok_or_else(|| "エンコーダプラグインが選択されていません".to_owned())?;
+        let preset_id = self
+            .export_dialog
+            .selected_preset()
+            .map(|p| p.id.clone())
+            .ok_or_else(|| "書き出しプリセットが選択されていません".to_owned())?;
+        let (width, height) = self.export_dialog.resolution.0.dimensions(&self.document);
+        let options = self.export_dialog.merged_options();
+        let out_path = PathBuf::from(self.export_dialog.output_path.trim());
+        let mut request = crate::export::runner::ExportJobRequest::full_project(
+            &self.document,
+            plugin_id,
+            preset_id,
+            out_path,
+            options,
+        );
+        request.width = width;
+        request.height = height;
+
+        let project_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let mut sources = crate::export::runner::ExportMediaSources::new(project_dir);
+        sources.seed_from_cache_and_mixer(&self.frame_cache, &self.mixer);
+
+        self.export_dialog.last_error = None;
+        self.export_dialog.last_completed = None;
+        let handle = crate::export::runner::spawn_export_job(
+            self.document.clone(),
+            self.export_dialog.registry.clone(),
+            request,
+            sources,
+        );
+        self.export_dialog.running_job = Some(handle);
+        "動画の書き出しを開始しました...".clone_into(&mut self.status_message);
+        Ok(())
+    }
+
+    /// 実行中の書き出しジョブへ中断通知を送る。
+    pub fn cancel_active_export(&mut self) {
+        self.export_dialog.cancel_active();
+        "書き出しを中断しています...".clone_into(&mut self.status_message);
+    }
+
+    /// 非同期書き出しジョブの進捗・完了イベントを取り込む（更新時 `true`）。
+    pub fn poll_export_status(&mut self) -> bool {
+        let changed = self.export_dialog.poll_job();
+        if changed {
+            if let Some(outcome) = &self.export_dialog.last_completed {
+                self.status_message = format!("書き出し完了: {}", outcome.output_path.display());
+            } else if let Some(err) = &self.export_dialog.last_error {
+                self.status_message = format!("書き出しエラー: {err}");
+            }
+        }
+        changed
     }
 }
 

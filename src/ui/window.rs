@@ -19,12 +19,14 @@ use gpui_kit::{
 use crate::core::time::FrameIndex;
 use crate::timeline::document::ClipKind;
 use crate::ui::app_controller::{AppController, clamp_right_panel_width};
+use crate::ui::export_dialog::render_export_dialog_overlay;
 use crate::ui::menu_bar::{
-    DeleteSelectedClip, ImportMedia, NewProject, OpenProject, QuitApp, RedoAction, SaveProject,
+    CopySelectedClip, DeleteSelectedClip, DuplicateSelectedClip, ImportMedia, NewProject,
+    OpenExportDialog, OpenProject, PasteAtPlayhead, QuitApp, RedoAction, SaveProject,
     SaveProjectAs, SeekStart, SplitAtPlayhead, TogglePlayback, UndoAction, setup_menus,
 };
 use crate::ui::preview_panel::render_preview_panel;
-use crate::ui::right_panel::render_right_panel;
+use crate::ui::right_panel::{RightPanelWidgets, render_right_panel};
 use crate::ui::timeline_panel::render_timeline_panel;
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
@@ -38,6 +40,10 @@ pub struct SeaEditorWindow {
     menu_bar: Entity<AppMenuBar>,
     scrub_slider: Entity<SliderState>,
     opacity_slider: Entity<SliderState>,
+    /// 数式 `f(t)` 編集用テキスト入力状態。
+    pub(crate) expr_input: Entity<InputState>,
+    /// 字幕本文編集用テキスト入力状態。
+    pub(crate) subtitle_text_input: Entity<InputState>,
     /// AI チャット欄のテキスト入力状態。
     pub(crate) ai_chat_input: Entity<InputState>,
     timeline_scroll: VirtualListScrollHandle,
@@ -76,6 +82,10 @@ impl SeaEditorWindow {
                 .step(0.05)
                 .default_value(1.0)
         });
+        let expr_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("例: sin(p * pi) * 90"));
+        let subtitle_text_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("字幕テキストを入力..."));
         let ai_chat_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("AI 編集指示を入力..."));
 
@@ -89,6 +99,8 @@ impl SeaEditorWindow {
             menu_bar,
             scrub_slider,
             opacity_slider,
+            expr_input,
+            subtitle_text_input,
             ai_chat_input,
             timeline_scroll: VirtualListScrollHandle::new(),
             sliders_dirty: true,
@@ -120,7 +132,25 @@ impl SeaEditorWindow {
         });
 
         if let Some((_, clip)) = self.controller.selected_clip() {
-            let op_val = match &clip.kind {
+            let clip_owned = clip.clone();
+            let head = self.controller.clock.current_frame();
+            let inspector_synced = self.controller.inspector.sync_from_clip(
+                &self.controller.document,
+                &clip_owned,
+                head,
+            );
+            if inspector_synced {
+                let expr_text = self.controller.inspector.expr_draft.clone();
+                self.expr_input.update(cx, |input, cx| {
+                    input.set_value(&expr_text, window, cx);
+                });
+                let sub_text = self.controller.inspector.subtitle_text_draft.clone();
+                self.subtitle_text_input.update(cx, |input, cx| {
+                    input.set_value(&sub_text, window, cx);
+                });
+            }
+
+            let op_val = match &clip_owned.kind {
                 ClipKind::Video { visual, .. } | ClipKind::Image { visual, .. } => {
                     visual.opacity.evaluate_constant_or_one()
                 }
@@ -152,7 +182,8 @@ impl SeaEditorWindow {
                 let keep_going = this.update(cx, |view, cx| {
                     let prev_frame = view.controller.clock.current_frame().get();
                     view.controller.tick_playback(elapsed);
-                    if view.controller.clock.current_frame().get() != prev_frame {
+                    let export_changed = view.controller.poll_export_status();
+                    if view.controller.clock.current_frame().get() != prev_frame || export_changed {
                         view.sliders_dirty = true;
                         cx.notify();
                     }
@@ -351,8 +382,12 @@ impl SeaEditorWindow {
                     .size_range(px(220.)..px(560.))
                     .child(render_right_panel(
                         &self.controller,
-                        &self.opacity_slider,
-                        &self.ai_chat_input,
+                        RightPanelWidgets {
+                            opacity_slider: &self.opacity_slider,
+                            expr_input: &self.expr_input,
+                            subtitle_text_input: &self.subtitle_text_input,
+                            ai_chat_input: &self.ai_chat_input,
+                        },
                         cx,
                     )),
             )
@@ -364,24 +399,46 @@ impl SeaEditorWindow {
             .on_action(cx.listener(Self::on_import_media))
             .on_action(cx.listener(Self::on_save_project))
             .on_action(cx.listener(Self::on_save_project_as))
+            .on_action(cx.listener(|this, _: &OpenExportDialog, _, cx| {
+                this.controller.open_export_dialog();
+                cx.notify();
+            }))
             .on_action(|_: &QuitApp, _, cx| cx.quit())
             .on_action(cx.listener(|this, _: &UndoAction, window, cx| {
                 let _ = this.controller.undo();
+                this.controller.inspector.invalidate_sync();
                 this.sync_sliders_now(window, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RedoAction, window, cx| {
                 let _ = this.controller.redo();
+                this.controller.inspector.invalidate_sync();
                 this.sync_sliders_now(window, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SplitAtPlayhead, window, cx| {
                 let _ = this.controller.split_selected_clip_at_playhead();
+                this.controller.inspector.invalidate_sync();
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CopySelectedClip, _, cx| {
+                let _ = this.controller.copy_selected_clip();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PasteAtPlayhead, window, cx| {
+                let _ = this.controller.paste_clipboard_at_playhead();
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &DuplicateSelectedClip, window, cx| {
+                let _ = this.controller.duplicate_selected_clip();
                 this.sync_sliders_now(window, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &DeleteSelectedClip, window, cx| {
                 let _ = this.controller.delete_selected_clip();
+                this.controller.inspector.invalidate_sync();
                 this.sync_sliders_now(window, cx);
                 cx.notify();
             }))
@@ -420,7 +477,7 @@ impl Render for SeaEditorWindow {
         );
         let workspace = self.build_workspace_split(window, cx);
 
-        Self::bind_actions(v_flex().size_full().bg(theme.background), cx)
+        let root = Self::bind_actions(v_flex().size_full().relative().bg(theme.background), cx)
             .child(top_bar)
             .child(
                 div()
@@ -428,7 +485,16 @@ impl Render for SeaEditorWindow {
                     .size_full()
                     .overflow_hidden()
                     .child(workspace),
-            )
+            );
+        if self.controller.export_dialog.is_open {
+            root.child(render_export_dialog_overlay(
+                &self.controller,
+                &self.controller.export_dialog,
+                cx,
+            ))
+        } else {
+            root
+        }
     }
 }
 

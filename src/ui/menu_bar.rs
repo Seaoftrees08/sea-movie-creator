@@ -25,8 +25,16 @@ actions!(
         RedoAction,
         /// 選択中クリップを現在再生ヘッド位置で分割するアクション。
         SplitAtPlayhead,
+        /// 選択中クリップをクリップボードへコピーするアクション。
+        CopySelectedClip,
+        /// クリップボード内容を再生ヘッド位置へ貼り付けるアクション。
+        PasteAtPlayhead,
+        /// 選択中クリップを複製するアクション。
+        DuplicateSelectedClip,
         /// 選択中クリップを削除するアクション。
         DeleteSelectedClip,
+        /// 動画書き出しダイアログを開くアクション。
+        OpenExportDialog,
         /// 再生・一時停止を切り替えるアクション。
         TogglePlayback,
         /// 再生ヘッドをタイムライン先頭へ戻すアクション。
@@ -41,9 +49,13 @@ pub fn setup_menus(cx: &mut App) -> Entity<AppMenuBar> {
         KeyBinding::new("ctrl-o", OpenProject, None),
         KeyBinding::new("ctrl-s", SaveProject, None),
         KeyBinding::new("ctrl-shift-s", SaveProjectAs, None),
+        KeyBinding::new("ctrl-shift-e", OpenExportDialog, None),
         KeyBinding::new("ctrl-i", ImportMedia, None),
         KeyBinding::new("ctrl-z", UndoAction, None),
         KeyBinding::new("ctrl-y", RedoAction, None),
+        KeyBinding::new("ctrl-c", CopySelectedClip, None),
+        KeyBinding::new("ctrl-v", PasteAtPlayhead, None),
+        KeyBinding::new("ctrl-d", DuplicateSelectedClip, None),
         KeyBinding::new("s", SplitAtPlayhead, None),
         KeyBinding::new("delete", DeleteSelectedClip, None),
         KeyBinding::new("space", TogglePlayback, None),
@@ -58,12 +70,18 @@ pub fn setup_menus(cx: &mut App) -> Entity<AppMenuBar> {
         MenuItem::action("保存", SaveProject),
         MenuItem::action("名前を付けて保存...", SaveProjectAs),
         MenuItem::separator(),
+        MenuItem::action("動画の書き出し...", OpenExportDialog),
+        MenuItem::separator(),
         MenuItem::action("終了", QuitApp),
     ]);
 
     let edit_menu = Menu::new("編集").items([
         MenuItem::action("元に戻す (Undo)", UndoAction),
         MenuItem::action("やり直す (Redo)", RedoAction),
+        MenuItem::separator(),
+        MenuItem::action("コピー (Ctrl+C)", CopySelectedClip),
+        MenuItem::action("貼り付け (Ctrl+V)", PasteAtPlayhead),
+        MenuItem::action("複製 (Ctrl+D)", DuplicateSelectedClip),
         MenuItem::separator(),
         MenuItem::action("再生ヘッドでクリップ分割", SplitAtPlayhead),
         MenuItem::action("選択クリップを削除", DeleteSelectedClip),

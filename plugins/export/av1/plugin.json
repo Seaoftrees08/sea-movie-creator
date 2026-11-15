@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "id": "sea.export.av1",
+  "name": "標準 AV1 (純粋 Rust / OS HW)",
+  "version": "0.1.0",
+  "kind": "export",
+  "entrypoint": "sea-export-av1",
+  "args": [],
+  "containers": ["mkv", "mp4"],
+  "license": {
+    "spdx": "BSD-2-Clause AND Apache-2.0 AND MIT",
+    "notice": "既定の SW 書き出しは純粋 Rust 製 rav1e (BSD-2-Clause + AOMedia Patent License 1.0)・flacenc (Apache-2.0)・webm-iterable (MIT) のみで構成され、GPL/特許汚染バイナリを含みません。OS HW モードは対応環境で OS Media Foundation AV1 ハードウェアエンコーダを利用します。",
+    "requires_external_binary": false
+  },
+  "capabilities": {
+    "supports_alpha": false,
+    "supports_audio": true,
+    "pixel_format": "bgra8",
+    "audio_sample_format": "f32_interleaved",
+    "hw_accelerated": true
+  },
+  "presets": [
+    {
+      "id": "av1_fast",
+      "label": "AV1 標準（高速 SW: rav1e + FLAC）",
+      "description": "純粋 Rust rav1e (Speed 9) + FLAC による高速・汎用な MKV 書き出し",
+      "video_codec": "AV1 (rav1e SW)",
+      "audio_codec": "FLAC (ロスレス)",
+      "container_ext": "mkv",
+      "default_options": {
+        "backend_mode": "software_rav1e",
+        "speed": 9,
+        "quantizer": 110,
+        "threads": 0
+      }
+    },
+    {
+      "id": "av1_quality",
+      "label": "AV1 高画質（高品質 SW: rav1e + FLAC）",
+      "description": "純粋 Rust rav1e (Speed 5 / Q75) による高圧縮・高画質 MKV 書き出し",
+      "video_codec": "AV1 (rav1e SW)",
+      "audio_codec": "FLAC (ロスレス)",
+      "container_ext": "mkv",
+      "default_options": {
+        "backend_mode": "software_rav1e",
+        "speed": 5,
+        "quantizer": 75,
+        "threads": 0
+      }
+    },
+    {
+      "id": "av1_hw",
+      "label": "AV1 GPU/HW 支援 (OS Media Foundation + AAC)",
+      "description": "対応 GPU / OS Media Foundation AV1 MFT を使った高速 MP4 書き出し",
+      "video_codec": "AV1 (OS HW MFT)",
+      "audio_codec": "AAC (OS Media Foundation)",
+      "container_ext": "mp4",
+      "default_options": {
+        "backend_mode": "os_hardware_mf",
+        "bitrate_kbps": 8000
+      }
+    }
+  ],
+  "option_fields": [
+    {
+      "key": "backend_mode",
+      "label": "エンコードバックエンド",
+      "description": "純粋 Rust SW (MKV) または OS ハードウェア MFT (MP4) を選択します。",
+      "kind": {
+        "type": "select",
+        "choices": [
+          { "value": "software_rav1e", "label": "ソフトウェア (rav1e + FLAC / MKV)" },
+          { "value": "os_hardware_mf", "label": "OS GPU ハードウェア支援 (Media Foundation / MP4)" }
+        ]
+      },
+      "default_value": "software_rav1e"
+    },
+    {
+      "key": "speed",
+      "label": "エンコード速度プリセット (0〜10)",
+      "description": "数値が大きいほど高速、小さいほど高画質になります (SW 時有効)。",
+      "kind": {
+        "type": "integer",
+        "min": 0,
+        "max": 10
+      },
+      "default_value": 9
+    },
+    {
+      "key": "quantizer",
+      "label": "量子化値 (20〜200)",
+      "description": "数値が小さいほど高ビットレート・高画質になります (SW 時有効)。",
+      "kind": {
+        "type": "integer",
+        "min": 20,
+        "max": 200
+      },
+      "default_value": 110
+    },
+    {
+      "key": "threads",
+      "label": "エンコードスレッド数 (0 = 自動)",
+      "description": "0 の場合は利用可能な CPU スレッドを自動使用します (SW 時有効)。",
+      "kind": {
+        "type": "integer",
+        "min": 0,
+        "max": 32
+      },
+      "default_value": 0
+    },
+    {
+      "key": "bitrate_kbps",
+      "label": "HW 目標ビットレート (kbps)",
+      "description": "OS HW モード時の目標映像ビットレートを指定します。",
+      "kind": {
+        "type": "integer",
+        "min": 500,
+        "max": 100000
+      },
+      "default_value": 8000
+    }
+  ]
+}

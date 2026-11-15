@@ -2,20 +2,33 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::slider::{Slider, SliderState};
+use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{Context, Entity, IntoElement, ParentElement as _, Styled as _, div};
 
 use crate::timeline::document::ClipKind;
 use crate::ui::app_controller::{AppController, RightPanelTab};
+use crate::ui::inspector_panel::{InspectorWidgets, render_clip_inspector};
 use crate::ui::window::SeaEditorWindow;
+
+/// 右側パネルの描画に必要な各種入力・スライダウィジェット群。
+#[derive(Clone, Copy)]
+pub struct RightPanelWidgets<'a> {
+    /// 不透明度連続スライダ。
+    pub opacity_slider: &'a Entity<SliderState>,
+    /// 数式 `f(t)` 入力欄。
+    pub expr_input: &'a Entity<InputState>,
+    /// 字幕テキスト入力欄。
+    pub subtitle_text_input: &'a Entity<InputState>,
+    /// AI チャット欄テキスト入力欄。
+    pub ai_chat_input: &'a Entity<InputState>,
+}
 
 /// 右側パネルのタブバーと選択中タブコンテンツを描画する。
 pub fn render_right_panel(
     controller: &AppController,
-    opacity_slider: &Entity<SliderState>,
-    ai_chat_input: &Entity<InputState>,
+    widgets: RightPanelWidgets<'_>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let selected_ix = match controller.right_tab {
@@ -53,10 +66,19 @@ pub fn render_right_panel(
                 }),
         )
         .child(match controller.right_tab {
-            RightPanelTab::ClipInspector => {
-                render_clip_tab(controller, opacity_slider, cx).into_any_element()
+            RightPanelTab::ClipInspector => render_clip_tab(
+                controller,
+                InspectorWidgets {
+                    opacity_slider: widgets.opacity_slider,
+                    expr_input: widgets.expr_input,
+                    subtitle_text_input: widgets.subtitle_text_input,
+                },
+                cx,
+            )
+            .into_any_element(),
+            RightPanelTab::AiChat => {
+                render_ai_chat_tab(widgets.ai_chat_input, cx).into_any_element()
             }
-            RightPanelTab::AiChat => render_ai_chat_tab(ai_chat_input, cx).into_any_element(),
             RightPanelTab::LayerList => render_layers_tab(controller, cx).into_any_element(),
             RightPanelTab::ProjectInfo => render_project_tab(controller, cx).into_any_element(),
         })
@@ -64,11 +86,11 @@ pub fn render_right_panel(
 
 fn render_clip_tab(
     controller: &AppController,
-    opacity_slider: &Entity<SliderState>,
+    widgets: InspectorWidgets<'_>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    let Some((layer, clip)) = controller.selected_clip() else {
+    let theme = cx.theme().clone();
+    let Some((_, clip)) = controller.selected_clip() else {
         return v_flex()
             .p_3()
             .gap_2()
@@ -78,60 +100,38 @@ fn render_clip_tab(
             .child("メニューまたはドラッグ操作でタイムライン上のクリップを選択してください。");
     };
 
-    let clip_info = format!(
-        "{} ({})  Track: {}  [{}..{})",
-        clip.name,
-        match &clip.kind {
-            ClipKind::Video { .. } => "Video",
-            ClipKind::Audio { .. } => "Audio",
-            ClipKind::Image { .. } => "Image",
-            ClipKind::Subtitle(_) => "Subtitle",
-        },
-        layer.name,
-        clip.timeline_start.get(),
-        clip.timeline_start.get() + clip.duration.get(),
-    );
-    let can_opacity = matches!(
-        clip.kind,
-        ClipKind::Video { .. } | ClipKind::Image { .. } | ClipKind::Subtitle(_)
-    );
     let can_speed = matches!(clip.kind, ClipKind::Video { .. } | ClipKind::Audio { .. });
 
     let mut panel = v_flex()
-        .p_3()
-        .gap_3()
-        .text_xs()
-        .child(div().text_color(theme.foreground).child(clip_info));
-
-    if can_opacity {
-        panel = panel
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("不透明度 (Opacity)"),
-            )
-            .child(Slider::new(opacity_slider));
-    }
+        .flex_1()
+        .overflow_hidden()
+        .child(render_clip_inspector(controller, widgets, cx));
 
     if can_speed {
-        panel = panel
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("再生速度 (PlaybackRate)"),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(speed_button("speed-05", "0.5x", 1, 2, cx))
-                    .child(speed_button("speed-10", "1.0x", 1, 1, cx))
-                    .child(speed_button("speed-15", "1.5x", 3, 2, cx))
-                    .child(speed_button("speed-20", "2.0x", 2, 1, cx)),
-            );
+        panel = panel.child(
+            v_flex()
+                .px_3()
+                .gap_1()
+                .text_xs()
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("再生速度 (PlaybackRate)"),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(speed_button("speed-05", "0.5x", 1, 2, cx))
+                        .child(speed_button("speed-10", "1.0x", 1, 1, cx))
+                        .child(speed_button("speed-15", "1.5x", 3, 2, cx))
+                        .child(speed_button("speed-20", "2.0x", 2, 1, cx)),
+                ),
+        );
     }
 
     panel.child(
         h_flex()
+            .p_3()
             .gap_2()
             .child(
                 Button::new("clip-split-btn")

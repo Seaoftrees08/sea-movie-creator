@@ -113,12 +113,22 @@ pub struct EvaluatedVisual {
     pub opacity: f64,
     /// ブレンドモード。
     pub blend_mode: BlendMode,
+    /// 明るさオフセット (`-1.0..=1.0`、既定 `0.0`)。
+    pub brightness: f64,
+    /// コントラスト倍率 (`0.0..=3.0`、既定 `1.0`)。
+    pub contrast: f64,
+    /// 彩度倍率 (`0.0..=3.0`、既定 `1.0`)。
+    pub saturation: f64,
+    /// 色相回転角（度、`-180.0..=180.0`、既定 `0.0`）。
+    pub hue_deg: f64,
+    /// ガンマ値 (`0.1..=4.0`、既定 `1.0`)。
+    pub gamma: f64,
     /// `translate(-anchor) -> scale -> rotate_cw -> translate(x, y)` の合成 2D 変換行列。
     pub matrix: Matrix2D,
 }
 
 impl EvaluatedVisual {
-    /// 各評価値から 2D 変換行列を組み立てて生成する。
+    /// 各評価値から 2D 変換行列を組み立てて生成する（色調整はニュートラル既定値）。
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn from_components(
@@ -142,6 +152,11 @@ impl EvaluatedVisual {
             anchor_y,
             opacity: opacity.clamp(0.0, 1.0),
             blend_mode,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            hue_deg: 0.0,
+            gamma: 1.0,
             matrix: Matrix2D::from_transform(
                 (x, y),
                 (scale_x, scale_y),
@@ -149,6 +164,24 @@ impl EvaluatedVisual {
                 rotation_deg,
             ),
         }
+    }
+
+    /// 色調整 5 項目（明るさ・コントラスト・彩度・色相・ガンマ）を設定して返す。
+    #[must_use]
+    pub const fn with_color_adjustments(
+        mut self,
+        brightness: f64,
+        contrast: f64,
+        saturation: f64,
+        hue_deg: f64,
+        gamma: f64,
+    ) -> Self {
+        self.brightness = brightness.clamp(-1.0, 1.0);
+        self.contrast = contrast.clamp(0.0, 4.0);
+        self.saturation = saturation.clamp(0.0, 4.0);
+        self.hue_deg = hue_deg;
+        self.gamma = gamma.clamp(0.05, 5.0);
+        self
     }
 }
 
@@ -182,6 +215,21 @@ pub struct VisualProperties {
     /// 合成時のブレンドモード。
     #[serde(default)]
     pub blend_mode: BlendMode,
+    /// 明るさ調整 (`-1.0..=1.0`, 既定 `0.0`)。
+    #[serde(default = "default_zero")]
+    pub brightness: AnimatedParameter,
+    /// コントラスト調整 (`0.0..=4.0`, 既定 `1.0`)。
+    #[serde(default = "default_one")]
+    pub contrast: AnimatedParameter,
+    /// 彩度調整 (`0.0..=4.0`, 既定 `1.0`)。
+    #[serde(default = "default_one")]
+    pub saturation: AnimatedParameter,
+    /// 色相回転角（度, 既定 `0.0`）。
+    #[serde(default = "default_zero")]
+    pub hue_deg: AnimatedParameter,
+    /// ガンマ補正 (`0.05..=5.0`, 既定 `1.0`)。
+    #[serde(default = "default_one")]
+    pub gamma: AnimatedParameter,
 }
 
 impl VisualProperties {
@@ -199,6 +247,11 @@ impl VisualProperties {
         let anchor_x = self.anchor_x.evaluate(ctx)?;
         let anchor_y = self.anchor_y.evaluate(ctx)?;
         let opacity = self.opacity.evaluate(ctx)?;
+        let brightness = self.brightness.evaluate(ctx)?;
+        let contrast = self.contrast.evaluate(ctx)?;
+        let saturation = self.saturation.evaluate(ctx)?;
+        let hue_deg = self.hue_deg.evaluate(ctx)?;
+        let gamma = self.gamma.evaluate(ctx)?;
 
         Ok(EvaluatedVisual::from_components(
             x,
@@ -210,7 +263,8 @@ impl VisualProperties {
             anchor_y,
             opacity,
             self.blend_mode,
-        ))
+        )
+        .with_color_adjustments(brightness, contrast, saturation, hue_deg, gamma))
     }
 }
 
@@ -226,6 +280,11 @@ impl Default for VisualProperties {
             anchor_y: default_zero(),
             opacity: default_one(),
             blend_mode: BlendMode::Normal,
+            brightness: default_zero(),
+            contrast: default_one(),
+            saturation: default_one(),
+            hue_deg: default_zero(),
+            gamma: default_one(),
         }
     }
 }

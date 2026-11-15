@@ -6,9 +6,9 @@ use gpui_kit::RenderImage;
 use image::{Frame as ImageFrame, RgbaImage};
 
 use crate::core::animation::EvaluationContext;
-use crate::core::color::RgbaColor;
 use crate::core::ids::AssetId;
 use crate::core::time::FrameIndex;
+use crate::media::compositor::{WgpuCompositor, build_render_scene};
 use crate::media::decoder::{FramePixelFormat, VideoFrameBuffer};
 use crate::media::visual_properties::EvaluatedVisual;
 use crate::timeline::document::{AssetStatus, Clip, ClipKind, ProjectDocument};
@@ -135,6 +135,34 @@ pub fn composite_timeline_preview(
     }
 }
 
+/// 利用可能な場合は `wgpu` GPU 合成（フル解像度評価→縮小→ステージング読出し）を使用し、
+/// GPU アダプタ不在環境では CPU ソフト合成へフォールバックする統合エントリ。
+pub fn composite_with_gpu_or_fallback(
+    doc: &ProjectDocument,
+    playhead: FrameIndex,
+    preview_width: u32,
+    preview_height: u32,
+    gpu_compositor: Option<&mut WgpuCompositor>,
+    lookup_asset_frame: &mut dyn FnMut(&AssetId, u64) -> Option<Arc<VideoFrameBuffer>>,
+) -> CompositePreviewOutput {
+    if let Some(gpu) = gpu_compositor {
+        let scene = build_render_scene(doc, playhead, lookup_asset_frame);
+        if let Ok(buffer) = gpu.render_scene_to_bgra8(&scene, preview_width, preview_height) {
+            return CompositePreviewOutput {
+                buffer,
+                has_missing_media: scene.has_missing_media,
+            };
+        }
+    }
+    composite_timeline_preview(
+        doc,
+        playhead,
+        preview_width,
+        preview_height,
+        lookup_asset_frame,
+    )
+}
+
 const fn clip_contains_frame(clip: &Clip, frame: FrameIndex) -> bool {
     let start = clip.timeline_start.get();
     let end = start.saturating_add(clip.duration.get());
@@ -215,7 +243,13 @@ fn composite_single_clip(
         }
         ClipKind::Subtitle(sub) => {
             if let Ok(evaluated) = sub.visual.evaluate(ctx) {
-                draw_subtitle_indicator(canvas, evaluated, sub.outline_color);
+                #[allow(clippy::cast_possible_truncation)]
+                let font_size = sub.font_size.evaluate(ctx).unwrap_or(42.0).max(6.0) as f32;
+                let wrap_width = doc.resolution.width.get().clamp(128, 3840);
+                let buffer = crate::media::subtitle_renderer::render_subtitle_cached(
+                    sub, font_size, wrap_width,
+                );
+                blit_scaled_layer(canvas, &buffer, evaluated, doc);
             }
         }
         ClipKind::Audio { .. } => {}
@@ -298,26 +332,11 @@ fn blend_bgra_pixel(dst: &mut [u8], src: &[u8], layer_opacity: f64) {
     dst[3] = 255;
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn draw_subtitle_indicator(dst: &mut VideoFrameBuffer, visual: EvaluatedVisual, accent: RgbaColor) {
-    let band_h = (dst.height / 8).max(8);
-    let y0 = dst.height.saturating_sub(band_h + (dst.height / 12));
-    let x0 = dst.width / 8;
-    let x1 = dst.width.saturating_sub(x0);
-    let src_bgra = [accent.blue, accent.green, accent.red, 180];
-    let opacity = visual.opacity * 0.75;
-    for py in y0..y0.saturating_add(band_h).min(dst.height) {
-        for px in x0..x1 {
-            let idx = ((py as usize) * (dst.width as usize) + (px as usize)) * 4;
-            blend_bgra_pixel(&mut dst.data[idx..idx + 4], &src_bgra, opacity);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::animation::AnimatedParameter;
+    use crate::core::color::RgbaColor;
     use crate::core::ids::{ClipId, LayerId};
     use crate::core::time::FrameCount;
     use crate::media::visual_properties::VisualProperties;

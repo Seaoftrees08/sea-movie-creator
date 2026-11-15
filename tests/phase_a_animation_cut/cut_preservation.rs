@@ -76,9 +76,7 @@ fn easing_keyframes_and_expression_remain_continuous_across_split_and_trim_left(
             ],
             extrapolation: ExtrapolationMode::Clamp,
         },
-        rotation_deg: AnimatedParameter::Expression {
-            expr: "sin(pi * p) * 90 + t * 15".to_owned(),
-        },
+        rotation_deg: AnimatedParameter::expression("sin(pi * p) * 90 + t * 15"),
         scale_x: AnimatedParameter::constant(1.5),
         ..VisualProperties::default()
     };
@@ -191,9 +189,7 @@ fn invalid_expression_is_rejected_at_dispatch_time() -> Result<(), Box<dyn std::
             },
             path: ParameterPath::X,
             value: ParameterValue::Animated {
-                param: AnimatedParameter::Expression {
-                    expr: "unknown_var + 1".to_owned(),
-                },
+                param: AnimatedParameter::expression("unknown_var + 1"),
             },
         },
     );

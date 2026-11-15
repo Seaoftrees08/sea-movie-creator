@@ -1,0 +1,22 @@
+[package]
+name = "sea-export-av1"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure Rust AV1 + FLAC Matroska export plugin for sea-movie-creator"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+flacenc.workspace = true
+rav1e.workspace = true
+sea-export-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+webm-iterable.workspace = true
+
+[dev-dependencies]
+matroska-demuxer.workspace = true

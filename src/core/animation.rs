@@ -241,7 +241,17 @@ pub enum AnimatedParameter {
     Expression {
         /// 評価する数式文字列（利用可能変数: `t`, `p`, `d`, `pi`, `e`）。
         expr: String,
+        /// 計算結果に加算する基準オフセット（既定値 `0.0`）。
+        #[serde(default)]
+        base_offset: f64,
+        /// 数式出力へ乗算するスケール係数（既定値 `1.0`）。
+        #[serde(default = "default_scale_one")]
+        scale: f64,
     },
+}
+
+const fn default_scale_one() -> f64 {
+    1.0
 }
 
 impl AnimatedParameter {
@@ -249,6 +259,26 @@ impl AnimatedParameter {
     #[must_use]
     pub const fn constant(value: f64) -> Self {
         Self::Constant { value }
+    }
+
+    /// 基準値そのままの数式 `f(t)` パラメータを作成する。
+    #[must_use]
+    pub fn expression(expr: impl Into<String>) -> Self {
+        Self::Expression {
+            expr: expr.into(),
+            base_offset: 0.0,
+            scale: 1.0,
+        }
+    }
+
+    /// 基準オフセット・倍率付きの `f(t)` パラメータを作成する。
+    #[must_use]
+    pub fn expression_with_tuning(expr: impl Into<String>, base_offset: f64, scale: f64) -> Self {
+        Self::Expression {
+            expr: expr.into(),
+            base_offset,
+            scale,
+        }
     }
 
     /// 指定された時刻コンテキストにおけるパラメータ値を評価する。
@@ -277,12 +307,17 @@ impl AnimatedParameter {
                 keyframes,
                 extrapolation,
             } => evaluate_keyframes(keyframes, *extrapolation, effect_frame as f64)?,
-            Self::Expression { expr } => {
+            Self::Expression {
+                expr,
+                base_offset,
+                scale,
+            } => {
                 let fps_f64 = ctx.fps.as_f64();
                 let t = (effect_frame as f64) / fps_f64;
                 let p = ctx.normalized_progress(effect_frame);
                 let d = (ctx.effect_duration_frames.get() as f64) / fps_f64;
-                evaluate_expression(expr, ExprContext { t, p, d })?
+                let raw = evaluate_expression(expr, ExprContext { t, p, d })?;
+                scale.mul_add(raw, *base_offset)
             }
         };
 
@@ -557,6 +592,22 @@ mod tests {
         assert!((make(ExtrapolationMode::Extrapolate).evaluate(ctx_at(25))? - 150.0).abs() < 1e-9);
         assert!((make(ExtrapolationMode::Loop).evaluate(ctx_at(25))? - 50.0).abs() < 1e-9);
         assert!((make(ExtrapolationMode::PingPong).evaluate(ctx_at(23))? - 70.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn expression_tuning_applies_scale_and_offset_and_defaults_from_legacy_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy: AnimatedParameter =
+            serde_json::from_str(r#"{"kind":"expression","expr":"p * 10"}"#)?;
+        let dur = FrameCount::new(11)?;
+        let ctx = EvaluationContext::new(0, 5, dur, FrameRate::FPS_60);
+        // p = 5 / 10 = 0.5 -> raw = 5.0 -> 0.0 + 1.0 * 5.0
+        assert!((legacy.evaluate(ctx)? - 5.0).abs() < 1e-9);
+
+        let tuned = AnimatedParameter::expression_with_tuning("p * 10", 100.0, 2.5);
+        // 100.0 + 2.5 * 5.0 = 112.5
+        assert!((tuned.evaluate(ctx)? - 112.5).abs() < 1e-9);
         Ok(())
     }
 }
