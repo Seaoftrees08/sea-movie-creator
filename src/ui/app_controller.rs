@@ -127,10 +127,12 @@ impl PreviewZoomMode {
 fn default_inspector_sections() -> std::collections::HashMap<String, bool> {
     let mut map = std::collections::HashMap::new();
     map.insert("standard".to_owned(), true);
+    map.insert("anchor".to_owned(), false);
     map.insert("color".to_owned(), false);
     map.insert("subtitle".to_owned(), true);
     map.insert("audio".to_owned(), true);
     map.insert("plugins".to_owned(), false);
+    map.insert("expression".to_owned(), false);
     map
 }
 
@@ -265,6 +267,8 @@ pub struct AppController {
     pub right_panel_width: Option<f32>,
     /// クリップインスペクタの編集中下書き状態。
     pub inspector: crate::ui::inspector_panel::InspectorState,
+    /// インスペクタのトラックバー水平ドラッグ状態（未コミット中ライブ編集）。
+    pub trackbar_drag: Option<crate::ui::inspector_panel::ActiveTrackBarDrag>,
     /// 動画書き出し設定モーダルダイアログ状態。
     pub export_dialog: crate::ui::export_dialog::ExportDialogState,
     /// 画面下部の最新ステータスメッセージ。
@@ -362,6 +366,7 @@ impl AppController {
             right_tab: RightPanelTab::ClipInspector,
             right_panel_width: None,
             inspector: crate::ui::inspector_panel::InspectorState::default(),
+            trackbar_drag: None,
             export_dialog: crate::ui::export_dialog::ExportDialogState::default(),
             status_message: "準備完了".to_owned(),
             surface_bridge: RenderImageSurfaceBridge::new(),
@@ -1061,10 +1066,8 @@ impl AppController {
 
     /// 指定フレームへシークし、プレビューを即時更新する。
     pub fn seek_to_frame(&mut self, frame: FrameIndex) {
-        self.clock.update_timeline_metrics(
-            self.document.fps,
-            self.document.total_duration_frames(),
-        );
+        self.clock
+            .update_timeline_metrics(self.document.fps, self.document.total_duration_frames());
         let max_frame = self.document.seek_upper_bound_frames();
         let clamped = FrameIndex::new(frame.get().min(max_frame));
         let was_playing = self.playback_state == PlaybackState::Playing;
@@ -1665,6 +1668,197 @@ impl AppController {
             locked: Some(!cur),
         })?;
         Ok(())
+    }
+
+    /// インスペクタのトラックバー水平ドラッグを開始する（ライブ反映のみ・Undo 未記録）。
+    pub fn begin_trackbar_drag(&mut self, start: crate::ui::inspector::TrackBarDragStart) {
+        self.trackbar_drag = None;
+        let Some((layer, clip)) = self.document.find_clip(&start.clip_id) else {
+            return;
+        };
+        if layer.locked {
+            return;
+        }
+        let Some(view) = crate::ui::inspector::read_trackbar_segment_view(
+            &self.document,
+            clip,
+            start.slot,
+            start.segment_index,
+        ) else {
+            return;
+        };
+        if matches!(view.mode, crate::ui::inspector::InspectorMode::Expression) {
+            "数式 f(t) モードは数式欄から編集してください".clone_into(&mut self.status_message);
+            return;
+        }
+        let Some(original_param) = start.slot.extract_param(clip).cloned() else {
+            return;
+        };
+        let paired_slot = crate::ui::inspector::segment_ops::paired_scale_slot(start.slot);
+        let original_paired_param = paired_slot.and_then(|ps| ps.extract_param(clip).cloned());
+        let aspect_ratio = paired_slot.map(|ps| {
+            crate::ui::inspector::segment_ops::compute_scale_aspect_ratio(
+                &self.document,
+                clip,
+                start.slot,
+                ps,
+                view.segment_index,
+                start.is_end,
+            )
+        });
+        let current_internal = if start.is_end {
+            view.end_value
+        } else {
+            view.start_value
+        };
+        self.trackbar_drag = Some(crate::ui::inspector::ActiveTrackBarDrag {
+            clip_id: start.clip_id,
+            slot: start.slot,
+            segment_index: view.segment_index,
+            is_end: start.is_end,
+            scale_aspect_locked: self.scale_aspect_locked,
+            aspect_ratio,
+            last_pointer_x_px: start.pointer_x_px,
+            current_ui: start.slot.internal_to_ui(current_internal),
+            track_width_px: start.track_width_px.max(24.0),
+            original_param,
+            original_paired_param,
+            original_clip_midpoints: clip.midpoints.clone(),
+        });
+    }
+
+    /// インスペクタのトラックバードラッグを更新し、一時パラメータへ即座にプレビュー反映する。
+    pub fn update_trackbar_drag(&mut self, pointer_x_px: f32, fine_shift: bool) {
+        let Some(mut drag) = self.trackbar_drag.take() else {
+            return;
+        };
+        let dx = f64::from(pointer_x_px - drag.last_pointer_x_px);
+        drag.last_pointer_x_px = pointer_x_px;
+        let (min_ui, max_ui, _) = drag.slot.ui_bounds();
+        let sensitivity = if fine_shift { 0.1 } else { 1.0 };
+        let width = f64::from(drag.track_width_px.max(24.0));
+        let delta_ui = (dx / width) * (max_ui - min_ui) * sensitivity;
+        drag.current_ui = (drag.current_ui + delta_ui).clamp(min_ui, max_ui);
+        let new_internal = drag.slot.ui_to_internal(drag.current_ui);
+
+        let transient = self
+            .document
+            .find_clip(&drag.clip_id)
+            .and_then(|(_, clip)| {
+                crate::ui::inspector::build_transient_drag_param_pair(
+                    &self.document,
+                    clip,
+                    &drag.original_param,
+                    drag.original_paired_param.as_ref(),
+                    &crate::ui::inspector::SegmentEndpointEdit {
+                        slot: drag.slot,
+                        segment_index: drag.segment_index,
+                        is_end: drag.is_end,
+                        new_value: new_internal,
+                        scale_aspect_locked: drag.scale_aspect_locked,
+                        aspect_ratio_override: drag.aspect_ratio,
+                    },
+                )
+            });
+
+        if let Some((next_primary, next_paired)) = transient {
+            self.write_transient_drag_params(&drag, next_primary, next_paired);
+        }
+        self.trackbar_drag = Some(drag);
+    }
+
+    /// 進行中のトラックバードラッグを破棄し、ドラッグ前パラメータへ即座に戻す。
+    pub fn cancel_trackbar_drag(&mut self) {
+        let Some(drag) = self.trackbar_drag.take() else {
+            return;
+        };
+        self.restore_original_drag_params(&drag);
+    }
+
+    /// トラックバードラッグ終了時に最終値を単一 Undo エントリとして確定コミットする。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時は元パラメータへ復元した上でエラーを返す。
+    pub fn finish_trackbar_drag(&mut self) -> Result<bool, String> {
+        let Some(drag) = self.trackbar_drag.take() else {
+            return Ok(false);
+        };
+        self.restore_original_drag_params(&drag);
+
+        let cmd = {
+            let Some((_, clip)) = self.document.find_clip(&drag.clip_id) else {
+                return Ok(false);
+            };
+            crate::ui::inspector::build_set_segment_endpoint_with_lock(
+                &self.document,
+                clip,
+                &crate::ui::inspector::SegmentEndpointEdit {
+                    slot: drag.slot,
+                    segment_index: drag.segment_index,
+                    is_end: drag.is_end,
+                    new_value: drag.slot.ui_to_internal(drag.current_ui),
+                    scale_aspect_locked: drag.scale_aspect_locked,
+                    aspect_ratio_override: drag.aspect_ratio,
+                },
+            )?
+        };
+        self.dispatch_command(&cmd)?;
+        Ok(true)
+    }
+
+    fn write_transient_drag_params(
+        &mut self,
+        drag: &crate::ui::inspector::ActiveTrackBarDrag,
+        primary: crate::core::animation::AnimatedParameter,
+        paired: Option<crate::core::animation::AnimatedParameter>,
+    ) {
+        let fps = self.document.fps;
+        if let Some(clip) = self
+            .document
+            .layers
+            .iter_mut()
+            .flat_map(|l| &mut l.clips)
+            .find(|c| c.id == drag.clip_id)
+        {
+            if let Some(slot_ref) = drag.slot.extract_param_mut(clip) {
+                *slot_ref = primary;
+            }
+            if let (Some(next_paired), Some(paired_slot)) = (
+                paired,
+                crate::ui::inspector::segment_ops::paired_scale_slot(drag.slot),
+            ) && let Some(p_ref) = paired_slot.extract_param_mut(clip)
+            {
+                *p_ref = next_paired;
+            }
+            crate::ui::inspector::align_clip_after_transient_edit(clip, fps);
+        }
+        self.dirty_preview = true;
+        self.refresh_preview_now();
+    }
+
+    fn restore_original_drag_params(&mut self, drag: &crate::ui::inspector::ActiveTrackBarDrag) {
+        if let Some(clip) = self
+            .document
+            .layers
+            .iter_mut()
+            .flat_map(|l| &mut l.clips)
+            .find(|c| c.id == drag.clip_id)
+        {
+            if let Some(slot_ref) = drag.slot.extract_param_mut(clip) {
+                *slot_ref = drag.original_param.clone();
+            }
+            if let (Some(orig_paired), Some(paired_slot)) = (
+                &drag.original_paired_param,
+                crate::ui::inspector::segment_ops::paired_scale_slot(drag.slot),
+            ) && let Some(p_ref) = paired_slot.extract_param_mut(clip)
+            {
+                *p_ref = orig_paired.clone();
+            }
+            clip.midpoints.clone_from(&drag.original_clip_midpoints);
+        }
+        self.dirty_preview = true;
+        self.refresh_preview_now();
     }
 
     fn next_seq(&mut self) -> u64 {

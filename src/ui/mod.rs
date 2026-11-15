@@ -3,6 +3,7 @@
 pub mod ai_chat_panel;
 pub mod app_controller;
 pub mod export_dialog;
+pub mod inspector;
 pub mod inspector_panel;
 pub mod key_config;
 pub mod menu_bar;

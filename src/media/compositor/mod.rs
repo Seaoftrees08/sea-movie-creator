@@ -379,6 +379,8 @@ impl WgpuCompositor {
     ///
     /// アダプタが見つからない、またはデバイス作成に失敗した場合 [`CompositorError`] を返す。
     pub fn try_new() -> Result<Self, CompositorError> {
+        static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _init_guard = INIT_LOCK.lock();
         let instance = wgpu::Instance::default();
         let adapter = request_best_adapter(&instance)?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {

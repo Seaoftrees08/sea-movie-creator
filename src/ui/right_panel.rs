@@ -1,11 +1,11 @@
 //! 右側インスペクタ・タブコンテナ（クリップ設定 / AIチャット / レイヤー / プロジェクト）。
 
+use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
-use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::{Context, Entity, IntoElement, ParentElement as _, Styled as _, div, px, rgba};
 
 use crate::timeline::document::TimelineLengthMode;

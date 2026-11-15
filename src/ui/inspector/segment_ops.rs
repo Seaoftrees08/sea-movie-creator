@@ -482,6 +482,34 @@ impl InspectorParameterSlot {
             Self::AudioPan => audio.map(|a| &a.pan),
         }
     }
+
+    /// クリップから該当スロットの `AnimatedParameter` への可変参照を取り出す。
+    pub fn extract_param_mut(self, clip: &mut Clip) -> Option<&mut AnimatedParameter> {
+        let (visual, audio, font_size) = match &mut clip.kind {
+            ClipKind::Video { visual, audio, .. } => (Some(visual), audio.as_mut(), None),
+            ClipKind::Image { visual, .. } => (Some(visual), None, None),
+            ClipKind::Subtitle(sub) => (Some(&mut sub.visual), None, Some(&mut sub.font_size)),
+            ClipKind::Audio { audio, .. } => (None, Some(audio), None),
+        };
+        match self {
+            Self::PositionX => visual.map(|v| &mut v.x),
+            Self::PositionY => visual.map(|v| &mut v.y),
+            Self::ScaleX => visual.map(|v| &mut v.scale_x),
+            Self::ScaleY => visual.map(|v| &mut v.scale_y),
+            Self::RotationDeg => visual.map(|v| &mut v.rotation_deg),
+            Self::AnchorX => visual.map(|v| &mut v.anchor_x),
+            Self::AnchorY => visual.map(|v| &mut v.anchor_y),
+            Self::Opacity => visual.map(|v| &mut v.opacity),
+            Self::Brightness => visual.map(|v| &mut v.brightness),
+            Self::Contrast => visual.map(|v| &mut v.contrast),
+            Self::Saturation => visual.map(|v| &mut v.saturation),
+            Self::HueDeg => visual.map(|v| &mut v.hue_deg),
+            Self::Gamma => visual.map(|v| &mut v.gamma),
+            Self::SubtitleFontSize => font_size,
+            Self::AudioVolume => audio.map(|a| &mut a.gain_db),
+            Self::AudioPan => audio.map(|a| &mut a.pan),
+        }
+    }
 }
 
 /// インスペクタパネルの編集用下書き状態（`AppController` に保持）。
@@ -659,8 +687,10 @@ impl TrackBarSegmentView {
     /// 当該セグメントが 3 次ベジェ曲線補間か。
     #[must_use]
     pub const fn is_bezier(&self) -> bool {
-        !matches!(self.mode, InspectorMode::Constant | InspectorMode::Expression)
-            && matches!(self.segment_curve, EasingCurve::CubicBezier { .. })
+        !matches!(
+            self.mode,
+            InspectorMode::Constant | InspectorMode::Expression
+        ) && matches!(self.segment_curve, EasingCurve::CubicBezier { .. })
     }
 
     /// 当該パラメータが数式 `f(t)` モードか。
@@ -1003,7 +1033,9 @@ pub fn build_set_segment_endpoint_with_lock(
     })
 }
 
-fn paired_scale_slot(slot: InspectorParameterSlot) -> Option<InspectorParameterSlot> {
+/// 拡大率 `ScaleX` ⇔ `ScaleY` の対になるスロットを返す。
+#[must_use]
+pub const fn paired_scale_slot(slot: InspectorParameterSlot) -> Option<InspectorParameterSlot> {
     match slot {
         InspectorParameterSlot::ScaleX => Some(InspectorParameterSlot::ScaleY),
         InspectorParameterSlot::ScaleY => Some(InspectorParameterSlot::ScaleX),
@@ -1011,7 +1043,9 @@ fn paired_scale_slot(slot: InspectorParameterSlot) -> Option<InspectorParameterS
     }
 }
 
-fn compute_scale_aspect_ratio(
+/// 拡大率ロック時に維持する `paired / primary` アスペクト比率を計算する。
+#[must_use]
+pub fn compute_scale_aspect_ratio(
     doc: &ProjectDocument,
     clip: &Clip,
     slot: InspectorParameterSlot,
@@ -1021,9 +1055,8 @@ fn compute_scale_aspect_ratio(
 ) -> f64 {
     let primary_old = read_trackbar_segment_view(doc, clip, slot, segment_index)
         .map_or(1.0, |v| if is_end { v.end_value } else { v.start_value });
-    let paired_old =
-        read_trackbar_segment_view(doc, clip, paired_slot, segment_index)
-            .map_or(1.0, |v| if is_end { v.end_value } else { v.start_value });
+    let paired_old = read_trackbar_segment_view(doc, clip, paired_slot, segment_index)
+        .map_or(1.0, |v| if is_end { v.end_value } else { v.start_value });
     if primary_old.abs() > 1e-6 {
         paired_old / primary_old
     } else {

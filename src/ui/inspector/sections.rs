@@ -1,12 +1,12 @@
 //! インスペクタ `Collapsible` セクション・未選択/複数選択・字幕/音声/数式 UI。
 
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
-use gpui_kit::base::StyledExt as _;
 use gpui_kit::{
     AnyElement, Context, IntoElement, ParentElement as _, Styled as _, Window, div, px, rgba,
 };
@@ -136,7 +136,12 @@ fn render_multi_select_inspector(
                 ),
         )
         .child(render_multi_select_actions(selected_ids, cx))
-        .child(render_multi_select_offset_box(selected_ids, bank, theme, cx))
+        .child(render_multi_select_offset_box(
+            selected_ids,
+            bank,
+            theme,
+            cx,
+        ))
 }
 
 fn render_multi_select_actions(
@@ -626,7 +631,9 @@ fn render_subtitle_section_body(
         .gap_1p5()
         .w_full()
         .child(render_subtitle_text_box(&clip.id, bank, theme, cx))
-        .child(render_subtitle_font_align_row(&clip.id, sub, bank, theme, cx))
+        .child(render_subtitle_font_align_row(
+            &clip.id, sub, bank, theme, cx,
+        ))
         .child(render_subtitle_color_outline_row(bank, theme))
         .child(render_trackbar_row(
             controller,
@@ -705,29 +712,37 @@ fn render_subtitle_font_align_row(
                 .child("ﾌｫﾝﾄ"),
         )
         .child(div().flex_1().child(Input::new(&bank.font_family_input)))
-        .children(alignments.into_iter().enumerate().map(|(ix, (lbl, align))| {
-            let cid_btn = cid_align.clone();
-            let mut b = Button::new(("sub-align-btn", ix)).small().label(lbl);
-            b = if sub.alignment == align {
-                b.primary()
-            } else {
-                b.ghost()
-            };
-            b.on_click(cx.listener(move |this, _, _, cx| {
-                let cmd = EditCommand::SetParameter {
-                    target: ParameterTarget::Clip {
-                        clip_id: ClipRef::Id(cid_btn.clone()),
-                    },
-                    path: ParameterPath::SubtitleAlignment,
-                    value: ParameterValue::TextAlignment { value: align },
-                };
-                let _ = this.controller.dispatch_command(&cmd);
-                cx.notify();
-            }))
-        }))
+        .children(
+            alignments
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (lbl, align))| {
+                    let cid_btn = cid_align.clone();
+                    let mut b = Button::new(("sub-align-btn", ix)).small().label(lbl);
+                    b = if sub.alignment == align {
+                        b.primary()
+                    } else {
+                        b.ghost()
+                    };
+                    b.on_click(cx.listener(move |this, _, _, cx| {
+                        let cmd = EditCommand::SetParameter {
+                            target: ParameterTarget::Clip {
+                                clip_id: ClipRef::Id(cid_btn.clone()),
+                            },
+                            path: ParameterPath::SubtitleAlignment,
+                            value: ParameterValue::TextAlignment { value: align },
+                        };
+                        let _ = this.controller.dispatch_command(&cmd);
+                        cx.notify();
+                    }))
+                }),
+        )
 }
 
-fn render_subtitle_color_outline_row(bank: &InspectorWidgetBank, theme: &Theme) -> impl IntoElement {
+fn render_subtitle_color_outline_row(
+    bank: &InspectorWidgetBank,
+    theme: &Theme,
+) -> impl IntoElement {
     h_flex()
         .items_center()
         .gap_2()
@@ -752,7 +767,11 @@ fn render_subtitle_color_outline_row(bank: &InspectorWidgetBank, theme: &Theme) 
                         .text_color(theme.muted_foreground)
                         .child("縁幅"),
                 )
-                .child(div().w(px(46.0)).child(Input::new(&bank.outline_width_input))),
+                .child(
+                    div()
+                        .w(px(46.0))
+                        .child(Input::new(&bank.outline_width_input)),
+                ),
         )
 }
 

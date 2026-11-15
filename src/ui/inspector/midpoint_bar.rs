@@ -1,8 +1,8 @@
 //! クリップ上部の中間点ナビゲーション・セグメント切替バー。
 
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
-use gpui_kit::base::Disableable as _;
 use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div, px, relative, rgba,

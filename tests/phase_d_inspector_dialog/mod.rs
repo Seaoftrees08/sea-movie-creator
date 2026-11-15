@@ -133,13 +133,7 @@ fn segment_edits_scale_lock_opacity_ui_and_expression_undo_flow()
     // Switch X to Expression f(t)
     let expr_cmd = {
         let (_, clip) = controller.document.find_clip(&cid).ok_or("clip")?;
-        build_expression_command(
-            clip,
-            InspectorParameterSlot::PositionX,
-            "100 * p",
-            0.0,
-            1.0,
-        )?
+        build_expression_command(clip, InspectorParameterSlot::PositionX, "100 * p", 0.0, 1.0)?
     };
     controller.dispatch_command(&expr_cmd)?;
 
