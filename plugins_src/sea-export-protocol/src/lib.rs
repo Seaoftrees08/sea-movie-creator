@@ -1,6 +1,8 @@
 //! `sea-movie-creator` ホスト本体と外部プロセス書き出しプラグイン間の共通 IPC プロトコル。
 
+pub mod audio_ipc;
 pub mod backends;
+pub mod external_ffmpeg;
 
 use std::io::{BufRead, Write};
 use std::ops::Range;

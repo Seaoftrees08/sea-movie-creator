@@ -132,8 +132,8 @@ pub struct AppController {
     dirty_preview: bool,
     /// アクティブな動画デコーダ（素材 ID ごと）。
     video_decoders: HashMap<AssetId, Box<dyn VideoDecoder>>,
-    /// AI チャット欄のプレースホルダ入力。
-    pub ai_chat_draft: String,
+    /// VS Code 風 AI チャットパネル状態・提案カード・履歴。
+    pub ai_chat: crate::ui::ai_chat_panel::AiChatState,
     /// タイムライン 1 フレームあたりの横幅（px）。
     pub timeline_px_per_frame: f32,
     /// タイムラインの水平スクロール基準フレーム。
@@ -204,7 +204,7 @@ impl AppController {
             last_rendered_frame: None,
             dirty_preview: true,
             video_decoders: HashMap::new(),
-            ai_chat_draft: String::new(),
+            ai_chat: crate::ui::ai_chat_panel::AiChatState::default(),
             timeline_px_per_frame: 3.0,
             timeline_scroll_x_frames: 0,
             clipboard: None,

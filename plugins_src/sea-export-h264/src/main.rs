@@ -2,20 +2,17 @@
 
 #![doc = "H.264/AAC MP4 export plugin implementing sea-export-protocol v1 without bundling GPL/patented encoders."]
 
-mod ffmpeg_cli;
-
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use sea_export_protocol::backends::mf_sink::{MfSinkConfig, MfSinkWriter, MfVideoCodec};
 use sea_export_protocol::backends::shm_mmap::ShmPluginRegion;
+use sea_export_protocol::external_ffmpeg::{ExternalFfmpegSession, FfmpegVideoCodec};
 use sea_export_protocol::{
     EXPORT_PROTOCOL_VERSION, ExportInitPayload, HostToPluginMessage, PixelFormat,
     PluginToHostMessage, SlotKind, read_json_line, write_json_line,
 };
 use serde_json::Value;
-
-use ffmpeg_cli::ExternalFfmpegSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H264BackendMode {
@@ -118,6 +115,7 @@ impl H264Session {
                     &init,
                     &settings.ffmpeg_path,
                     settings.bitrate_kbps,
+                    FfmpegVideoCodec::H264,
                 )?;
                 H264Backend::ExternalFfmpeg(Box::new(ext))
             }

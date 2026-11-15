@@ -9,6 +9,8 @@
 pub enum MfVideoCodec {
     /// AVC / H.264 (`MFVideoFormat_H264`)。
     H264,
+    /// HEVC / H.265 (`MFVideoFormat_HEVC`)。
+    Hevc,
     /// AV1 (`MFVideoFormat_AV1`、OS / GPU ハードウェアエンコーダ MFT 利用)。
     Av1,
 }
@@ -72,7 +74,7 @@ mod imp {
         MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMediaType,
         MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Audio,
         MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup, MFVideoFormat_AV1,
-        MFVideoFormat_H264, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
+        MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
     use windows::core::{GUID, PCWSTR};
@@ -353,6 +355,7 @@ mod imp {
     fn setup_video_stream(writer: &IMFSinkWriter, config: &MfSinkConfig) -> Result<u32, String> {
         let out_subtype = match config.video_codec {
             MfVideoCodec::H264 => MFVideoFormat_H264,
+            MfVideoCodec::Hevc => MFVideoFormat_HEVC,
             MfVideoCodec::Av1 => MFVideoFormat_AV1,
         };
         let frame_size = pack_u64_pair(config.width, config.height);

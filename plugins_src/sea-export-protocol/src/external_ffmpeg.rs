@@ -1,15 +1,46 @@
-//! ユーザー導入済み外部 `ffmpeg` CLI を別プロセス起動して H.264 / AAC MP4 を生成するバックエンド。
+//! ユーザー導入済み外部 `ffmpeg` `CLI` を別プロセス起動して `H.264` / `HEVC` MP4・MOV を生成する共通セッション。
 //!
-//! バイナリにはいかなる GPL / 特許コーデックも同梱せず、指定された外部実行ファイルのみを呼び出す。
+//! 本クレートおよび書き出しプラグインバイナリには特許 / `GPL` コーデックを一切同梱しない。
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-use sea_export_protocol::ExportInitPayload;
+use crate::ExportInitPayload;
 
-/// 外部 `ffmpeg` 実行プロセスと一時音声バッファを管理するセッション。
+/// 外部 `ffmpeg` プロセスへ指定する映像エンコーダ種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfmpegVideoCodec {
+    /// `H.264` (`-c:v libx264`)。
+    H264,
+    /// `HEVC / H.265` ソフトウェア (`-c:v libx265`)。
+    HevcSw,
+    /// macOS `VideoToolbox` ハードウェア `HEVC` (`-c:v hevc_videotoolbox`)。
+    HevcVideoToolbox,
+    /// Linux `VA-API` ハードウェア `HEVC` (`-c:v hevc_vaapi`)。
+    HevcVaapi,
+}
+
+impl FfmpegVideoCodec {
+    const fn encoder_name(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::HevcSw => "libx265",
+            Self::HevcVideoToolbox => "hevc_videotoolbox",
+            Self::HevcVaapi => "hevc_vaapi",
+        }
+    }
+
+    const fn output_tag_args(self) -> &'static [&'static str] {
+        match self {
+            Self::H264 => &[],
+            Self::HevcSw | Self::HevcVideoToolbox | Self::HevcVaapi => &["-tag:v", "hvc1"],
+        }
+    }
+}
+
+/// 外部 `ffmpeg` 実行プロセスと一時音声バッファを管理する共通セッション。
 pub struct ExternalFfmpegSession {
     ffmpeg_cmd: String,
     sample_rate: u32,
@@ -26,7 +57,7 @@ pub struct ExternalFfmpegSession {
 }
 
 impl ExternalFfmpegSession {
-    /// 外部 `ffmpeg` を起動し、`stdin` からの生 BGRA ストリーム受付状態に入る。
+    /// 外部 `ffmpeg` を起動し、`stdin` からの生 `BGRA8` ストリーム受付状態に入る。
     ///
     /// # Errors
     ///
@@ -35,6 +66,7 @@ impl ExternalFfmpegSession {
         init: &ExportInitPayload,
         ffmpeg_cmd: &str,
         bitrate_kbps: u32,
+        codec: FfmpegVideoCodec,
     ) -> Result<Self, String> {
         let trimmed = ffmpeg_cmd.trim();
         if trimmed.is_empty() {
@@ -84,21 +116,22 @@ impl ExternalFfmpegSession {
             "pipe:0",
             "-an",
             "-c:v",
-            "libx264",
+            codec.encoder_name(),
             "-b:v",
             &bitrate_arg,
             "-pix_fmt",
             "yuv420p",
-            &temp_video_str,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        ]);
+        cmd.args(codec.output_tag_args());
+        cmd.arg(&temp_video_str)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|err| {
             let _ = std::fs::remove_file(&temp_audio_path);
             format!(
-                "外部 ffmpeg ('{trimmed}') を起動できませんでした ({err})。OS Media Foundation モードを使うか、ffmpeg を導入・パス指定してください。"
+                "外部 ffmpeg ('{trimmed}') を起動できませんでした ({err})。OS ネイティブ HW バックエンドを使うか、ffmpeg を導入・パス指定してください。"
             )
         })?;
 
@@ -142,7 +175,7 @@ impl ExternalFfmpegSession {
         Ok(())
     }
 
-    /// インターリーブ `f32` LE バイト列を一時音声ファイルへ追記する。
+    /// インターリーブ `f32` `LE` バイト列を一時音声ファイルへ追記する。
     ///
     /// # Errors
     ///
@@ -178,7 +211,7 @@ impl ExternalFfmpegSession {
         self.audio_samples_received
     }
 
-    /// 映像エンコードを確定し、音声がある場合は MP4 へ AAC 多重化して出力ファイルサイズを返す。
+    /// 映像エンコードを確定し、音声がある場合は MP4/MOV へ `AAC` 多重化して出力サイズを返す。
     ///
     /// # Errors
     ///
@@ -212,14 +245,14 @@ impl ExternalFfmpegSession {
 
         if self.audio_bytes_written == 0 || self.audio_channels == 0 {
             std::fs::copy(&self.temp_video_path, &self.output_path)
-                .map_err(|err| format!("出力 MP4 コピー失敗: {err}"))?;
+                .map_err(|err| format!("出力ファイルコピー失敗: {err}"))?;
         } else {
             self.mux_video_and_audio()?;
         }
 
         let size = std::fs::metadata(&self.output_path)
             .map(|m| m.len())
-            .map_err(|err| format!("出力 MP4 サイズ取得失敗: {err}"))?;
+            .map_err(|err| format!("出力ファイルサイズ取得失敗: {err}"))?;
         Ok((size, self.frames_submitted))
     }
 
@@ -286,14 +319,15 @@ impl Drop for ExternalFfmpegSession {
 
 #[cfg(test)]
 mod tests {
-    use sea_export_protocol::{
+    use crate::{
         AudioSampleFormat, EXPORT_PROTOCOL_VERSION, PixelFormat, ShmLayout, ShmLayoutSpec,
     };
 
     use super::*;
 
     #[test]
-    fn missing_external_ffmpeg_binary_returns_clear_error() {
+    fn missing_external_ffmpeg_binary_returns_clear_error() -> Result<(), Box<dyn std::error::Error>>
+    {
         let layout = ShmLayout::from_spec(ShmLayoutSpec {
             width: 32,
             height: 32,
@@ -302,8 +336,7 @@ mod tests {
             audio_channels: 2,
             audio_slot_capacity_frames: 1024,
             audio_slot_count: 2,
-        })
-        .unwrap();
+        })?;
         let init = ExportInitPayload {
             protocol_version: EXPORT_PROTOCOL_VERSION,
             width: 32,
@@ -321,14 +354,21 @@ mod tests {
                 .join("sea-missing-ffmpeg-out.mp4")
                 .to_string_lossy()
                 .into_owned(),
-            preset_id: "h264_external_ffmpeg".to_owned(),
+            preset_id: "h265_external_ffmpeg".to_owned(),
             options: serde_json::json!({}),
         };
 
-        let err = ExternalFfmpegSession::start(&init, "nonexistent-ffmpeg-binary-xyz123", 5000)
-            .err()
-            .unwrap();
+        let res = ExternalFfmpegSession::start(
+            &init,
+            "nonexistent-ffmpeg-binary-xyz123",
+            6000,
+            FfmpegVideoCodec::HevcSw,
+        );
+        let Err(err) = res else {
+            return Err("expected missing external ffmpeg binary to fail".into());
+        };
         assert!(err.contains("nonexistent-ffmpeg-binary-xyz123"));
         assert!(!PathBuf::from(&init.output_path).exists());
+        Ok(())
     }
 }

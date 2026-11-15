@@ -62,10 +62,17 @@ pub enum ParameterTarget {
         /// 対象クリップの確定 ID または同一バッチ内仮 ID。
         clip_id: ClipRef,
     },
+    /// クリップ上の外部音声プラグインスロットを変更する。
+    AudioPlugin {
+        /// 対象クリップの確定 ID または同一バッチ内仮 ID。
+        clip_id: ClipRef,
+        /// 対象プラグインスロット ID (`AudioPluginSlot::slot_id`)。
+        slot_id: String,
+    },
 }
 
 /// [`EditCommand::SetParameter`] で変更可能なプロパティパス。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ParameterPath {
     /// キャンバス中心基準の X 座標。
@@ -118,6 +125,13 @@ pub enum ParameterPath {
     SubtitleOutlineWidth,
     /// 字幕水平揃え位置。
     SubtitleAlignment,
+    /// 音声プラグインスロットの有効／バイパスフラグ。
+    PluginEnabled,
+    /// 音声プラグインスロット内の任意パラメータ値。
+    PluginParam {
+        /// 変更するプラグインパラメータ名。
+        param_name: String,
+    },
 }
 
 /// 数値アニメーションからテキスト・真偽値・色まで統一的に扱う変更値。

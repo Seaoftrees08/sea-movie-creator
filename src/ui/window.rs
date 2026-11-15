@@ -183,7 +183,11 @@ impl SeaEditorWindow {
                     let prev_frame = view.controller.clock.current_frame().get();
                     view.controller.tick_playback(elapsed);
                     let export_changed = view.controller.poll_export_status();
-                    if view.controller.clock.current_frame().get() != prev_frame || export_changed {
+                    let ai_changed = view.controller.poll_ai_chat();
+                    if view.controller.clock.current_frame().get() != prev_frame
+                        || export_changed
+                        || ai_changed
+                    {
                         view.sliders_dirty = true;
                         cx.notify();
                     }

@@ -1,0 +1,16 @@
+[package]
+name = "sea-export-h265"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "OS native HW (MF/VideoToolbox/VA-API) and external ffmpeg CLI H.265/HEVC export plugin for sea-movie-creator"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+sea-export-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true

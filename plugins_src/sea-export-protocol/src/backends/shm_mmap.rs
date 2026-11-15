@@ -80,6 +80,47 @@ impl ShmHostRegion {
         })
     }
 
+    /// 既存の共有メモリファイルを開き、読み書き可能にマップする（子プロセス・ワーカー用）。
+    ///
+    /// ホスト側が作成した一時ファイルを破棄しないよう、`Drop` 時の自動削除は無効化される。
+    ///
+    /// # Errors
+    ///
+    /// ファイルオープン失敗、サイズ不足、またはメモリマップ失敗時に [`ShmError`] を返す。
+    pub fn open_existing_rw(path: &Path, layout: ShmLayout) -> Result<Self, ShmError> {
+        let total_len = usize::try_from(layout.total_bytes)
+            .map_err(|_| ShmError::InvalidLayout("total_bytes overflows usize".to_owned()))?;
+        if total_len == 0 {
+            return Err(ShmError::InvalidLayout(
+                "shared memory size must be positive".to_owned(),
+            ));
+        }
+
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let metadata = file.metadata()?;
+        if metadata.len() < layout.total_bytes {
+            return Err(ShmError::InvalidLayout(format!(
+                "shared memory file too small: actual={}, expected={}",
+                metadata.len(),
+                layout.total_bytes
+            )));
+        }
+
+        // SAFETY:
+        // 1. ホスト側で `layout.total_bytes` 以上に拡張済みのファイルのみをマップする。
+        // 2. ワーカー側は自身の担当スロット（出力スロット等）にのみ書き込み、ホスト〜ワーカー間は
+        //    直列化された NDJSON IPC 指令・完了応答で同期されるため同時書き込み競合は起きない。
+        // 3. マップ中に外部プロセスがファイルを切り詰めることはない。
+        let mmap = unsafe { MmapOptions::new().len(total_len).map_mut(&file)? };
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            layout,
+            mmap: Some(mmap),
+            remove_on_drop: false,
+        })
+    }
+
     /// 共有メモリバッキングファイルのパスを返す。
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -142,6 +183,30 @@ impl ShmHostRegion {
             .zip(samples.iter().copied())
         {
             *dst = sample.to_le_bytes();
+        }
+        Ok(())
+    }
+
+    /// 指定された音声スロットからインターリーブ `f32` サンプル列を読み出す。
+    ///
+    /// # Errors
+    ///
+    /// マップ解放済み、スロット番号またはサンプル数が容量を超える場合に [`ShmError`] を返す。
+    pub fn read_audio_slot_f32(
+        &self,
+        slot_index: u32,
+        sample_count: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), ShmError> {
+        let byte_len = sample_count.saturating_mul(std::mem::size_of::<f32>());
+        let range = self.layout.audio_slot_byte_range(slot_index, byte_len)?;
+        let mmap = self.mmap.as_ref().ok_or_else(|| {
+            ShmError::InvalidLayout("host shared memory already closed".to_owned())
+        })?;
+        out.clear();
+        out.reserve(sample_count);
+        for chunk in mmap[range].as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(*chunk));
         }
         Ok(())
     }
@@ -263,6 +328,20 @@ mod tests {
 
         assert!(host.write_video_slot(2, &frame_bytes).is_err());
         drop(plugin);
+
+        // 既存ファイルを開いて双方向（スロット 0 -> スロット 1）の読み書きができること。
+        let mut worker = ShmHostRegion::open_existing_rw(&path, layout)?;
+        let mut in_buf = Vec::new();
+        worker.read_audio_slot_f32(0, samples.len(), &mut in_buf)?;
+        assert_eq!(in_buf, samples);
+        let processed: Vec<f32> = in_buf.into_iter().map(|s| s * 0.5).collect();
+        worker.write_audio_slot_f32(1, &processed)?;
+        drop(worker);
+
+        let mut out_buf = Vec::new();
+        host.read_audio_slot_f32(1, samples.len(), &mut out_buf)?;
+        assert_eq!(out_buf, processed);
+
         host.cleanup();
         assert!(!path.exists());
         Ok(())

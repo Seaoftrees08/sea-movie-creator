@@ -1,7 +1,7 @@
 //! 右側 1/5 リサイズ可能タブパネル: クリップ設定・AI チャット枠・レイヤー・プロジェクト情報。
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -77,7 +77,7 @@ pub fn render_right_panel(
             )
             .into_any_element(),
             RightPanelTab::AiChat => {
-                render_ai_chat_tab(widgets.ai_chat_input, cx).into_any_element()
+                render_ai_chat_tab(controller, widgets.ai_chat_input, cx).into_any_element()
             }
             RightPanelTab::LayerList => render_layers_tab(controller, cx).into_any_element(),
             RightPanelTab::ProjectInfo => render_project_tab(controller, cx).into_any_element(),
@@ -176,52 +176,11 @@ fn speed_button(
 }
 
 fn render_ai_chat_tab(
+    controller: &AppController,
     ai_chat_input: &Entity<InputState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    v_flex()
-        .size_full()
-        .p_3()
-        .gap_2()
-        .text_xs()
-        .child(
-            div()
-                .text_color(theme.foreground)
-                .child("AI 編集アシスタント（Phase B 連携枠）"),
-        )
-        .child(
-            div()
-                .flex_1()
-                .p_2()
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
-                .text_color(theme.muted_foreground)
-                .child("EditCommand / CommandDispatcher 直結の対話ログ領域（Phase B で接続）"),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(ai_chat_input)))
-                .child(
-                    Button::new("ai-send-btn")
-                        .primary()
-                        .small()
-                        .label("送信")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let msg = this.ai_chat_input.read(cx).value().to_string();
-                            if !msg.trim().is_empty() {
-                                this.controller.ai_chat_draft.clone_from(&msg);
-                                this.controller.status_message = format!("AI コマンド予約: {msg}");
-                                this.ai_chat_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                            }
-                            cx.notify();
-                        })),
-                ),
-        )
+    crate::ui::ai_chat_panel::render_ai_chat_panel(controller, ai_chat_input, cx)
 }
 
 fn render_layers_tab(

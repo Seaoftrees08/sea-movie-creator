@@ -218,11 +218,13 @@ pub struct MediaStreamInfo {
 /// メディアデコードバックエンドの選択方針。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendPreference {
-    /// Windows では OS ネイティブ (Media Foundation) とオープン SW (rav1d/symphonia) を形式に応じて自動選択し、失敗時にフォールバックする。
+    /// 各 OS のネイティブハードウェアバックエンド (`MediaFoundation` / `VideoToolbox` / `VA-API`) とオープン SW を形式に応じて自動選択し、失敗時にフォールバックする。
     #[default]
     Auto,
     /// 常にクロスプラットフォームなオープンソースデコーダ (`rav1d` / `symphonia` / `matroska-demuxer`) を使用する。
     OpenSoftware,
+    /// 現在の OS のネイティブハードウェアバックエンドを明示指定する。
+    NativeHardware,
     /// 常に Windows Media Foundation バックエンドを使用する（Windows 以外では利用不可）。
     WindowsMediaFoundation,
 }

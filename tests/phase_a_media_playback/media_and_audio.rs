@@ -292,6 +292,7 @@ fn wav_decode_rubato_resample_and_audio_mixer_synchronize_with_clock()
                 gain_db: AnimatedParameter::constant(0.0),
                 pan: AnimatedParameter::constant(0.0),
                 muted: false,
+                ..AudioProperties::default()
             },
         },
     });

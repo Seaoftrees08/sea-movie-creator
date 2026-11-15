@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "sea.ai.antigravity",
+  "name": "Google Antigravity (agy CLI)",
+  "version": "0.1.0",
+  "entrypoint": "sea-ai-antigravity",
+  "args": [],
+  "protocol": "sea_ai_v1",
+  "requires_external_cli": "agy",
+  "profiles": [
+    {
+      "id": "agy-default",
+      "label": "Antigravity Headless Stream-JSON",
+      "cli": "agy",
+      "args": []
+    }
+  ]
+}

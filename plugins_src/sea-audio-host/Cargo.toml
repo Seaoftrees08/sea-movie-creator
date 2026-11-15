@@ -1,0 +1,20 @@
+[package]
+name = "sea-audio-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Isolated external audio plugin worker (VST3 MIT / CLAP / SHM PCM ring buffer) for sea-movie-creator"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clack-extensions = { version = "0.2.0", features = ["clack-host", "params"] }
+clack-host = "0.2.0"
+libloading = "0.8"
+sea-export-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+vst3 = "0.3.0"

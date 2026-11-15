@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::audio::properties::AudioPluginParamValue;
 use crate::core::ids::{AssetId, AssetRef, ClipId, ClipRef, LayerId, LayerRef};
 use crate::core::time::{FrameCount, FrameIndex, PlaybackRate, frames_to_source_seconds};
 use crate::media::visual_properties::{SubtitleProperties, VisualProperties};
@@ -446,7 +447,7 @@ impl CommandRunner<'_, '_, '_> {
                 target,
                 path,
                 value,
-            } => set_parameter(self.doc, self.ctx, target, *path, value, self.undo_patches),
+            } => set_parameter(self.doc, self.ctx, target, path, value, self.undo_patches),
             EditCommand::SetPlaybackRate {
                 clip_id,
                 new_rate,
@@ -785,11 +786,14 @@ fn set_parameter(
     doc: &mut ProjectDocument,
     ctx: &ExecutionContext,
     target: &ParameterTarget,
-    path: ParameterPath,
+    path: &ParameterPath,
     value: &ParameterValue,
     undo_patches: &mut Vec<PatchStep>,
 ) -> Result<(), CommandError> {
-    let ParameterTarget::Clip { clip_id: clip_ref } = target;
+    let (clip_ref, slot_id_opt) = match target {
+        ParameterTarget::Clip { clip_id } => (clip_id, None),
+        ParameterTarget::AudioPlugin { clip_id, slot_id } => (clip_id, Some(slot_id.as_str())),
+    };
     let clip_id = ctx.resolve_clip(clip_ref)?;
     let (layer_idx, clip_idx) = locate_clip_mutable(doc, &clip_id)?;
     let layer_id = doc.layers[layer_idx].id.clone();
@@ -799,7 +803,12 @@ fn set_parameter(
 
     let old_clip = doc.layers[layer_idx].clips[clip_idx].clone();
     let clip = &mut doc.layers[layer_idx].clips[clip_idx];
-    apply_clip_parameter(&mut clip.kind, path, value)?;
+    if let Some(slot_id) = slot_id_opt {
+        let audio = clip_audio_mut(&mut clip.kind)?;
+        apply_audio_plugin_parameter(audio, slot_id, path, value)?;
+    } else {
+        apply_clip_parameter(&mut clip.kind, path, value)?;
+    }
     undo_patches.push(PatchStep::ReplaceClip {
         layer_id,
         clip: old_clip,
@@ -980,7 +989,7 @@ fn shift_source_in_signed(
 
 fn apply_clip_parameter(
     kind: &mut ClipKind,
-    path: ParameterPath,
+    path: &ParameterPath,
     value: &ParameterValue,
 ) -> Result<(), CommandError> {
     match path {
@@ -1016,6 +1025,63 @@ fn apply_clip_parameter(
             let sub = clip_subtitle_mut(kind)?;
             apply_subtitle_parameter(sub, path, value)
         }
+        ParameterPath::PluginEnabled | ParameterPath::PluginParam { .. } => {
+            Err(CommandError::Incompatible(
+                "audio plugin paths require ParameterTarget::AudioPlugin".to_owned(),
+            ))
+        }
+    }
+}
+
+fn apply_audio_plugin_parameter(
+    audio: &mut AudioProperties,
+    slot_id: &str,
+    path: &ParameterPath,
+    value: &ParameterValue,
+) -> Result<(), CommandError> {
+    let slot = audio
+        .plugin_slots
+        .iter_mut()
+        .find(|s| s.slot_id == slot_id)
+        .ok_or_else(|| {
+            CommandError::Incompatible(format!("audio plugin slot not found: {slot_id}"))
+        })?;
+    match path {
+        ParameterPath::PluginEnabled => {
+            let ParameterValue::Bool { value: enabled } = value else {
+                return Err(CommandError::Incompatible(
+                    "expected Bool ParameterValue for plugin_enabled".to_owned(),
+                ));
+            };
+            slot.enabled = *enabled;
+            Ok(())
+        }
+        ParameterPath::PluginParam { param_name } => {
+            let plugin_val = match value {
+                ParameterValue::Animated { param } => AudioPluginParamValue::Animated {
+                    param: param.clone(),
+                },
+                ParameterValue::Number { value } => {
+                    if !value.is_finite() {
+                        return Err(CommandError::Incompatible(
+                            "plugin parameter number must be finite".to_owned(),
+                        ));
+                    }
+                    AudioPluginParamValue::Number { value: *value }
+                }
+                ParameterValue::Bool { value } => AudioPluginParamValue::Bool { value: *value },
+                _ => {
+                    return Err(CommandError::Incompatible(
+                        "plugin_param requires Animated, Number, or Bool ParameterValue".to_owned(),
+                    ));
+                }
+            };
+            slot.parameters.insert(param_name.clone(), plugin_val);
+            Ok(())
+        }
+        _ => Err(CommandError::Incompatible(
+            "expected PluginEnabled or PluginParam for ParameterTarget::AudioPlugin".to_owned(),
+        )),
     }
 }
 
@@ -1081,7 +1147,7 @@ fn expect_animated(
 
 fn apply_visual_parameter(
     visual: &mut VisualProperties,
-    path: ParameterPath,
+    path: &ParameterPath,
     value: &ParameterValue,
 ) -> Result<(), CommandError> {
     match path {
@@ -1117,7 +1183,7 @@ fn apply_visual_parameter(
 
 fn apply_audio_parameter(
     audio: &mut AudioProperties,
-    path: ParameterPath,
+    path: &ParameterPath,
     value: &ParameterValue,
 ) -> Result<(), CommandError> {
     match path {
@@ -1159,7 +1225,7 @@ fn apply_preserve_pitch(kind: &mut ClipKind, value: &ParameterValue) -> Result<(
 
 fn apply_subtitle_parameter(
     sub: &mut SubtitleProperties,
-    path: ParameterPath,
+    path: &ParameterPath,
     value: &ParameterValue,
 ) -> Result<(), CommandError> {
     match path {

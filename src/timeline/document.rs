@@ -260,6 +260,9 @@ pub struct AudioProperties {
     /// 個別ミュート状態。
     #[serde(default)]
     pub muted: bool,
+    /// クリップ単位で直列適用する外部オーディオプラグインスロット一覧。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_slots: Vec<crate::audio::properties::AudioPluginSlot>,
 }
 
 impl Default for AudioProperties {
@@ -268,6 +271,7 @@ impl Default for AudioProperties {
             gain_db: default_gain_db(),
             pan: default_pan(),
             muted: false,
+            plugin_slots: Vec::new(),
         }
     }
 }

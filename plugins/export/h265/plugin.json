@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "id": "sea.export.h265",
+  "name": "H.265 / HEVC MP4・MOV (OS HW エンコーダ / 外部 ffmpeg)",
+  "version": "0.1.0",
+  "kind": "export",
+  "entrypoint": "sea-export-h265",
+  "args": [],
+  "containers": ["mp4", "mov"],
+  "license": {
+    "spdx": "MIT OR Apache-2.0",
+    "notice": "OS 標準ハードウェア / プラットフォーム API (Windows Media Foundation HEVC MFT / VideoToolbox / VA-API) またはユーザー導入済み外部 ffmpeg CLI のみを使用し、本アプリおよびプラグインバイナリに特許 / GPL エンコーダ (x265 等) は同梱しません。",
+    "requires_external_binary": false
+  },
+  "capabilities": {
+    "supports_alpha": false,
+    "supports_audio": true,
+    "pixel_format": "bgra8",
+    "audio_sample_format": "f32_interleaved",
+    "hw_accelerated": true
+  },
+  "presets": [
+    {
+      "id": "h265_os_hw",
+      "label": "H.265 (HEVC) OS HW 支援 (Media Foundation / VideoToolbox / VA-API)",
+      "description": "OS ネイティブ HEVC ハードウェアエンコーダによる高圧縮 MP4/MOV 書き出し",
+      "video_codec": "HEVC / H.265 (OS Native HW)",
+      "audio_codec": "AAC (OS / 外部多重化)",
+      "container_ext": "mp4",
+      "default_options": {
+        "backend_mode": "os_native_hw",
+        "bitrate_kbps": 6000,
+        "prefer_hardware": true
+      }
+    },
+    {
+      "id": "h265_external_ffmpeg",
+      "label": "H.265 (HEVC) 外部コマンド実行 (ユーザー導入 ffmpeg CLI)",
+      "description": "ユーザーが導入済みの外部 ffmpeg CLI (libx265 等) を別プロセス起動して書き出し",
+      "video_codec": "HEVC / H.265 (外部 ffmpeg CLI)",
+      "audio_codec": "AAC (外部 ffmpeg CLI)",
+      "container_ext": "mp4",
+      "default_options": {
+        "backend_mode": "external_ffmpeg",
+        "bitrate_kbps": 6000,
+        "ffmpeg_path": "ffmpeg"
+      }
+    }
+  ],
+  "option_fields": [
+    {
+      "key": "backend_mode",
+      "label": "エンコードバックエンド",
+      "description": "OS ネイティブ HEVC HW API またはユーザー導入済み外部 ffmpeg CLI を選択します。",
+      "kind": {
+        "type": "select",
+        "choices": [
+          { "value": "os_native_hw", "label": "OS ネイティブ HEVC HW API (MF / VideoToolbox / VA-API)" },
+          { "value": "windows_mf", "label": "Windows Media Foundation (HEVC MFT)" },
+          { "value": "external_ffmpeg", "label": "外部 ffmpeg CLI (libx265)" }
+        ]
+      },
+      "default_value": "os_native_hw"
+    },
+    {
+      "key": "bitrate_kbps",
+      "label": "映像目標ビットレート (kbps)",
+      "description": "出力 H.265 ストリームの平均ビットレートを指定します。",
+      "kind": {
+        "type": "integer",
+        "min": 300,
+        "max": 120000
+      },
+      "default_value": 6000
+    },
+    {
+      "key": "prefer_hardware",
+      "label": "GPU ハードウェア HEVC MFT を優先する",
+      "description": "OS HW エンコーダ実行時にハードウェアアクセラレーションを優先使用します。",
+      "kind": {
+        "type": "boolean"
+      },
+      "default_value": true
+    },
+    {
+      "key": "ffmpeg_path",
+      "label": "外部 ffmpeg コマンド / パス",
+      "description": "外部 ffmpeg モードまたは macOS/Linux HW CLI ブリッジ時に起動するコマンドを指定します。",
+      "kind": {
+        "type": "string"
+      },
+      "default_value": "ffmpeg"
+    }
+  ]
+}
