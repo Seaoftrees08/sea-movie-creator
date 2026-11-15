@@ -47,8 +47,12 @@ GPUI の Windows 対応状況（外部 GPU テクスチャ共有可否、メニ�
      - `rav1d`（`BSD-2-Clause`）が公開する `dav1d` 互換 C ABI（`dav1d_open` / `dav1d_send_data` / `dav1d_get_picture` 等）の呼び出し側で必要になる `unsafe` 境界を確認する（AGPL-3.0 の `rav1d-safe` は使用しない）。
      - x86_64 Windows 環境で `asm` feature 有効時に `nasm` がビルド依存として必要になるか、および `default-features = false` での純粋 Rust フォールバック時の速度・実ビルド成否を確認する（必要なら `docs/getting-started.md` 前提条件へ `nasm` 要否を追記）。
 
-- **スパイクコードの取り扱い方針**:
-  - 検証コードはスパイク実施中のみ一時的に `examples/phase_a0_spike.rs` 等で動かし、検証結果を [`../draft.md`](../draft.md) と本設計書へ記録したあと、**使い捨てのスパイクコードは `PhaseA-1` 着手前にリポジトリから削除** する（`src/` や `examples/` に未使用・放置コードを残さない。再利用可能なウィンドウ骨格のみ `PhaseA-5` で正規モジュールとして再構築する）。
+- **実測・検証結果（完了済み）**:
+  1. `gpui-kit = "0.9.1"`（`gpui-pre = 0.3.12` + `gpui-component = 0.9.1`）を `Cargo.toml` へ導入し、Windows 11（`rustc 1.100.0`）でビルド・実ウィンドウ起動に成功。推移的依存（`cosmic-text 0.19.0`: Rust 1.89、`oo7 0.6.0`: Rust 1.92）に基づき **`Cargo.toml` の `rust-version` を `"1.92"`** へ確定した。
+  2. `gpui-pre 0.3.12` / `gpui 0.2.2` の `Surface` / `paint_surface` は macOS/iOS 限定（`CVPixelBuffer`）であり、Windows 版 GPUI に外部 GPU テクスチャのゼロコピー公開 API がないことを確認。よって **BGRA 形式 `Arc<gpui::RenderImage>` ダブルバッファ（プレビュー解像度へ縮小＋`window.drop_image(...)` でアトラス解放）を正式主経路** として確定した（`960x540` BGRA フレーム生成は debug ビルドでも `2.1〜2.4ms/frame` であり 60fps 要件を満たす）。
+  3. `gpui_component::menu::AppMenuBar` + `TitleBar` + `Theme::change(ThemeMode::Dark, ...)` + `TabBar` + `Input` + `Slider` + `h_resizable` + `v_virtual_list` の Windows 上での実動作とダークテーマ表示を確認。
+  4. `rav1d = "1.1.0"` 検証：既定 `asm` feature は Windows x86_64 で `nasm` 不在時にビルドエラー（`nasm-rs` パニック）となる一方、`default-features = false, features = ["bitdepth_8", "bitdepth_16"]` は `nasm` 不要の純粋 Rust でビルド成功。さらに Windows 既定 1MiB スレッドスタックでは非最適化 `dev` ビルド時にスタックオーバーフローを起こすため、**`[profile.dev.package.rav1d]` / `rav1e` に `opt-level = 2` を設定し、デコーダスレッドでも 8MiB スタックを確保** することで回避できることを実測確認した（`dav1d_*` C ABI 呼び出し境界に `#[allow(unsafe_code)]` + `// SAFETY:` を隔離し、64x64 AV1 1 フレームを 27.26ms でデコード成功）。
+  5. 使い捨てスパイクコード `examples/phase_a0_spike.rs` は本記録の反映後に削除して `PhaseA-1` へ進んだ。
 
 ### 動作確認とテストの実施
 1. **スパイク動作・ビルド確認**:

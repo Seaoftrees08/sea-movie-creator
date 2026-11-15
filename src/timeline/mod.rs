@@ -1,1 +1,8 @@
-//! マルチレイヤータイムライン、カット編集、アニメーション管理モジュール（Phase A 以降で実装）。
+//! タイムラインモデル・ドキュメント永続化・編集コマンド関連モジュール。
+
+pub mod command;
+pub mod dispatcher;
+pub mod document;
+pub mod history;
+pub mod operations;
+pub mod serialization;

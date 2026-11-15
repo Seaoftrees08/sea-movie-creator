@@ -7,8 +7,9 @@
 
 ## 必要な環境（Prerequisites）
 
-- Rust ツールチェーン（`rustup` による `stable` チャンネル、`rustfmt`・`clippy` コンポーネント含む。`rust-toolchain.toml` 参照）
+- Rust ツールチェーン（**Rust 1.92 以上**、`rustup` による `stable` チャンネル、`rustfmt`・`clippy` コンポーネント含む。`rust-toolchain.toml` および `Cargo.toml` の `rust-version` 参照）
 - Windows 環境では Visual Studio Build Tools（MSVC C++ ビルドツールおよび Windows SDK）
+- ※ 既定のビルド構成は `rav1d` の純粋 Rust パス（`default-features = false`）を使用するため、`nasm` アセンブラの導入は必須ではありません（リリースビルド等で x86_64 SIMD ASM を有効化する場合のみ `nasm` が必要です）。
 
 ## セットアップ手順
 

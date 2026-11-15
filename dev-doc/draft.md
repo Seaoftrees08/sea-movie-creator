@@ -38,9 +38,9 @@
 - **ビジュアル・配色**: DaVinci Resolve / VS Code に近いダークテーマ基調・高コントラストかつ余白を抑えた情報密度。
 - **チャット UI**: VS Code の Chat / Copilot パネルに準拠したメッセージスレッド・編集差分（適用コマンド一覧）プレビュー・承認/取り消し操作。
 - **UI ウィジェット基盤とメニューバー方針**:
-  - GPUI 単体はプリミティブ（`div`, `canvas`, `uniform_list` 等）中心のため、標準的なボタン・入力欄・タブ・数値スライダー・仮想リスト・ダイアログ・ウィンドウ内メニューバーは **`gpui-component`** を採用して構築し、タイムラインやカーブ編集・プレビュー枠などの専用表現を GPUI プリミティブで実装する。
-  - GPUI の OS ネイティブメニューバー機能は macOS 中心のため、Windows / Linux では **GPUI ウィンドウ上部にカスタムメニューバーを自前描画** する（将来 macOS 対応時にネイティブメニュー橋渡しを追加可能とする）。
-  - `Cargo.toml` の `rust-version` は、Phase A 着手時の技術検証スパイク（`PhaseA-0`）で採用する `gpui` / `gpui-component` リビジョンの要求 MSRV に合わせて確定・更新する。
+  - 採用クレートは **`gpui-kit = "0.9.1"`**（`gpui-pre 0.3.12` + `gpui-component 0.9.1` 統合ファサード）とする。標準的なボタン・入力欄（`Input`）・タブ（`TabBar`）・数値スライダー（`Slider`）・仮想リスト（`v_virtual_list`）・分割ペイン（`h_resizable`）・ウィンドウ内メニューバー（**`gpui_component::menu::AppMenuBar`**）は `gpui-component` を利用し、タイムラインやカーブ編集・プレビュー枠などの専用表現を GPUI プリミティブで実装する。
+  - GPUI の OS ネイティブメニューバー機能は macOS 中心のため、Windows / Linux では **`gpui-component` の `AppMenuBar`（+ `TitleBar`）** によりウィンドウ上部カスタムメニューバーを描画する（将来 macOS 対応時にネイティブメニュー橋渡しを追加可能）。
+  - PhaseA-0 スパイクでの実測により、`cosmic-text 0.19.0`（Rust 1.89）および Linux 向け `oo7 0.6.0`（Rust 1.92）の推移的依存に合わせ、`Cargo.toml` の **`rust-version` を `"1.92"`** へ確定・更新した（実機 `rustc 1.100.0` で検証済み）。
 
 ```text
 +-----------------------------------------------------------------------+
@@ -104,12 +104,12 @@ UI スレッド上で動画デコードやピクセル変換を行うと操作�
 
 GPUI の `gpui::surface()` は現状 macOS の `CVPixelBuffer` 連携を主眼としており、Windows の GPUI バックエンド上に外部 `wgpu` テクスチャを直接ゼロコピーで持ち込む公開安定 API は確立していない可能性が高い。そのため、**初期段階の確実な動作と理想的なゼロコピー最適化を両立する 2 段階戦略** を採用する。
 
-- **検証ゲート（PhaseA-0 技術スパイク）**:
-  - Phase A の最初に GPUI 上でのプレビュー表示・`gpui-component` 動作・MSRV を検証するスパイクを実施し、Windows 版 GPUI で外部 GPU テクスチャのゼロコピー提示が可能か確認する。
-- **検証前の標準主経路（確実動作保証パス）**:
-  - `wgpu` 上でフル多層合成を完了させたのち、GPU 上で **プレビュー枠の論理/物理サイズへダウンスケール（例：1920x1080 → 960x540 相当）** したうえで、ダブルバッファの非同期ステージングバッファ経由で `Arc<gpui::RenderImage>` へ渡す。これにより 4K 素材であってもバス転送量を数分の一〜十数分の一に抑えつつ、GPUI 公開 API のみで全 OS 確実に 60fps 表示を行う。
-- **ゼロコピー理想経路（スパイク成功時または対応 OS で有効化）**:
-  - `PreviewSurfaceBridge` トレイトの実装として、macOS の `IOSurface`/`CVPixelBuffer` や検証済み環境での共有 GPU テクスチャを `gpui::surface` 相当へ渡す実装を差し込めるようにし、プレビュー画面の呼び出し側コード（UI）を一切変更せずゼロコピー化できるようにする。
+- **検証結果（PhaseA-0 技術スパイクで確定）**:
+  - `gpui-pre 0.3.12`（および `gpui 0.2.2`）の `gpui::surface` / `SurfaceSource` / `paint_surface` は `#[cfg(any(target_os = "macos", target_os = "ios"))]` 限定の `CVPixelBuffer` のみをサポートしており、Windows 版 GPUI に外部 GPU テクスチャをゼロコピー取り込みする公開 API が存在しないことを確認した。
+- **正式主経路（全 OS 共通・確実動作パス）**:
+  - `wgpu` 上でフル多層合成を完了させたのち、GPU 上で **プレビュー枠の論理/物理サイズへダウンスケール（例：1920x1080 → 960x540 相当）** したうえで、ダブルバッファの非同期ステージングバッファ経由で **BGRA 形式の `Arc<gpui::RenderImage>`** へ渡す。さらにフレーム差し替え時に旧フレームを **`window.drop_image(old)` で明示解放** して `sprite_atlas` 肥大化を防ぐ（実測：`960x540` BGRA 生成は約 2.1〜2.4ms/frame で 60fps 予算内に十分収まることを確認）。
+- **ゼロコピー理想経路（macOS 等対応 OS 向け拡張余地）**:
+  - `PreviewSurfaceBridge` トレイトの実装として、macOS の `IOSurface`/`CVPixelBuffer` や将来の GPUI 拡張対応 OS での共有 GPU テクスチャを差し込めるようにし、プレビュー画面の呼び出し側コード（UI）を変更せず差し替え可能に保つ。
 - **プレビューと書き出しの画質一致保証**:
   - プレビューも動画書き出しも **同一の `wgpu` コンポジタグラフ（WGSL シェーダ）** を使用する。プレビュー時は表示領域サイズに応じた解像度で、書き出し時はプロジェクト出力解像度で実行する。
 
@@ -125,7 +125,7 @@ GPUI の `gpui::surface()` は現状 macOS の `CVPixelBuffer` 連携を主眼�
 
 | 層 | 採用技術・具体クレートとライセンス | 役割と選定理由 |
 | --- | --- | --- |
-| **第 1 層：本体内蔵（ロイヤリティフリー標準）** | ・コンテナ分離（読込）：`matroska-demuxer`（MIT / Apache-2.0 / Zlib、読込専用）<br>・コンテナ出力（書き出しプラグイン）：`oxideav-mkv`（MIT）または `webm-iterable`（MIT）<br>・AV1 デコード：`rav1d`（BSD-2-Clause：`dav1d` C ABI 経由のため呼び出し側は `backends/` に `unsafe` 隔離、x86 では `asm` 有効時 `nasm` 要／`default-features = false` で純粋 Rust フォールバック可。※ AGPL の `rav1d-safe` は使用しない）<br>・AV1 エンコード（書き出しプラグイン）：`rav1e`（BSD-2-Clause・純粋 Rust）<br>・音声デコード：`symphonia`（MPL-2.0、Phase A は **`flac` / `vorbis` / `wav(pcm)` のみ有効化**）<br>・音声エンコード（書き出しプラグイン）：`flacenc`（Apache-2.0・純粋 Rust FLAC）<br>・音声リサンプル＆I/O：`rubato`（MIT）、`cpal`（Apache-2.0）<br>・画像：`image` クレート（MIT / Apache-2.0）<br>（※ Opus は将来必要に応じ `symphonia-adapter-libopus` + `libopus` ビルド手順を精査のうえ別機能追加） | C ライブラリ外部ビルド依存や特許リスクを極小化した構成。`rav1d` の C ABI 呼び出し境界と `nasm` ビルド要件は `PhaseA-0` スパイクで事前検証する。`symphonia` の MPL-2.0 ファイル境界を維持しつつ、アプリ単体で必ず再生・編集・書き出しを行えるベースラインを保証する。 |
+| **第 1 層：本体内蔵（ロイヤリティフリー標準）** | ・コンテナ分離（読込）：`matroska-demuxer`（MIT / Apache-2.0 / Zlib、読込専用）<br>・コンテナ出力（書き出しプラグイン）：`oxideav-mkv`（MIT）または `webm-iterable`（MIT）<br>・AV1 デコード：`rav1d`（BSD-2-Clause：`dav1d` C ABI 経由のため呼び出し側は `backends/` に `unsafe` 隔離。PhaseA-0 実測により既定 `asm` は Windows x86_64 で `nasm` 未導入時にビルド失敗すること・非最適化 `dev` ビルドで Windows 既定 1MiB スタックを超過することを確認済みのため、**`default-features = false, features = ["bitdepth_8", "bitdepth_16"]`＋`[profile.dev.package.rav1d] opt-level = 2`＋ワーカー 8MiB スタック** を標準採用。※ AGPL の `rav1d-safe` は使用しない）<br>・AV1 エンコード（書き出しプラグイン）：`rav1e`（BSD-2-Clause・`default-features = false` で純粋 Rust、`opt-level = 2` 推奨）<br>・音声デコード：`symphonia`（MPL-2.0、Phase A は **`flac` / `vorbis` / `wav(pcm)` のみ有効化**）<br>・音声エンコード（書き出しプラグイン）：`flacenc`（Apache-2.0・純粋 Rust FLAC）<br>・音声リサンプル＆I/O：`rubato`（MIT）、`cpal`（Apache-2.0）<br>・画像：`image` クレート（MIT / Apache-2.0）<br>（※ Opus は将来必要に応じ `symphonia-adapter-libopus` + `libopus` ビルド手順を精査のうえ別機能追加） | C ライブラリ外部ビルド依存や特許リスクを極小化した構成。`rav1d` の C ABI 呼び出し境界と純粋 Rust デコード動作は `PhaseA-0` スパイクで検証済み（`64x64` フレームを 27.26ms でデコード、1MiB スタック超過も `[profile.dev.package.rav1d]` で解消）。`symphonia` の MPL-2.0 ファイル境界を維持しつつ、アプリ単体で必ず再生・編集・書き出しを行えるベースラインを保証する。 |
 | **第 2 層：OS ネイティブメディア API（`backends/` に隔離）** | ・**Phase A（Windows 先行）**：`windows` クレート経由の **Media Foundation / D3D11VA**<br>・**Phase C-5（クロスプラットフォーム拡張）**：macOS **VideoToolbox / AVFoundation**、Linux **VA-API / Vulkan Video** | H.264 / H.265 / AAC 等のハードウェアデコード・エンコードを **ホスト OS が提供する正規メディア基盤** へ委譲し、アプリ配布物への特許対象ソフトウェアコーデック同梱を避ける。 |
 | **第 3 層：外部プラグイン／ユーザー導入ツール分離** | ・`plugins/export/<name>/` 配下の **別プロセスプラグイン**（ユーザー自身の環境に導入済みの外部 `ffmpeg` 等を呼び出すアダプタを含む） | GPL 系エンコーダや任意コーデックを利用したい場合も、別プロセス境界によりアプリ本体のライセンス汚染および再配布責任を完全に分離する。 |
 
