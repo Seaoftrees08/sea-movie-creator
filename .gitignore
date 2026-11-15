@@ -1,0 +1,33 @@
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Logs & Temp
+*.log
+tmp/
+temp/
+
+# Build & Dependencies (add stack-specific entries as needed)
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
