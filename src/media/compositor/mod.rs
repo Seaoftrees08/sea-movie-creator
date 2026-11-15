@@ -1005,6 +1005,7 @@ mod tests {
             duration: FrameCount::new(60)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Image {
                 asset_id: ok_id.clone(),
                 visual: crate::media::visual_properties::VisualProperties::default(),
@@ -1018,6 +1019,7 @@ mod tests {
             duration: FrameCount::new(60)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Image {
                 asset_id: missing_id,
                 visual: crate::media::visual_properties::VisualProperties::default(),

@@ -283,6 +283,7 @@ fn wav_decode_rubato_resample_and_audio_mixer_synchronize_with_clock()
         duration: FrameCount::new(15)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Audio {
             asset_id: asset_id.clone(),
             source_in: RationalDuration::ZERO,

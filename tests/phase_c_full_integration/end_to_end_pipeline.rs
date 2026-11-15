@@ -238,6 +238,7 @@ fn build_ai_batch_for_e2e(
                 duration: dur,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: NewClipKind::Image {
                     asset_id: AssetRef::Temp("img_asset".to_owned()),
                     visual: VisualProperties::default(),
@@ -263,6 +264,7 @@ fn build_ai_batch_for_e2e(
                 duration: dur,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: NewClipKind::Subtitle(SubtitleProperties::new("E2E Integration")),
             }),
         },
@@ -276,6 +278,7 @@ fn build_ai_batch_for_e2e(
                 duration: dur,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: NewClipKind::Audio {
                     asset_id: AssetRef::Temp("bgm_asset".to_owned()),
                     source_in: RationalDuration::ZERO,

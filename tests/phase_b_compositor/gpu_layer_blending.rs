@@ -54,6 +54,7 @@ fn make_image_layer_cmds(
                 duration: FrameCount::new(60)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: NewClipKind::Image {
                     asset_id: AssetRef::Id(asset_id.clone()),
                     visual: VisualProperties::default(),
@@ -178,6 +179,7 @@ fn missing_asset_generates_fallback_layer_in_render_scene() -> Result<(), Box<dy
         duration: FrameCount::new(30)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Image {
             asset_id: gone,
             visual: VisualProperties::default(),

@@ -406,6 +406,7 @@ mod tests {
             duration: FrameCount::new(30)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Image {
                 asset_id: ok_asset.clone(),
                 visual: VisualProperties {
@@ -421,6 +422,7 @@ mod tests {
             duration: FrameCount::new(30)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Video {
                 asset_id: missing_asset,
                 source_in: crate::core::time::RationalDuration::ZERO,

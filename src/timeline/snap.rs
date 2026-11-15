@@ -218,6 +218,7 @@ mod tests {
             duration: FrameCount::new(50)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("A")),
         });
         layer.clips.push(Clip {
@@ -227,6 +228,7 @@ mod tests {
             duration: FrameCount::new(40)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("B")),
         });
         doc.layers.push(layer);

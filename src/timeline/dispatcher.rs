@@ -154,6 +154,11 @@ fn describe_command(command: &EditCommand) -> String {
         EditCommand::DuplicateClip { .. } => "Duplicate Clip".to_owned(),
         EditCommand::SetParameter { .. } => "Set Parameter".to_owned(),
         EditCommand::SetPlaybackRate { .. } => "Set Playback Rate".to_owned(),
+        EditCommand::SetTimelineLength { .. } => "Set Timeline Length".to_owned(),
+        EditCommand::SetSelectionRange { .. } => "Set Selection Range".to_owned(),
+        EditCommand::AddMidpoint { .. } => "Add Midpoint".to_owned(),
+        EditCommand::MoveMidpoint { .. } => "Move Midpoint".to_owned(),
+        EditCommand::RemoveMidpoint { .. } => "Remove Midpoint".to_owned(),
         EditCommand::Batch { commands } => format!("Batch ({} commands)", commands.len()),
     }
 }

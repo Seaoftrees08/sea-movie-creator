@@ -442,6 +442,49 @@ fn summarize_other_command(
                 new_timeline_start.get()
             ));
         }
+        other => summarize_timeline_and_midpoint_command(other, summary_lines, targets),
+    }
+}
+
+fn summarize_timeline_and_midpoint_command(
+    cmd: &EditCommand,
+    summary_lines: &mut Vec<String>,
+    targets: &mut Vec<String>,
+) {
+    match cmd {
+        EditCommand::SetTimelineLength { mode } => {
+            summary_lines.push(format!("  * タイムライン総尺設定 ({mode:?})"));
+        }
+        EditCommand::SetSelectionRange { range } => {
+            summary_lines.push(format!("  * 選択範囲変更 ({range:?})"));
+        }
+        EditCommand::AddMidpoint {
+            clip_id,
+            effect_frame,
+        } => {
+            let lbl = format_clip_ref(clip_id);
+            targets.push(lbl.clone());
+            summary_lines.push(format!("  + 中間点追加 {lbl} @ {effect_frame}"));
+        }
+        EditCommand::MoveMidpoint {
+            clip_id,
+            old_effect_frame,
+            new_effect_frame,
+        } => {
+            let lbl = format_clip_ref(clip_id);
+            targets.push(lbl.clone());
+            summary_lines.push(format!(
+                "  ~ 中間点移動 {lbl} ({old_effect_frame} -> {new_effect_frame})"
+            ));
+        }
+        EditCommand::RemoveMidpoint {
+            clip_id,
+            effect_frame,
+        } => {
+            let lbl = format_clip_ref(clip_id);
+            targets.push(lbl.clone());
+            summary_lines.push(format!("  - 中間点削除 {lbl} @ {effect_frame}"));
+        }
         _ => {}
     }
 }
@@ -465,6 +508,73 @@ mod tests {
     use super::*;
     use crate::core::ids::LayerId;
     use crate::timeline::document::Layer;
+
+    #[test]
+    fn ai_plan_keyframes_sync_and_align_clip_midpoints() -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("AI Midpoints");
+        let l1 = LayerId::new("l1")?;
+        let c1 = crate::core::ids::ClipId::new("c1")?;
+        let mut dispatcher = CommandDispatcher::new();
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::Batch {
+                commands: vec![
+                    EditCommand::AddLayer {
+                        temp_id: None,
+                        id: Some(l1.clone()),
+                        name: "Sub".to_owned(),
+                        insert_index: None,
+                    },
+                    EditCommand::AddClip {
+                        temp_id: None,
+                        id: Some(c1.clone()),
+                        layer_id: LayerRef::Id(l1),
+                        clip: Box::new(crate::timeline::command::NewClipSpec {
+                            name: "AI Sub".to_owned(),
+                            timeline_start: crate::core::time::FrameIndex::ZERO,
+                            duration: crate::core::time::FrameCount::new(120)?,
+                            effect_offset_frames: 0,
+                            effect_duration_frames: None,
+                            midpoints: Vec::new(),
+                            kind: crate::timeline::command::NewClipKind::Subtitle(
+                                crate::media::visual_properties::SubtitleProperties::new("AI"),
+                            ),
+                        }),
+                    },
+                ],
+            },
+        )?;
+
+        let cmd_val = EditCommand::Batch {
+            commands: vec![EditCommand::SetParameter {
+                target: ParameterTarget::Clip {
+                    clip_id: ClipRef::Id(c1.clone()),
+                },
+                path: crate::timeline::command::ParameterPath::X,
+                value: crate::timeline::command::ParameterValue::Animated {
+                    param: crate::core::animation::AnimatedParameter::Keyframes {
+                        keyframes: vec![
+                            crate::core::animation::Keyframe::new(0, -100.0),
+                            crate::core::animation::Keyframe::new(45, 50.0),
+                            crate::core::animation::Keyframe::new(119, 100.0),
+                        ],
+                        extrapolation: crate::core::animation::ExtrapolationMode::Clamp,
+                    },
+                },
+            }],
+        };
+        let raw_response = format!(
+            "中間点付きキーフレームを設定します。\n```json\n{}\n```",
+            serde_json::to_string_pretty(&cmd_val)?
+        );
+        let plan = dry_run_validate(&doc, &raw_response)?;
+        assert_eq!(plan.summary_lines.len(), 2);
+        assert!(plan.affected_targets.iter().any(|t| t.contains("c1")));
+        dispatcher.dispatch(&mut doc, &plan.command)?;
+        let (_, clip) = doc.find_clip(&c1).ok_or("missing clip")?;
+        assert_eq!(clip.midpoints, vec![45]);
+        Ok(())
+    }
 
     #[test]
     fn dry_run_accepts_fenced_batch_with_temp_id_without_mutating_doc()

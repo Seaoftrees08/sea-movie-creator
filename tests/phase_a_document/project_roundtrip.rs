@@ -99,6 +99,7 @@ fn build_sample_document() -> Result<ProjectDocument, Box<dyn std::error::Error>
         duration: FrameCount::new(150)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Video {
             asset_id: AssetId::new("asset_v1")?,
             source_in: RationalDuration::new(1, 1)?,
@@ -124,6 +125,7 @@ fn build_sample_document() -> Result<ProjectDocument, Box<dyn std::error::Error>
         duration: FrameCount::new(90)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Image {
             asset_id: AssetId::new("asset_i1")?,
             visual: VisualProperties::default(),
@@ -138,6 +140,7 @@ fn build_sample_document() -> Result<ProjectDocument, Box<dyn std::error::Error>
         duration: FrameCount::new(240)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Audio {
             asset_id: AssetId::new("asset_a1")?,
             source_in: RationalDuration::ZERO,
@@ -155,6 +158,7 @@ fn build_sample_document() -> Result<ProjectDocument, Box<dyn std::error::Error>
         duration: FrameCount::new(120)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Subtitle(SubtitleProperties::new("Hello Sea Movie Creator")),
     });
 
@@ -288,6 +292,7 @@ fn validation_rejects_playback_rate_exceeding_asset_duration()
         duration: FrameCount::new(40)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Video {
             asset_id: AssetId::new("v1")?,
             source_in: RationalDuration::ZERO,

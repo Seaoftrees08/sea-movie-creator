@@ -3,16 +3,22 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::audio::properties::AudioPluginParamValue;
+use crate::core::animation::{
+    AnimatedParameter, EasingCurve, EvaluationContext, ExtrapolationMode, Keyframe,
+};
 use crate::core::ids::{AssetId, AssetRef, ClipId, ClipRef, LayerId, LayerRef};
-use crate::core::time::{FrameCount, FrameIndex, PlaybackRate, frames_to_source_seconds};
+use crate::core::time::{
+    FrameCount, FrameIndex, FrameRate, PlaybackRate, frames_to_source_seconds,
+};
 use crate::media::visual_properties::{SubtitleProperties, VisualProperties};
 use crate::timeline::command::{
     CommandError, EditCommand, NewClipKind, NewClipSpec, ParameterPath, ParameterTarget,
     ParameterValue,
 };
 use crate::timeline::document::{
-    Asset, AssetKind, AssetPath, AssetStatus, AudioProperties, Clip, ClipKind, Layer,
-    ProjectDocument, ProjectResolution,
+    Asset, AssetKind, AssetPath, AssetStatus, AudioProperties, Clip, ClipKind,
+    DocumentValidationError, FrameRange, Layer, ProjectDocument, ProjectResolution,
+    TimelineLengthMode,
 };
 use crate::timeline::history::PatchStep;
 
@@ -241,6 +247,45 @@ impl CommandRunner<'_, '_, '_> {
             EditCommand::AddLayer { .. }
             | EditCommand::RemoveLayer { .. }
             | EditCommand::SetLayerFlags { .. } => self.run_layer_command(command),
+            EditCommand::SetTimelineLength { mode } => {
+                set_timeline_length(self.doc, *mode, self.undo_patches);
+                Ok(())
+            }
+            EditCommand::SetSelectionRange { range } => {
+                set_selection_range(self.doc, *range, self.undo_patches)
+            }
+            EditCommand::AddMidpoint {
+                clip_id,
+                effect_frame,
+            } => add_midpoint(
+                self.doc,
+                self.ctx,
+                clip_id,
+                *effect_frame,
+                self.undo_patches,
+            ),
+            EditCommand::MoveMidpoint {
+                clip_id,
+                old_effect_frame,
+                new_effect_frame,
+            } => move_midpoint(
+                self.doc,
+                self.ctx,
+                clip_id,
+                *old_effect_frame,
+                *new_effect_frame,
+                self.undo_patches,
+            ),
+            EditCommand::RemoveMidpoint {
+                clip_id,
+                effect_frame,
+            } => remove_midpoint(
+                self.doc,
+                self.ctx,
+                clip_id,
+                *effect_frame,
+                self.undo_patches,
+            ),
             EditCommand::Batch { commands } => {
                 if commands.is_empty() {
                     return Err(CommandError::EmptyBatch);
@@ -476,15 +521,25 @@ impl CommandRunner<'_, '_, '_> {
         self.ctx.register_clip_temp(temp_id, &clip_id)?;
 
         let kind = resolve_clip_kind(&spec.kind, self.ctx)?;
-        let clip = Clip {
+        if !spec.midpoints.windows(2).all(|w| w[0] < w[1]) {
+            return Err(CommandError::Validation(
+                DocumentValidationError::InvalidMidpoints { clip_id },
+            ));
+        }
+
+        let mut clip = Clip {
             id: clip_id.clone(),
             name: spec.name.clone(),
             timeline_start: spec.timeline_start,
             duration: spec.duration,
             effect_offset_frames: spec.effect_offset_frames,
             effect_duration_frames: spec.effect_duration_frames,
+            midpoints: spec.midpoints.clone(),
             kind,
         };
+        if !clip.midpoints.is_empty() || clip_has_non_empty_keyframes(&clip) {
+            sync_and_align_clip_keyframes(&mut clip, self.doc.fps);
+        }
 
         insert_clip_sorted(self.doc, &layer_id, clip)?;
         self.undo_patches
@@ -543,6 +598,7 @@ impl CommandRunner<'_, '_, '_> {
             duration: FrameCount::new(right_len)?,
             effect_offset_frames: right_effect_offset,
             effect_duration_frames: Some(preserved_effect_duration),
+            midpoints: left.midpoints.clone(),
             kind: right_kind,
         };
 
@@ -807,7 +863,16 @@ fn set_parameter(
         let audio = clip_audio_mut(&mut clip.kind)?;
         apply_audio_plugin_parameter(audio, slot_id, path, value)?;
     } else {
+        let fps = doc.fps;
         apply_clip_parameter(&mut clip.kind, path, value)?;
+        if matches!(
+            value,
+            ParameterValue::Animated {
+                param: AnimatedParameter::Keyframes { keyframes, .. }
+            } if !keyframes.is_empty()
+        ) {
+            sync_and_align_clip_keyframes(clip, fps);
+        }
     }
     undo_patches.push(PatchStep::ReplaceClip {
         layer_id,
@@ -1310,6 +1375,7 @@ struct CopiedClipItem {
     duration: FrameCount,
     effect_offset_frames: i64,
     effect_duration_frames: Option<FrameCount>,
+    midpoints: Vec<i64>,
     kind: NewClipKind,
 }
 
@@ -1374,6 +1440,7 @@ pub fn copy_clips(
             duration: clip.duration,
             effect_offset_frames: clip.effect_offset_frames,
             effect_duration_frames: clip.effect_duration_frames,
+            midpoints: clip.midpoints.clone(),
             kind: to_new_clip_kind(&clip.kind),
         })
         .collect();
@@ -1417,6 +1484,7 @@ pub fn build_paste_command(
                 duration: item.duration,
                 effect_offset_frames: item.effect_offset_frames,
                 effect_duration_frames: item.effect_duration_frames,
+                midpoints: item.midpoints.clone(),
                 kind: item.kind.clone(),
             }),
         });
@@ -1460,5 +1528,739 @@ fn to_new_clip_kind(kind: &ClipKind) -> NewClipKind {
             visual: visual.clone(),
         },
         ClipKind::Subtitle(sub) => NewClipKind::Subtitle(sub.clone()),
+    }
+}
+
+fn clip_has_non_empty_keyframes(clip: &Clip) -> bool {
+    let mut found = false;
+    let mut probe = clip.clone();
+    probe.visit_animated_params_mut(|param| {
+        if let AnimatedParameter::Keyframes { keyframes, .. } = param
+            && !keyframes.is_empty()
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// クリップ内の中間点配列 (`Clip.midpoints`) と全パラメータのキーフレーム境界を双方向同期する。
+///
+/// 1. 未登録の中間キーフレーム (`eff_start < frame < eff_last`) を `clip.midpoints` へ取り込む。
+/// 2. `visible_midpoints` が存在する場合は全 [`AnimatedParameter::Easing`] を `Keyframes` へ展開する。
+/// 3. 既存の [`AnimatedParameter::Keyframes`] を `clip.grid_frames()` 上に再サンプルする。
+pub fn sync_and_align_clip_keyframes(clip: &mut Clip, fps: FrameRate) {
+    let (eff_start, eff_last) = clip.effect_bounds();
+    let mut harvested = Vec::new();
+    clip.visit_animated_params_mut(|param| {
+        if let AnimatedParameter::Keyframes { keyframes, .. } = param {
+            for kf in keyframes.iter() {
+                if eff_start < kf.frame && kf.frame < eff_last {
+                    harvested.push(kf.frame);
+                }
+            }
+        }
+    });
+    clip.midpoints.extend(harvested);
+    clip.midpoints.sort_unstable();
+    clip.midpoints.dedup();
+
+    align_clip_keyframes_to_midpoints(clip, fps);
+}
+
+/// 現在の `Clip.midpoints` を正として、全パラメータの `Easing` 展開および `Keyframes` 再サンプルを行う。
+fn align_clip_keyframes_to_midpoints(clip: &mut Clip, fps: FrameRate) {
+    let (eff_start, _) = clip.effect_bounds();
+    let has_visible_midpoints = !clip.visible_midpoints().is_empty();
+    let grid = clip.grid_frames();
+    let eff_dur = clip.effective_effect_duration();
+
+    clip.visit_animated_params_mut(|param| {
+        align_single_parameter(param, eff_start, eff_dur, fps, has_visible_midpoints, &grid);
+    });
+}
+
+fn align_single_parameter(
+    param: &mut AnimatedParameter,
+    eff_start: i64,
+    eff_dur: FrameCount,
+    fps: FrameRate,
+    has_visible_midpoints: bool,
+    grid: &[i64],
+) {
+    match param {
+        AnimatedParameter::Constant { .. } | AnimatedParameter::Expression { .. } => {}
+        AnimatedParameter::Easing { curve, .. } => {
+            if !has_visible_midpoints || grid.len() <= 1 {
+                return;
+            }
+            let curve_cloned = *curve;
+            let snapshot = param.clone();
+            let keyframes = grid
+                .iter()
+                .map(|&f| {
+                    let val = eval_param_at_effect_frame(&snapshot, f, eff_start, eff_dur, fps);
+                    Keyframe::with_easing(f, val, curve_cloned)
+                })
+                .collect();
+            *param = AnimatedParameter::Keyframes {
+                keyframes,
+                extrapolation: ExtrapolationMode::Clamp,
+            };
+        }
+        AnimatedParameter::Keyframes {
+            keyframes,
+            extrapolation,
+        } => {
+            if keyframes.is_empty() {
+                return;
+            }
+            let orig_keyframes = keyframes.clone();
+            let snapshot = AnimatedParameter::Keyframes {
+                keyframes: orig_keyframes.clone(),
+                extrapolation: *extrapolation,
+            };
+            let mut next = Vec::with_capacity(grid.len());
+            for &f in grid {
+                if let Some(existing) = orig_keyframes.iter().find(|kf| kf.frame == f) {
+                    next.push(existing.clone());
+                } else {
+                    let val = eval_param_at_effect_frame(&snapshot, f, eff_start, eff_dur, fps);
+                    let inherited_easing = orig_keyframes
+                        .iter()
+                        .find(|kf| kf.frame > f)
+                        .or_else(|| orig_keyframes.last())
+                        .map_or(EasingCurve::Linear, |kf| kf.easing);
+                    next.push(Keyframe::with_easing(f, val, inherited_easing));
+                }
+            }
+            *keyframes = next;
+        }
+    }
+}
+
+fn eval_param_at_effect_frame(
+    param: &AnimatedParameter,
+    effect_frame: i64,
+    eff_start: i64,
+    eff_dur: FrameCount,
+    fps: FrameRate,
+) -> f64 {
+    let local = u64::try_from(effect_frame.saturating_sub(eff_start)).unwrap_or(0);
+    let ctx = EvaluationContext::new(local, eff_start, eff_dur, fps);
+    param.evaluate(ctx).unwrap_or(0.0)
+}
+
+fn set_timeline_length(
+    doc: &mut ProjectDocument,
+    mode: TimelineLengthMode,
+    undo_patches: &mut Vec<PatchStep>,
+) {
+    undo_patches.push(PatchStep::SetTimelineLength {
+        mode: doc.timeline_length,
+    });
+    doc.timeline_length = mode;
+}
+
+fn set_selection_range(
+    doc: &mut ProjectDocument,
+    range: Option<FrameRange>,
+    undo_patches: &mut Vec<PatchStep>,
+) -> Result<(), CommandError> {
+    if let Some(r) = range
+        && r.start >= r.end
+    {
+        return Err(CommandError::Validation(
+            DocumentValidationError::InvalidSelectionRange {
+                start: r.start,
+                end: r.end,
+            },
+        ));
+    }
+    undo_patches.push(PatchStep::SetSelectionRange {
+        range: doc.selection_range,
+    });
+    doc.selection_range = range;
+    Ok(())
+}
+
+fn add_midpoint(
+    doc: &mut ProjectDocument,
+    ctx: &ExecutionContext,
+    clip_ref: &ClipRef,
+    effect_frame: i64,
+    undo_patches: &mut Vec<PatchStep>,
+) -> Result<(), CommandError> {
+    let clip_id = ctx.resolve_clip(clip_ref)?;
+    let (layer_idx, clip_idx) = locate_clip_mutable(doc, &clip_id)?;
+    let layer_id = doc.layers[layer_idx].id.clone();
+    if doc.layers[layer_idx].locked {
+        return Err(CommandError::LayerLocked(layer_id));
+    }
+
+    let fps = doc.fps;
+    let clip = &mut doc.layers[layer_idx].clips[clip_idx];
+    if clip.duration.get() < 3 {
+        return Err(CommandError::Incompatible(
+            "3フレーム未満のクリップには中間点を追加できません".to_owned(),
+        ));
+    }
+    let (eff_start, eff_last) = clip.effect_bounds();
+    if !(eff_start < effect_frame && effect_frame < eff_last) {
+        return Err(CommandError::Incompatible(format!(
+            "中間点 {effect_frame} はクリップ範囲 ({eff_start}..{eff_last}) の内側である必要があります"
+        )));
+    }
+    if clip.midpoints.contains(&effect_frame) {
+        return Err(CommandError::Incompatible(format!(
+            "中間点 {effect_frame} は既に存在します"
+        )));
+    }
+
+    let old_clip = clip.clone();
+    let pos = clip.midpoints.partition_point(|&m| m < effect_frame);
+    clip.midpoints.insert(pos, effect_frame);
+    align_clip_keyframes_to_midpoints(clip, fps);
+
+    undo_patches.push(PatchStep::ReplaceClip {
+        layer_id,
+        clip: old_clip,
+    });
+    Ok(())
+}
+
+fn move_midpoint(
+    doc: &mut ProjectDocument,
+    ctx: &ExecutionContext,
+    clip_ref: &ClipRef,
+    old_effect_frame: i64,
+    new_effect_frame: i64,
+    undo_patches: &mut Vec<PatchStep>,
+) -> Result<(), CommandError> {
+    let clip_id = ctx.resolve_clip(clip_ref)?;
+    let (layer_idx, clip_idx) = locate_clip_mutable(doc, &clip_id)?;
+    let layer_id = doc.layers[layer_idx].id.clone();
+    if doc.layers[layer_idx].locked {
+        return Err(CommandError::LayerLocked(layer_id));
+    }
+
+    let fps = doc.fps;
+    let clip = &mut doc.layers[layer_idx].clips[clip_idx];
+    let Some(old_pos) = clip.midpoints.iter().position(|&m| m == old_effect_frame) else {
+        return Err(CommandError::NotFound(format!(
+            "midpoint `{old_effect_frame}` on clip `{clip_id}`"
+        )));
+    };
+    let (eff_start, eff_last) = clip.effect_bounds();
+    if !(eff_start < new_effect_frame && new_effect_frame < eff_last) {
+        return Err(CommandError::Incompatible(format!(
+            "移動先中間点 {new_effect_frame} は ({eff_start}..{eff_last}) の内側である必要があります"
+        )));
+    }
+    if new_effect_frame == old_effect_frame {
+        return Ok(());
+    }
+    if clip.midpoints.contains(&new_effect_frame) {
+        return Err(CommandError::Incompatible(format!(
+            "移動先中間点 {new_effect_frame} は他の中間点と重複しています"
+        )));
+    }
+
+    let old_clip = clip.clone();
+    clip.midpoints.remove(old_pos);
+    let new_pos = clip.midpoints.partition_point(|&m| m < new_effect_frame);
+    clip.midpoints.insert(new_pos, new_effect_frame);
+
+    clip.visit_animated_params_mut(|param| {
+        if let AnimatedParameter::Keyframes { keyframes, .. } = param {
+            for kf in keyframes.iter_mut() {
+                if kf.frame == old_effect_frame {
+                    kf.frame = new_effect_frame;
+                }
+            }
+            keyframes.sort_by_key(|kf| kf.frame);
+            keyframes.dedup_by_key(|kf| kf.frame);
+        }
+    });
+    align_clip_keyframes_to_midpoints(clip, fps);
+
+    undo_patches.push(PatchStep::ReplaceClip {
+        layer_id,
+        clip: old_clip,
+    });
+    Ok(())
+}
+
+fn remove_midpoint(
+    doc: &mut ProjectDocument,
+    ctx: &ExecutionContext,
+    clip_ref: &ClipRef,
+    effect_frame: i64,
+    undo_patches: &mut Vec<PatchStep>,
+) -> Result<(), CommandError> {
+    let clip_id = ctx.resolve_clip(clip_ref)?;
+    let (layer_idx, clip_idx) = locate_clip_mutable(doc, &clip_id)?;
+    let layer_id = doc.layers[layer_idx].id.clone();
+    if doc.layers[layer_idx].locked {
+        return Err(CommandError::LayerLocked(layer_id));
+    }
+
+    let fps = doc.fps;
+    let clip = &mut doc.layers[layer_idx].clips[clip_idx];
+    let Some(pos) = clip.midpoints.iter().position(|&m| m == effect_frame) else {
+        return Err(CommandError::NotFound(format!(
+            "midpoint `{effect_frame}` on clip `{clip_id}`"
+        )));
+    };
+
+    let old_clip = clip.clone();
+    clip.midpoints.remove(pos);
+    align_clip_keyframes_to_midpoints(clip, fps);
+
+    undo_patches.push(PatchStep::ReplaceClip {
+        layer_id,
+        clip: old_clip,
+    });
+    Ok(())
+}
+
+/// 複数クリップ一括移動コマンド生成時の単体移動計画。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipMovePlan {
+    /// 移動対象クリップ ID。
+    pub clip_id: ClipId,
+    /// 移動先レイヤー ID。
+    pub target_layer_id: LayerId,
+    /// 移動先の開始フレーム位置。
+    pub new_timeline_start: FrameIndex,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMovePlan {
+    clip_id: ClipId,
+    src_layer: LayerId,
+    dst_layer: LayerId,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    new_end: u64,
+}
+
+/// 複数クリップの移動計画を検証し、一時衝突を起こさない順序の [`EditCommand::Batch`] を構築する。
+///
+/// # Errors
+///
+/// - `plans` が空、または変化のある移動が 1 件もない場合
+/// - 移動元・移動先レイヤーがロック状態、または存在しない場合
+/// - 移動後配置に重複がある場合、または相互依存サイクルにより順次移動できない場合
+pub fn build_batch_move_clips_command(
+    doc: &ProjectDocument,
+    plans: &[ClipMovePlan],
+) -> Result<EditCommand, CommandError> {
+    if plans.is_empty() {
+        return Err(CommandError::EmptyBatch);
+    }
+
+    let resolved = resolve_move_plans(doc, plans)?;
+    validate_final_move_positions(doc, &resolved)?;
+
+    let active: Vec<_> = resolved
+        .into_iter()
+        .filter(|m| m.src_layer != m.dst_layer || m.old_start != m.new_start)
+        .collect();
+    if active.is_empty() {
+        return Err(CommandError::EmptyBatch);
+    }
+
+    let ordered = topological_sort_moves(&active)?;
+    let commands = ordered
+        .into_iter()
+        .map(|idx| {
+            let m = &active[idx];
+            EditCommand::MoveClip {
+                clip_id: ClipRef::Id(m.clip_id.clone()),
+                target_layer_id: Some(LayerRef::Id(m.dst_layer.clone())),
+                new_timeline_start: FrameIndex::new(m.new_start),
+            }
+        })
+        .collect();
+    Ok(EditCommand::Batch { commands })
+}
+
+fn resolve_move_plans(
+    doc: &ProjectDocument,
+    plans: &[ClipMovePlan],
+) -> Result<Vec<ResolvedMovePlan>, CommandError> {
+    let mut seen_ids = std::collections::HashSet::with_capacity(plans.len());
+    let mut resolved = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if !seen_ids.insert(&plan.clip_id) {
+            return Err(CommandError::Incompatible(format!(
+                "duplicate clip `{}` in multi-clip move",
+                plan.clip_id
+            )));
+        }
+        let (src_layer, clip) = doc
+            .find_clip(&plan.clip_id)
+            .ok_or_else(|| CommandError::NotFound(plan.clip_id.to_string()))?;
+        if src_layer.locked {
+            return Err(CommandError::LayerLocked(src_layer.id.clone()));
+        }
+        let dst_layer = doc
+            .find_layer(&plan.target_layer_id)
+            .ok_or_else(|| CommandError::NotFound(plan.target_layer_id.to_string()))?;
+        if dst_layer.locked {
+            return Err(CommandError::LayerLocked(dst_layer.id.clone()));
+        }
+        let old_end = clip.timeline_end()?.get();
+        let new_end = plan
+            .new_timeline_start
+            .get()
+            .checked_add(clip.duration.get())
+            .ok_or(CommandError::Time(crate::core::time::TimeError::Overflow))?;
+        resolved.push(ResolvedMovePlan {
+            clip_id: plan.clip_id.clone(),
+            src_layer: src_layer.id.clone(),
+            dst_layer: plan.target_layer_id.clone(),
+            old_start: clip.timeline_start.get(),
+            old_end,
+            new_start: plan.new_timeline_start.get(),
+            new_end,
+        });
+    }
+    Ok(resolved)
+}
+
+fn validate_final_move_positions(
+    doc: &ProjectDocument,
+    resolved: &[ResolvedMovePlan],
+) -> Result<(), CommandError> {
+    let moving_ids: std::collections::HashSet<&ClipId> =
+        resolved.iter().map(|m| &m.clip_id).collect();
+    for (idx_a, a) in resolved.iter().enumerate() {
+        for b in &resolved[idx_a + 1..] {
+            if a.dst_layer == b.dst_layer
+                && intervals_overlap(a.new_start, a.new_end, b.new_start, b.new_end)
+            {
+                return Err(CommandError::Validation(
+                    DocumentValidationError::OverlappingClips {
+                        layer_id: a.dst_layer.clone(),
+                        first: a.clip_id.clone(),
+                        second: b.clip_id.clone(),
+                    },
+                ));
+            }
+        }
+        if let Some(dst_layer) = doc.find_layer(&a.dst_layer) {
+            for other in &dst_layer.clips {
+                if moving_ids.contains(&other.id) {
+                    continue;
+                }
+                let other_end = other.timeline_end()?.get();
+                if intervals_overlap(
+                    a.new_start,
+                    a.new_end,
+                    other.timeline_start.get(),
+                    other_end,
+                ) {
+                    return Err(CommandError::Validation(
+                        DocumentValidationError::OverlappingClips {
+                            layer_id: dst_layer.id.clone(),
+                            first: a.clip_id.clone(),
+                            second: other.id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn topological_sort_moves(active: &[ResolvedMovePlan]) -> Result<Vec<usize>, CommandError> {
+    let n = active.len();
+    let mut adj = vec![Vec::new(); n];
+    let mut in_deg = vec![0_usize; n];
+
+    for (dst_idx, dst) in active.iter().enumerate() {
+        for (src_idx, src) in active.iter().enumerate() {
+            if dst_idx == src_idx {
+                continue;
+            }
+            if dst.dst_layer == src.src_layer
+                && intervals_overlap(dst.new_start, dst.new_end, src.old_start, src.old_end)
+            {
+                adj[src_idx].push(dst_idx);
+                in_deg[dst_idx] += 1;
+            }
+        }
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    for (idx, &deg) in in_deg.iter().enumerate() {
+        if deg == 0 {
+            queue.push_back(idx);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(u) = queue.pop_front() {
+        order.push(u);
+        for &v in &adj[u] {
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 {
+                queue.push_back(v);
+            }
+        }
+    }
+
+    if order.len() < n {
+        return Err(CommandError::Incompatible(
+            "循環依存により複数クリップを一括移動できません".to_owned(),
+        ));
+    }
+    Ok(order)
+}
+
+const fn intervals_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::dispatcher::CommandDispatcher;
+
+    fn seed_subtitle_doc(
+        clips: &[(u64, u64, &str)],
+    ) -> Result<(ProjectDocument, LayerId, Vec<ClipId>), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("Ops Test");
+        let layer_id = LayerId::new("l1")?;
+        let mut dispatcher = CommandDispatcher::new();
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::AddLayer {
+                temp_id: None,
+                id: Some(layer_id.clone()),
+                name: "Track 1".to_owned(),
+                insert_index: None,
+            },
+        )?;
+        let mut ids = Vec::new();
+        for (idx, (start, dur, text)) in clips.iter().enumerate() {
+            let cid = ClipId::new(format!("c{idx}"))?;
+            dispatcher.dispatch(
+                &mut doc,
+                &EditCommand::AddClip {
+                    temp_id: None,
+                    id: Some(cid.clone()),
+                    layer_id: LayerRef::Id(layer_id.clone()),
+                    clip: Box::new(NewClipSpec {
+                        name: format!("Clip {idx}"),
+                        timeline_start: FrameIndex::new(*start),
+                        duration: FrameCount::new(*dur)?,
+                        effect_offset_frames: 0,
+                        effect_duration_frames: None,
+                        midpoints: Vec::new(),
+                        kind: NewClipKind::Subtitle(SubtitleProperties::new(*text)),
+                    }),
+                },
+            )?;
+            ids.push(cid);
+        }
+        Ok((doc, layer_id, ids))
+    }
+
+    #[test]
+    fn midpoint_add_move_remove_promote_easing_and_roundtrip_undo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut doc, _l1, ids) = seed_subtitle_doc(&[(0, 120, "Sub")])?;
+        let cid = &ids[0];
+        let mut dispatcher = CommandDispatcher::new();
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::SetParameter {
+                target: ParameterTarget::Clip {
+                    clip_id: ClipRef::Id(cid.clone()),
+                },
+                path: ParameterPath::X,
+                value: ParameterValue::Animated {
+                    param: AnimatedParameter::Easing {
+                        start_value: 0.0,
+                        end_value: 100.0,
+                        curve: EasingCurve::Linear,
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                },
+            },
+        )?;
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::AddMidpoint {
+                clip_id: ClipRef::Id(cid.clone()),
+                effect_frame: 60,
+            },
+        )?;
+
+        let (_, clip) = doc.find_clip(cid).ok_or("missing clip")?;
+        assert_eq!(clip.midpoints, vec![60]);
+        let ClipKind::Subtitle(sub) = &clip.kind else {
+            return Err("expected subtitle".into());
+        };
+        assert!(matches!(
+            &sub.visual.x,
+            AnimatedParameter::Keyframes { keyframes, .. }
+                if keyframes.iter().map(|kf| kf.frame).collect::<Vec<_>>() == vec![0, 60, 119]
+        ));
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::MoveMidpoint {
+                clip_id: ClipRef::Id(cid.clone()),
+                old_effect_frame: 60,
+                new_effect_frame: 80,
+            },
+        )?;
+        let (_, clip) = doc.find_clip(cid).ok_or("missing clip")?;
+        assert_eq!(clip.midpoints, vec![80]);
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::RemoveMidpoint {
+                clip_id: ClipRef::Id(cid.clone()),
+                effect_frame: 80,
+            },
+        )?;
+        let (_, clip) = doc.find_clip(cid).ok_or("missing clip")?;
+        assert_eq!(clip.midpoints, Vec::<i64>::new());
+        let ClipKind::Subtitle(sub) = &clip.kind else {
+            return Err("expected subtitle".into());
+        };
+        assert!(matches!(
+            &sub.visual.x,
+            AnimatedParameter::Keyframes { keyframes, .. }
+                if keyframes.iter().map(|kf| kf.frame).collect::<Vec<_>>() == vec![0, 119]
+        ));
+
+        dispatcher.undo(&mut doc)?;
+        assert_eq!(doc.find_clip(cid).ok_or("missing")?.1.midpoints, vec![80]);
+        dispatcher.undo(&mut doc)?;
+        assert_eq!(doc.find_clip(cid).ok_or("missing")?.1.midpoints, vec![60]);
+        Ok(())
+    }
+
+    #[test]
+    fn short_clip_rejects_midpoint_and_split_preserves_midpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut doc, _l1, ids) = seed_subtitle_doc(&[(0, 2, "Tiny"), (10, 100, "Long")])?;
+        let mut dispatcher = CommandDispatcher::new();
+
+        let tiny_err = dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::AddMidpoint {
+                clip_id: ClipRef::Id(ids[0].clone()),
+                effect_frame: 1,
+            },
+        );
+        assert!(matches!(tiny_err, Err(CommandError::Incompatible(_))));
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::AddMidpoint {
+                clip_id: ClipRef::Id(ids[1].clone()),
+                effect_frame: 60,
+            },
+        )?;
+        let report = dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::SplitClip {
+                clip_id: ClipRef::Id(ids[1].clone()),
+                split_at_timeline_frame: FrameIndex::new(50),
+                right_temp_id: Some("r".to_owned()),
+                right_id: None,
+            },
+        )?;
+        let right_id = &report.created_clips["r"];
+        let (_, left) = doc.find_clip(&ids[1]).ok_or("missing left")?;
+        let (_, right) = doc.find_clip(right_id).ok_or("missing right")?;
+        assert_eq!(left.midpoints, vec![60]);
+        assert_eq!(left.visible_midpoints(), Vec::<i64>::new());
+        assert_eq!(right.midpoints, vec![60]);
+        assert_eq!(right.visible_midpoints(), vec![60]);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_move_orders_right_shift_left_shift_and_rejects_cycles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut doc, l1, ids) = seed_subtitle_doc(&[(0, 30, "A"), (30, 30, "B")])?;
+        let mut dispatcher = CommandDispatcher::new();
+
+        let shift_right = build_batch_move_clips_command(
+            &doc,
+            &[
+                ClipMovePlan {
+                    clip_id: ids[0].clone(),
+                    target_layer_id: l1.clone(),
+                    new_timeline_start: FrameIndex::new(20),
+                },
+                ClipMovePlan {
+                    clip_id: ids[1].clone(),
+                    target_layer_id: l1.clone(),
+                    new_timeline_start: FrameIndex::new(50),
+                },
+            ],
+        )?;
+        dispatcher.dispatch(&mut doc, &shift_right)?;
+        assert_eq!(
+            doc.find_clip(&ids[0]).ok_or("a")?.1.timeline_start.get(),
+            20
+        );
+        assert_eq!(
+            doc.find_clip(&ids[1]).ok_or("b")?.1.timeline_start.get(),
+            50
+        );
+
+        let shift_left = build_batch_move_clips_command(
+            &doc,
+            &[
+                ClipMovePlan {
+                    clip_id: ids[1].clone(),
+                    target_layer_id: l1.clone(),
+                    new_timeline_start: FrameIndex::new(30),
+                },
+                ClipMovePlan {
+                    clip_id: ids[0].clone(),
+                    target_layer_id: l1.clone(),
+                    new_timeline_start: FrameIndex::new(0),
+                },
+            ],
+        )?;
+        dispatcher.dispatch(&mut doc, &shift_left)?;
+        assert_eq!(doc.find_clip(&ids[0]).ok_or("a")?.1.timeline_start.get(), 0);
+        assert_eq!(
+            doc.find_clip(&ids[1]).ok_or("b")?.1.timeline_start.get(),
+            30
+        );
+
+        let swap_cycle = build_batch_move_clips_command(
+            &doc,
+            &[
+                ClipMovePlan {
+                    clip_id: ids[0].clone(),
+                    target_layer_id: l1.clone(),
+                    new_timeline_start: FrameIndex::new(30),
+                },
+                ClipMovePlan {
+                    clip_id: ids[1].clone(),
+                    target_layer_id: l1,
+                    new_timeline_start: FrameIndex::new(0),
+                },
+            ],
+        );
+        assert!(matches!(swap_cycle, Err(CommandError::Incompatible(_))));
+        Ok(())
     }
 }

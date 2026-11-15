@@ -99,6 +99,57 @@ pub enum DocumentValidationError {
         #[source]
         source: TimeError,
     },
+    /// タイムライン選択範囲の開始が終了以上になっている。
+    #[error("selection range start ({:?}) must be strictly less than end ({:?})", .start.get(), .end.get())]
+    InvalidSelectionRange {
+        /// 範囲開始フレーム。
+        start: FrameIndex,
+        /// 範囲終了フレーム。
+        end: FrameIndex,
+    },
+    /// クリップ中間点配列が狭義単調増加ではない。
+    #[error("clip `{clip_id}` midpoints must be strictly increasing")]
+    InvalidMidpoints {
+        /// 該当クリップ ID。
+        clip_id: ClipId,
+    },
+}
+
+/// タイムライン全体の総尺算出モード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TimelineLengthMode {
+    /// 全レイヤーの最終クリップ末尾に追従する（既定）。
+    #[default]
+    AutoToLastClip,
+    /// 手動指定したフレーム数をプロジェクト尺として扱う。
+    Manual {
+        /// 手動尺の総フレーム数（1 以上）。
+        end_frame: FrameCount,
+    },
+}
+
+/// タイムライン上の半開選択範囲 `[start, end)`（単位: フレーム）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FrameRange {
+    /// 選択範囲の開始フレーム（含む）。
+    pub start: FrameIndex,
+    /// 選択範囲の終了フレーム（含まない）。
+    pub end: FrameIndex,
+}
+
+impl FrameRange {
+    /// 選択範囲のフレーム長を返す。
+    #[must_use]
+    pub const fn len_frames(self) -> u64 {
+        self.end.get().saturating_sub(self.start.get())
+    }
+
+    /// 指定フレームがこの選択範囲 `[start, end)` に含まれるか返す。
+    #[must_use]
+    pub const fn contains(self, frame: FrameIndex) -> bool {
+        self.start.get() <= frame.get() && frame.get() < self.end.get()
+    }
 }
 
 /// キャンバス解像度（幅・高さとも 1px 以上）。
@@ -360,8 +411,95 @@ pub struct Clip {
     /// カット後もイージングや数式 `p`/`d` の時間尺度を保つための基準尺（省略時はクリップ長）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_duration_frames: Option<FrameCount>,
+    /// クリップ内エフェクト基準座標の中間点配列（狭義単調増加）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midpoints: Vec<i64>,
     /// クリップ種別ごとのペイロード。
     pub kind: ClipKind,
+}
+
+impl Clip {
+    /// クリップ可視範囲のエフェクト基準境界 `(eff_start, eff_last)` を返す。
+    #[must_use]
+    pub fn effect_bounds(&self) -> (i64, i64) {
+        let eff_start = self.effect_offset_frames;
+        let span = i64::try_from(self.duration.get().saturating_sub(1)).unwrap_or(i64::MAX);
+        let eff_last = eff_start.saturating_add(span);
+        (eff_start, eff_last)
+    }
+
+    /// 現在の可視範囲 `(eff_start, eff_last)` に厳密に含まれる中間点一覧を昇順で返す。
+    #[must_use]
+    pub fn visible_midpoints(&self) -> Vec<i64> {
+        let (eff_start, eff_last) = self.effect_bounds();
+        self.midpoints
+            .iter()
+            .copied()
+            .filter(|&m| eff_start < m && m < eff_last)
+            .collect()
+    }
+
+    /// セグメント境界フレーム列 `[eff_start, ...visible_midpoints..., eff_last]` を返す。
+    ///
+    /// クリップ長が 1 フレームのときは `[eff_start]` を返す。
+    #[must_use]
+    pub fn grid_frames(&self) -> Vec<i64> {
+        let (eff_start, eff_last) = self.effect_bounds();
+        if self.duration.get() <= 1 || eff_last <= eff_start {
+            return vec![eff_start];
+        }
+        let mut grid = Vec::with_capacity(self.midpoints.len() + 2);
+        grid.push(eff_start);
+        grid.extend(self.visible_midpoints());
+        grid.push(eff_last);
+        grid
+    }
+
+    /// クリップ内の全 [`AnimatedParameter`] に対して変更コールバックを適用する。
+    pub fn visit_animated_params_mut<F>(&mut self, mut visit: F)
+    where
+        F: FnMut(&mut AnimatedParameter),
+    {
+        match &mut self.kind {
+            ClipKind::Video { visual, audio, .. } => {
+                visit_visual_params_mut(visual, &mut visit);
+                if let Some(a) = audio {
+                    visit(&mut a.gain_db);
+                    visit(&mut a.pan);
+                }
+            }
+            ClipKind::Image { visual, .. } => {
+                visit_visual_params_mut(visual, &mut visit);
+            }
+            ClipKind::Audio { audio, .. } => {
+                visit(&mut audio.gain_db);
+                visit(&mut audio.pan);
+            }
+            ClipKind::Subtitle(sub) => {
+                visit(&mut sub.font_size);
+                visit_visual_params_mut(&mut sub.visual, &mut visit);
+            }
+        }
+    }
+}
+
+fn visit_visual_params_mut<F>(visual: &mut VisualProperties, visit: &mut F)
+where
+    F: FnMut(&mut AnimatedParameter),
+{
+    visit(&mut visual.x);
+    visit(&mut visual.y);
+    visit(&mut visual.scale_x);
+    visit(&mut visual.scale_y);
+    visit(&mut visual.rotation_deg);
+    visit(&mut visual.anchor_x);
+    visit(&mut visual.anchor_y);
+    visit(&mut visual.opacity);
+    visit(&mut visual.brightness);
+    visit(&mut visual.contrast);
+    visit(&mut visual.saturation);
+    visit(&mut visual.hue_deg);
+    visit(&mut visual.gamma);
 }
 
 impl Clip {
@@ -471,6 +609,12 @@ pub struct ProjectDocument {
     /// キャンバス背景色。
     #[serde(default)]
     pub background_color: RgbaColor,
+    /// タイムライン総尺の算出モード。
+    #[serde(default)]
+    pub timeline_length: TimelineLengthMode,
+    /// タイムライン上の選択範囲（`[`〜`]` マーカー、半開区間）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_range: Option<FrameRange>,
     /// 登録済み素材一覧。
     #[serde(default)]
     pub assets: Vec<Asset>,
@@ -489,6 +633,8 @@ impl ProjectDocument {
             fps: FrameRate::FPS_60,
             resolution: ProjectResolution::HD_1080P,
             background_color: RgbaColor::BLACK,
+            timeline_length: TimelineLengthMode::AutoToLastClip,
+            selection_range: None,
             assets: Vec::new(),
             layers: Vec::new(),
         }
@@ -529,9 +675,9 @@ impl ProjectDocument {
         None
     }
 
-    /// プロジェクト全体の末尾フレーム位置（最大 `timeline_start + duration`）を返す。
+    /// 全レイヤーの最終クリップ末尾位置（最大 `timeline_start + duration`）を返す。
     #[must_use]
-    pub fn total_duration_frames(&self) -> u64 {
+    pub fn clips_end_frame(&self) -> u64 {
         self.layers
             .iter()
             .flat_map(|layer| layer.clips.iter())
@@ -540,7 +686,39 @@ impl ProjectDocument {
             .unwrap_or(0)
     }
 
-    /// ドキュメント全体の不変条件（ID 一意性・非重複区間・参照整合・ソース境界）を検証する。
+    /// プロジェクト全体の総尺フレーム数を返す。
+    ///
+    /// [`TimelineLengthMode::AutoToLastClip`] の場合は [`Self::clips_end_frame`]、
+    /// [`TimelineLengthMode::Manual`] の場合は指定された `end_frame` を返す。
+    #[must_use]
+    pub fn total_duration_frames(&self) -> u64 {
+        match self.timeline_length {
+            TimelineLengthMode::AutoToLastClip => self.clips_end_frame(),
+            TimelineLengthMode::Manual { end_frame } => end_frame.get(),
+        }
+    }
+
+    /// ルーラー表示用の仮想終端フレーム位置（`total_duration_frames + 10秒`、最小 10 秒）を返す。
+    #[must_use]
+    pub fn ruler_display_span_frames(&self) -> u64 {
+        let num = u64::from(self.fps.numerator());
+        let den = u64::from(self.fps.denominator()).max(1);
+        let ten_sec = (num.saturating_mul(10).saturating_add(den / 2)) / den;
+        self.total_duration_frames()
+            .saturating_add(ten_sec)
+            .max(ten_sec.max(1))
+    }
+
+    /// プレイヘッドシーク許容上限フレームを返す。
+    #[must_use]
+    pub fn seek_upper_bound_frames(&self) -> u64 {
+        match self.timeline_length {
+            TimelineLengthMode::AutoToLastClip => self.ruler_display_span_frames(),
+            TimelineLengthMode::Manual { end_frame } => end_frame.get(),
+        }
+    }
+
+    /// ドキュメント全体の不変条件（ID 一意性・非重複区間・参照整合・ソース境界・選択範囲・中間点）を検証する。
     ///
     /// # Errors
     ///
@@ -553,6 +731,15 @@ impl ProjectDocument {
             });
         }
 
+        if let Some(range) = self.selection_range
+            && range.start >= range.end
+        {
+            return Err(DocumentValidationError::InvalidSelectionRange {
+                start: range.start,
+                end: range.end,
+            });
+        }
+
         let asset_map = self.validate_assets()?;
         let mut seen_layer_ids = HashSet::with_capacity(self.layers.len());
         let mut seen_clip_ids = HashSet::new();
@@ -560,6 +747,13 @@ impl ProjectDocument {
         for layer in &self.layers {
             if !seen_layer_ids.insert(&layer.id) {
                 return Err(DocumentValidationError::DuplicateLayerId(layer.id.clone()));
+            }
+            for clip in &layer.clips {
+                if !clip.midpoints.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(DocumentValidationError::InvalidMidpoints {
+                        clip_id: clip.id.clone(),
+                    });
+                }
             }
             self.validate_single_layer(layer, &asset_map, &mut seen_clip_ids)?;
         }
@@ -799,6 +993,7 @@ mod tests {
                 duration: FrameCount::new(60)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Video {
                     asset_id: AssetId::new("asset_video")?,
                     source_in: RationalDuration::ZERO,
@@ -830,6 +1025,7 @@ mod tests {
             duration: FrameCount::new(100)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("Hello")),
         });
         layer.clips.push(Clip {
@@ -839,6 +1035,7 @@ mod tests {
             duration: FrameCount::new(50)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("Overlap")),
         });
         doc.layers.push(layer);
@@ -865,6 +1062,7 @@ mod tests {
             duration: FrameCount::new(121)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Video {
                 asset_id: AssetId::new("asset_video")?,
                 source_in: RationalDuration::ZERO,
@@ -881,6 +1079,98 @@ mod tests {
             err,
             Err(DocumentValidationError::SourceRangeExceedsAsset { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_length_ruler_span_and_seek_upper_bound_behave_per_spec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("Len");
+        doc.fps = FrameRate::FPS_29_97;
+        assert_eq!(doc.total_duration_frames(), 0);
+        assert_eq!(doc.ruler_display_span_frames(), 300);
+        assert_eq!(doc.seek_upper_bound_frames(), 300);
+
+        let mut layer = Layer::new(LayerId::new("l1")?, "V1");
+        layer.clips.push(Clip {
+            id: ClipId::new("c1")?,
+            name: "Sub".to_owned(),
+            timeline_start: FrameIndex::new(100),
+            duration: FrameCount::new(200)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: vec![20, 100],
+            kind: ClipKind::Subtitle(SubtitleProperties::new("Hi")),
+        });
+        doc.layers.push(layer);
+        assert_eq!(doc.clips_end_frame(), 300);
+        assert_eq!(doc.total_duration_frames(), 300);
+        assert_eq!(doc.ruler_display_span_frames(), 600);
+        assert_eq!(doc.seek_upper_bound_frames(), 600);
+
+        doc.timeline_length = TimelineLengthMode::Manual {
+            end_frame: FrameCount::new(900)?,
+        };
+        assert_eq!(doc.total_duration_frames(), 900);
+        assert_eq!(doc.ruler_display_span_frames(), 1200);
+        assert_eq!(doc.seek_upper_bound_frames(), 900);
+
+        let clip = &doc.layers[0].clips[0];
+        assert_eq!(clip.effect_bounds(), (0, 199));
+        assert_eq!(clip.visible_midpoints(), vec![20, 100]);
+        assert_eq!(clip.grid_frames(), vec![0, 20, 100, 199]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_selection_range_and_non_monotonic_midpoints_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("Validate");
+        doc.selection_range = Some(FrameRange {
+            start: FrameIndex::new(10),
+            end: FrameIndex::new(10),
+        });
+        assert!(matches!(
+            doc.validate(),
+            Err(DocumentValidationError::InvalidSelectionRange { .. })
+        ));
+
+        doc.selection_range = Some(FrameRange {
+            start: FrameIndex::new(10),
+            end: FrameIndex::new(20),
+        });
+        let mut layer = Layer::new(LayerId::new("l1")?, "V1");
+        layer.clips.push(Clip {
+            id: ClipId::new("c1")?,
+            name: "Bad".to_owned(),
+            timeline_start: FrameIndex::ZERO,
+            duration: FrameCount::new(100)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: vec![30, 30],
+            kind: ClipKind::Subtitle(SubtitleProperties::new("Bad")),
+        });
+        doc.layers.push(layer);
+        assert!(matches!(
+            doc.validate(),
+            Err(DocumentValidationError::InvalidMidpoints { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn old_project_json_without_new_fields_deserializes_with_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let doc = ProjectDocument::new("Compat");
+        let mut val = serde_json::to_value(&doc)?;
+        if let Some(obj) = val.as_object_mut() {
+            let _ = obj.remove("timeline_length");
+            let _ = obj.remove("selection_range");
+        }
+        let restored: ProjectDocument = serde_json::from_value(val)?;
+        assert_eq!(restored.timeline_length, TimelineLengthMode::AutoToLastClip);
+        assert_eq!(restored.selection_range, None);
+        restored.validate()?;
         Ok(())
     }
 }

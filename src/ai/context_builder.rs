@@ -287,6 +287,7 @@ mod tests {
             duration: FrameCount::new(45)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("開始テロップ")),
         });
         doc.layers.push(layer);

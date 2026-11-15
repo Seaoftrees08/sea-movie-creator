@@ -127,6 +127,7 @@ fn build_stretched_fade_doc()
                         duration: FrameCount::new(90)?,
                         effect_offset_frames: 0,
                         effect_duration_frames: None,
+                        midpoints: Vec::new(),
                         kind: NewClipKind::Audio {
                             asset_id: AssetRef::Temp("a_tone".to_owned()),
                             source_in: RationalDuration::ZERO,
@@ -253,6 +254,7 @@ fn varispeed_without_pitch_preserve_shifts_frequency_and_limiter_clamps_sum()
                         duration: FrameCount::new(45)?,
                         effect_offset_frames: 0,
                         effect_duration_frames: None,
+                        midpoints: Vec::new(),
                         kind: NewClipKind::Audio {
                             asset_id: AssetRef::Temp("a_tone".to_owned()),
                             source_in: RationalDuration::ZERO,

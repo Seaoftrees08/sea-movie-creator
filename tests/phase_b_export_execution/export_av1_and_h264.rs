@@ -264,6 +264,7 @@ fn build_clips_batch(
                     duration: clip_len,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: NewClipKind::Image {
                         asset_id: AssetRef::Id(img_asset_id.clone()),
                         visual: VisualProperties::default(),
@@ -280,6 +281,7 @@ fn build_clips_batch(
                     duration: clip_len,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: NewClipKind::Subtitle(SubtitleProperties {
                         text: "Phase B-5 実書き出し\nテスト字幕".to_owned(),
                         font_family: "sans-serif".to_owned(),
@@ -302,6 +304,7 @@ fn build_clips_batch(
                     duration: clip_len,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: NewClipKind::Audio {
                         asset_id: AssetRef::Id(bgm_asset_id.clone()),
                         source_in: RationalDuration::ZERO,

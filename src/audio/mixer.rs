@@ -481,6 +481,7 @@ mod tests {
             duration: FrameCount::new(30)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Audio {
                 asset_id: asset_id.clone(),
                 source_in: RationalDuration::ZERO,
@@ -527,6 +528,7 @@ mod tests {
                 duration: FrameCount::new(30)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Audio {
                     asset_id: asset_id.clone(),
                     source_in: RationalDuration::ZERO,

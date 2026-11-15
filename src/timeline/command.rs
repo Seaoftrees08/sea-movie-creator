@@ -12,7 +12,8 @@ use crate::media::visual_properties::{
     BlendMode, SubtitleProperties, TextAlignment, VisualProperties,
 };
 use crate::timeline::document::{
-    AssetKind, AssetPath, AudioProperties, DocumentValidationError, ProjectResolution,
+    AssetKind, AssetPath, AudioProperties, DocumentValidationError, FrameRange, ProjectResolution,
+    TimelineLengthMode,
 };
 
 /// 編集コマンドの検証・実行時に発生するエラー。
@@ -190,6 +191,9 @@ pub struct NewClipSpec {
     /// エフェクト基準尺（省略時はクリップ長を使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_duration_frames: Option<FrameCount>,
+    /// クリップ内中間点配列（省略時は空）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midpoints: Vec<i64>,
     /// 種別ごとのペイロード。
     pub kind: NewClipKind,
 }
@@ -423,6 +427,39 @@ pub enum EditCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preserve_pitch: Option<bool>,
     },
+    /// タイムライン全体の総尺算出モードを変更する。
+    SetTimelineLength {
+        /// 新しい総尺モード（自動または手動フレーム数）。
+        mode: TimelineLengthMode,
+    },
+    /// タイムライン上の選択範囲（`[`〜`]`）を設定または解除する。
+    SetSelectionRange {
+        /// 新しい半開選択範囲 `[start, end)`（`None` で解除）。
+        range: Option<FrameRange>,
+    },
+    /// 指定クリップに中間点を追加する。
+    AddMidpoint {
+        /// 対象クリップ参照。
+        clip_id: ClipRef,
+        /// エフェクト基準フレーム位置（`eff_start < effect_frame < eff_last`）。
+        effect_frame: i64,
+    },
+    /// 指定クリップ上の既存中間点を移動する。
+    MoveMidpoint {
+        /// 対象クリップ参照。
+        clip_id: ClipRef,
+        /// 移動前のエフェクト基準フレーム位置。
+        old_effect_frame: i64,
+        /// 移動後のエフェクト基準フレーム位置。
+        new_effect_frame: i64,
+    },
+    /// 指定クリップから中間点を削除する。
+    RemoveMidpoint {
+        /// 対象クリップ参照。
+        clip_id: ClipRef,
+        /// 削除する中間点のエフェクト基準フレーム位置。
+        effect_frame: i64,
+    },
     /// 複数コマンドを 1 つの Undo 単位かつ全成功/全ロールバックのアトミック単位として実行する。
     Batch {
         /// 順番に実行するコマンド配列。
@@ -454,6 +491,7 @@ mod tests {
                         duration: FrameCount::new(120)?,
                         effect_offset_frames: 0,
                         effect_duration_frames: None,
+                        midpoints: Vec::new(),
                         kind: NewClipKind::Subtitle(SubtitleProperties::new("Hello")),
                     }),
                 },

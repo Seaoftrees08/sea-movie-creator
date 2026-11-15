@@ -84,6 +84,7 @@ impl PlaybackClock {
         let sample = u128::from(frame.get())
             .saturating_mul(u128::from(sr))
             .saturating_mul(u128::from(den))
+            .saturating_add(u128::from(num.saturating_sub(1)))
             / u128::from(num);
         let sample_u64 = u64::try_from(sample).unwrap_or(u64::MAX);
         self.current_sample.store(sample_u64, Ordering::Release);

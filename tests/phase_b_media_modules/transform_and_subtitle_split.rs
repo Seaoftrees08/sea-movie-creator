@@ -145,6 +145,7 @@ fn setup_phase_b2_document(
                     duration: clip_len,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: NewClipKind::Image {
                         asset_id: AssetRef::Id(img_asset_id.clone()),
                         visual: VisualProperties::default(),
@@ -161,6 +162,7 @@ fn setup_phase_b2_document(
                     duration: clip_len,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: NewClipKind::Subtitle(SubtitleProperties {
                         text: "こんにちは Phase B-2\n2行目字幕".to_owned(),
                         font_family: "sans-serif".to_owned(),

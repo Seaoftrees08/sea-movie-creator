@@ -24,6 +24,7 @@ fn make_subtitle_clip(
         duration: FrameCount::new(dur)?,
         effect_offset_frames: 0,
         effect_duration_frames: None,
+        midpoints: Vec::new(),
         kind: ClipKind::Subtitle(SubtitleProperties::new(name)),
     })
 }

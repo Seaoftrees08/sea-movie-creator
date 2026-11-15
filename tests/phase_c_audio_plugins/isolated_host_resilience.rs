@@ -201,6 +201,7 @@ fn build_doc_with_gain_plugin(
                         duration,
                         effect_offset_frames: 0,
                         effect_duration_frames: None,
+                        midpoints: Vec::new(),
                         kind: NewClipKind::Audio {
                             asset_id: AssetRef::Temp("a1".to_owned()),
                             source_in: RationalDuration::ZERO,

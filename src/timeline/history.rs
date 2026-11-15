@@ -5,7 +5,9 @@ use std::mem;
 use crate::core::color::RgbaColor;
 use crate::core::ids::{AssetId, ClipId, LayerId};
 use crate::timeline::command::CommandError;
-use crate::timeline::document::{Asset, Clip, Layer, ProjectDocument, ProjectResolution};
+use crate::timeline::document::{
+    Asset, Clip, FrameRange, Layer, ProjectDocument, ProjectResolution, TimelineLengthMode,
+};
 
 /// ドキュメント全体のコピーを持たずに変更箇所だけを可逆適用するための最小パッチ単位。
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +54,12 @@ pub(crate) enum PatchStep {
         layer_id: LayerId,
         clip: Clip,
     },
+    SetTimelineLength {
+        mode: TimelineLengthMode,
+    },
+    SetSelectionRange {
+        range: Option<FrameRange>,
+    },
 }
 
 /// 逆順（LIFO）でパッチ列を適用し、逆方向操作（Redo 用またはロールバック用）のパッチ列を返す。
@@ -93,6 +101,14 @@ fn apply_single_patch(
         PatchStep::InsertClip { .. }
         | PatchStep::RemoveClip { .. }
         | PatchStep::ReplaceClip { .. } => apply_clip_patch(doc, step),
+        PatchStep::SetTimelineLength { mode } => {
+            let prev = mem::replace(&mut doc.timeline_length, mode);
+            Ok(PatchStep::SetTimelineLength { mode: prev })
+        }
+        PatchStep::SetSelectionRange { range } => {
+            let prev = mem::replace(&mut doc.selection_range, range);
+            Ok(PatchStep::SetSelectionRange { range: prev })
+        }
     }
 }
 
@@ -369,6 +385,7 @@ mod tests {
             duration: FrameCount::new(60)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("V1")),
         };
 

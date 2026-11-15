@@ -120,6 +120,7 @@ fn build_synthetic_project()
                 duration: FrameCount::new(8)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Image {
                     asset_id: img_id.clone(),
                     visual,
@@ -139,6 +140,7 @@ fn build_synthetic_project()
                 duration: FrameCount::new(8)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Subtitle(subtitle_props),
             }],
         },
@@ -155,6 +157,7 @@ fn build_synthetic_project()
                 duration: FrameCount::new(8)?,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Audio {
                     asset_id: bgm_id.clone(),
                     source_in: RationalDuration::ZERO,

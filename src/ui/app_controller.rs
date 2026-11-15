@@ -37,12 +37,128 @@ use crate::ui::surface_bridge::{
 const DEFAULT_FRAME_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PREVIEW_CANVAS_MAX_WIDTH: u32 = 480;
 const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
-const MIN_RIGHT_PANEL_WIDTH: f32 = 220.0;
+/// 右インスペクタパネルの最小許容幅 (px)。
+pub const MIN_RIGHT_PANEL_WIDTH: f32 = 240.0;
+/// タイムライン拡大率の最小値 (px / frame)。
+pub const MIN_TIMELINE_PX_PER_FRAME: f32 = 0.2;
+/// タイムライン拡大率の最大値 (px / frame)。
+pub const MAX_TIMELINE_PX_PER_FRAME: f32 = 32.0;
 const DEFAULT_RIGHT_PANEL_RATIO: f32 = 0.2;
 const MAX_RIGHT_PANEL_RATIO: f32 = 0.5;
 const MIN_TIMELINE_HEIGHT: f32 = 140.0;
 const DEFAULT_TIMELINE_RATIO: f32 = 0.3;
 const MAX_TIMELINE_RATIO: f32 = 0.6;
+
+/// ヘッダー・時刻バッジの時間表記単位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeDisplayUnit {
+    /// タイムコード表記 (`HH:MM:SS.cc`)。
+    #[default]
+    Timecode,
+    /// 総フレーム数表記 (`0f`)。
+    Frames,
+}
+
+/// タイムラインレイヤー行の表示密度プリセット。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimelineRowDensity {
+    /// 高密度表示 (22px)。
+    Compact,
+    /// 標準表示 (30px)。
+    #[default]
+    Medium,
+    /// 波形重視の広め表示 (44px)。
+    Large,
+}
+
+impl TimelineRowDensity {
+    /// 行密度に応じたピクセル高さを返す。
+    #[must_use]
+    pub const fn row_height_px(self) -> f32 {
+        match self {
+            Self::Compact => 22.0,
+            Self::Medium => 30.0,
+            Self::Large => 44.0,
+        }
+    }
+
+    /// 次の密度プリセットへ順送りする (`Compact -> Medium -> Large -> Compact`)。
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Compact => Self::Medium,
+            Self::Medium => Self::Large,
+            Self::Large => Self::Compact,
+        }
+    }
+
+    /// UI ボタン表示用の短いラベルを返す。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "小",
+            Self::Medium => "中",
+            Self::Large => "大",
+        }
+    }
+}
+
+/// プレビューキャンバス表示倍率モード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewZoomMode {
+    /// ペイン全体へ自動フィット表示する。
+    #[default]
+    Fit,
+    /// 固定パーセント倍率（25, 50, 100, 200 など）。
+    Percent(u16),
+}
+
+impl PreviewZoomMode {
+    /// 固定倍率の場合はスカラー係数 (`1.0 == 100%`) を、`Fit` の場合は `None` を返す。
+    #[must_use]
+    pub fn zoom_factor(self) -> Option<f32> {
+        match self {
+            Self::Fit => None,
+            Self::Percent(pct) => Some((f32::from(pct.clamp(10, 800))) / 100.0),
+        }
+    }
+}
+
+fn default_inspector_sections() -> std::collections::HashMap<String, bool> {
+    let mut map = std::collections::HashMap::new();
+    map.insert("standard".to_owned(), true);
+    map.insert("color".to_owned(), false);
+    map.insert("subtitle".to_owned(), true);
+    map.insert("audio".to_owned(), true);
+    map.insert("plugins".to_owned(), false);
+    map
+}
+
+fn find_unlocked_free_layer(
+    doc: &ProjectDocument,
+    preferred: Option<&LayerId>,
+    start_frame: u64,
+    end_frame: u64,
+) -> Option<LayerId> {
+    let is_free = |layer: &crate::timeline::document::Layer| -> bool {
+        !layer.locked
+            && layer.clips.iter().all(|c| {
+                let c_start = c.timeline_start.get();
+                let c_end = c_start.saturating_add(c.duration.get());
+                c_end <= start_frame || end_frame <= c_start
+            })
+    };
+    if let Some(pref_id) = preferred
+        && let Some(layer) = doc.find_layer(pref_id)
+        && is_free(layer)
+    {
+        return Some(layer.id.clone());
+    }
+    doc.layers
+        .iter()
+        .find(|layer| is_free(layer))
+        .map(|layer| layer.id.clone())
+}
 
 /// タイムライン再生の状態機械。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,6 +211,7 @@ pub fn clamp_timeline_height(window_height: f32, requested: Option<f32>) -> f32 
 }
 
 /// プロジェクト編集・デコード・再生状態を一元保持するヘッドレスコントローラ。
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppController {
     /// 現在のプロジェクトドキュメント。
     pub document: ProjectDocument,
@@ -112,8 +229,36 @@ pub struct AppController {
     pub playback_state: PlaybackState,
     /// 現在の選択レイヤー ID。
     pub selected_layer_id: Option<LayerId>,
-    /// 現在の選択クリップ ID。
+    /// 現在の選択クリップ ID（複数選択時は先頭要素と同期）。
     pub selected_clip_id: Option<ClipId>,
+    /// 現在選択中のクリップ ID 一覧（順序維持・重複なし）。
+    pub selected_clip_ids: Vec<ClipId>,
+    /// 右インスペクタで編集中のセグメント番号 (`0 .. visible_midpoints.len()`)。
+    pub selected_segment_index: Option<usize>,
+    /// 時間表示単位（タイムコード / フレーム）。
+    pub time_display_unit: TimeDisplayUnit,
+    /// タイムラインレイヤー行密度。
+    pub timeline_row_density: TimelineRowDensity,
+    /// タイムラインの垂直スクロール位置 (px)。
+    pub timeline_scroll_y_px: f32,
+    /// プレイヘッド移動時に再生位置上のクリップを選択追従させるか。
+    pub follow_selected_on_seek: bool,
+    /// プレビュー選択枠・ハンドルを表示するか。
+    pub show_preview_guides: bool,
+    /// プレビュー中央補助グリッドを表示するか。
+    pub show_preview_grid: bool,
+    /// プレビュー下部マスター波形ストリップを表示するか。
+    pub show_preview_waveform: bool,
+    /// プレビュー表示倍率モード。
+    pub preview_zoom: PreviewZoomMode,
+    /// 固定倍率表示時のパンオフセット (px)。
+    pub preview_pan_offset_px: (f32, f32),
+    /// 拡大率 `X/Y` のアスペクト比連動ロック。
+    pub scale_aspect_locked: bool,
+    /// インスペクタ各セクションの開閉状態 (`section_key -> expanded`)。
+    pub inspector_sections: std::collections::HashMap<String, bool>,
+    /// ショートカット設定。
+    pub key_config: crate::ui::key_config::KeyConfig,
     /// 右タブパネルの現在タブ。
     pub right_tab: RightPanelTab,
     /// ユーザーが変更した右パネル幅（未設定時は 1/5）。
@@ -195,7 +340,21 @@ impl AppController {
             clock,
             playback_state: PlaybackState::Stopped,
             selected_layer_id,
+            selected_clip_ids: selected_clip_id.iter().cloned().collect(),
             selected_clip_id,
+            selected_segment_index: None,
+            time_display_unit: TimeDisplayUnit::Timecode,
+            timeline_row_density: TimelineRowDensity::Medium,
+            timeline_scroll_y_px: 0.0,
+            follow_selected_on_seek: false,
+            show_preview_guides: true,
+            show_preview_grid: false,
+            show_preview_waveform: true,
+            preview_zoom: PreviewZoomMode::Fit,
+            preview_pan_offset_px: (0.0, 0.0),
+            scale_aspect_locked: true,
+            inspector_sections: default_inspector_sections(),
+            key_config: crate::ui::key_config::KeyConfig::with_defaults(),
             right_tab: RightPanelTab::ClipInspector,
             right_panel_width: None,
             inspector: crate::ui::inspector_panel::InspectorState::default(),
@@ -256,7 +415,8 @@ impl AppController {
         self.mixer = AudioMixer::new();
         self.video_decoders.clear();
         self.selected_layer_id = None;
-        self.selected_clip_id = None;
+        self.clear_clip_selection();
+        self.timeline_scroll_y_px = 0.0;
         "新規プロジェクトを作成しました".clone_into(&mut self.status_message);
         self.sync_shared_state();
         self.dirty_preview = true;
@@ -279,13 +439,15 @@ impl AppController {
         self.frame_cache.clear();
         self.mixer = AudioMixer::new();
         self.video_decoders.clear();
-        self.selected_layer_id = self.document.layers.first().map(|l| l.id.clone());
-        self.selected_clip_id = self
+        let first_clip = self
             .document
             .layers
             .first()
             .and_then(|l| l.clips.first())
             .map(|c| c.id.clone());
+        self.select_single_clip(first_clip);
+        self.selected_layer_id = self.document.layers.first().map(|l| l.id.clone());
+        self.timeline_scroll_y_px = 0.0;
         self.preload_available_media(project_dir);
         self.sync_shared_state();
         self.clock.seek_to_frame(FrameIndex::ZERO);
@@ -352,11 +514,11 @@ impl AppController {
         for (asset_id, item) in planned_assets.iter().zip(&prepared) {
             self.register_decoded_resources_for_asset(asset_id, &item.source_path, item.ext_kind);
         }
-        self.selected_layer_id = Some(layer_id);
         let last_key = format!("imported_clip_{}", prepared.len().saturating_sub(1));
         if let Some(new_clip) = report.created_clips.get(&last_key) {
-            self.selected_clip_id = Some(new_clip.clone());
+            self.select_single_clip(Some(new_clip.clone()));
         }
+        self.selected_layer_id = Some(layer_id);
         self.sync_shared_state();
         self.dirty_preview = true;
         self.refresh_preview_now();
@@ -446,6 +608,7 @@ impl AppController {
                     duration: item.clip_frames,
                     effect_offset_frames: 0,
                     effect_duration_frames: None,
+                    midpoints: Vec::new(),
                     kind: build_new_clip_kind(&asset_id, item.clip_kind),
                 }),
             });
@@ -496,6 +659,7 @@ impl AppController {
                 duration: frames,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
+                midpoints: Vec::new(),
                 kind: ClipKind::Video {
                     asset_id: asset_id.clone(),
                     source_in: RationalDuration::ZERO,
@@ -507,8 +671,8 @@ impl AppController {
             });
             layer.sort_clips();
         }
+        self.select_single_clip(Some(clip_id.clone()));
         self.selected_layer_id = Some(layer_id);
-        self.selected_clip_id = Some(clip_id.clone());
         self.sync_shared_state();
         self.dirty_preview = true;
         self.refresh_preview_now();
@@ -783,7 +947,8 @@ impl AppController {
 
     /// タイムラインの表示倍率 (`timeline_px_per_frame`) を安全範囲内で拡大・縮小する。
     pub fn zoom_timeline(&mut self, factor: f32) {
-        self.timeline_px_per_frame = (self.timeline_px_per_frame * factor).clamp(0.5, 24.0);
+        self.timeline_px_per_frame = (self.timeline_px_per_frame * factor)
+            .clamp(MIN_TIMELINE_PX_PER_FRAME, MAX_TIMELINE_PX_PER_FRAME);
     }
 
     /// 選択クリップの不透明度を定数 `AnimatedParameter` として設定する。
@@ -885,7 +1050,11 @@ impl AppController {
 
     /// 指定フレームへシークし、プレビューを即時更新する。
     pub fn seek_to_frame(&mut self, frame: FrameIndex) {
-        let max_frame = self.document.total_duration_frames();
+        self.clock.update_timeline_metrics(
+            self.document.fps,
+            self.document.total_duration_frames(),
+        );
+        let max_frame = self.document.seek_upper_bound_frames();
         let clamped = FrameIndex::new(frame.get().min(max_frame));
         let was_playing = self.playback_state == PlaybackState::Playing;
         self.playback_state = PlaybackState::Seeking;
@@ -976,21 +1145,490 @@ impl AppController {
     }
 
     fn sync_selection_after_edit(&mut self) {
+        self.selected_clip_ids
+            .retain(|cid| self.document.find_clip(cid).is_some());
+        if self.selected_clip_ids.is_empty()
+            && let Some(cid) = &self.selected_clip_id
+            && self.document.find_clip(cid).is_some()
+        {
+            self.selected_clip_ids.push(cid.clone());
+        }
+
         if let Some(cid) = &self.selected_clip_id
             && self.document.find_clip(cid).is_none()
         {
-            self.selected_clip_id = self
-                .document
-                .layers
-                .first()
-                .and_then(|l| l.clips.first())
-                .map(|c| c.id.clone());
+            self.selected_clip_id = self.selected_clip_ids.first().cloned().or_else(|| {
+                self.document
+                    .layers
+                    .first()
+                    .and_then(|l| l.clips.first())
+                    .map(|c| c.id.clone())
+            });
+            if self.selected_clip_ids.is_empty()
+                && let Some(fallback) = &self.selected_clip_id
+            {
+                self.selected_clip_ids.push(fallback.clone());
+            }
+        } else if !self.selected_clip_ids.is_empty() {
+            self.selected_clip_id = self.selected_clip_ids.first().cloned();
         }
+
+        if let Some(seg_idx) = self.selected_segment_index {
+            let valid_seg = self
+                .selected_clip_id
+                .as_ref()
+                .and_then(|cid| self.document.find_clip(cid))
+                .is_some_and(|(_, clip)| seg_idx <= clip.visible_midpoints().len());
+            if !valid_seg {
+                self.selected_segment_index = None;
+            }
+        }
+
         if let Some(lid) = &self.selected_layer_id
             && self.document.find_layer(lid).is_none()
         {
             self.selected_layer_id = self.document.layers.first().map(|l| l.id.clone());
         }
+    }
+
+    /// 実質的な選択クリップ ID 一覧を返す（`selected_clip_id` 直接代入への後方互換を維持）。
+    #[must_use]
+    pub fn effective_selected_clip_ids(&self) -> Vec<ClipId> {
+        if self.selected_clip_ids.is_empty() {
+            self.selected_clip_id.iter().cloned().collect()
+        } else {
+            self.selected_clip_ids.clone()
+        }
+    }
+
+    /// 単一クリップ選択状態を設定する（`None` で選択解除）。
+    pub fn select_single_clip(&mut self, clip_id: Option<ClipId>) {
+        self.selected_clip_ids.clear();
+        if let Some(cid) = clip_id {
+            if let Some((layer, _)) = self.document.find_clip(&cid) {
+                self.selected_layer_id = Some(layer.id.clone());
+            }
+            self.selected_clip_id = Some(cid.clone());
+            self.selected_clip_ids.push(cid);
+        } else {
+            self.selected_clip_id = None;
+        }
+        self.selected_segment_index = None;
+    }
+
+    /// 指定クリップの選択状態をトグルする（`Ctrl+Click` 用）。
+    pub fn toggle_clip_selection(&mut self, clip_id: &ClipId) {
+        if self.selected_clip_ids.is_empty()
+            && let Some(prev) = self.selected_clip_id.take()
+        {
+            self.selected_clip_ids.push(prev);
+        }
+        if let Some(pos) = self.selected_clip_ids.iter().position(|id| id == clip_id) {
+            self.selected_clip_ids.remove(pos);
+        } else {
+            self.selected_clip_ids.push(clip_id.clone());
+            if let Some((layer, _)) = self.document.find_clip(clip_id) {
+                self.selected_layer_id = Some(layer.id.clone());
+            }
+        }
+        self.selected_clip_id = self.selected_clip_ids.first().cloned();
+        self.selected_segment_index = None;
+    }
+
+    /// 複数選択クリップ一覧を明示的に設定する（重複除去・先頭を `selected_clip_id` へ同期）。
+    pub fn set_selected_clips(&mut self, clip_ids: Vec<ClipId>) {
+        let mut unique = Vec::with_capacity(clip_ids.len());
+        for cid in clip_ids {
+            if !unique.contains(&cid) {
+                unique.push(cid);
+            }
+        }
+        self.selected_clip_ids = unique;
+        self.selected_clip_id = self.selected_clip_ids.first().cloned();
+        if let Some(first) = &self.selected_clip_id
+            && let Some((layer, _)) = self.document.find_clip(first)
+        {
+            self.selected_layer_id = Some(layer.id.clone());
+        }
+        self.selected_segment_index = None;
+    }
+
+    /// 全レイヤーの全クリップを選択状態にする (`Ctrl+A`)。
+    pub fn select_all_clips(&mut self) {
+        let all: Vec<ClipId> = self
+            .document
+            .layers
+            .iter()
+            .flat_map(|layer| layer.clips.iter().map(|clip| clip.id.clone()))
+            .collect();
+        self.set_selected_clips(all);
+    }
+
+    /// クリップ・セグメント選択をすべて解除する (`Ctrl+Shift+A` / `Escape`)。
+    pub fn clear_clip_selection(&mut self) {
+        self.selected_clip_ids.clear();
+        self.selected_clip_id = None;
+        self.selected_segment_index = None;
+    }
+
+    /// 時間表示単位 (`Timecode` / `Frames`) を切り替える。
+    pub fn toggle_time_display_unit(&mut self) {
+        self.time_display_unit = match self.time_display_unit {
+            TimeDisplayUnit::Timecode => TimeDisplayUnit::Frames,
+            TimeDisplayUnit::Frames => TimeDisplayUnit::Timecode,
+        };
+    }
+
+    /// タイムラインレイヤー行密度プリセットを順送りする (`Compact -> Medium -> Large`)。
+    pub fn cycle_timeline_row_density(&mut self) {
+        self.timeline_row_density = self.timeline_row_density.cycle();
+    }
+
+    /// インスペクタセクションの開閉状態を返す（未登録時は規定で開く）。
+    #[must_use]
+    pub fn is_inspector_section_open(&self, key: &str) -> bool {
+        self.inspector_sections.get(key).copied().unwrap_or(true)
+    }
+
+    /// インスペクタセクションの開閉状態をトグルする。
+    pub fn toggle_inspector_section(&mut self, key: &str) {
+        let next = !self.is_inspector_section_open(key);
+        self.inspector_sections.insert(key.to_owned(), next);
+    }
+
+    /// プロジェクト総尺モードを設定し、手動短縮時は再生位置をクランプする。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn set_timeline_length(
+        &mut self,
+        mode: crate::timeline::document::TimelineLengthMode,
+    ) -> Result<String, String> {
+        let res = self.dispatch_command(&EditCommand::SetTimelineLength { mode })?;
+        let upper = self.document.seek_upper_bound_frames();
+        if self.clock.current_frame().get() > upper {
+            self.seek_to_frame(FrameIndex::new(upper));
+        }
+        Ok(res)
+    }
+
+    /// タイムライン上の選択範囲 `[start, end)` を設定または解除する。
+    ///
+    /// # Errors
+    ///
+    /// `start >= end` 等の検証失敗時。
+    pub fn set_selection_range(
+        &mut self,
+        range: Option<crate::timeline::document::FrameRange>,
+    ) -> Result<String, String> {
+        self.dispatch_command(&EditCommand::SetSelectionRange { range })
+    }
+
+    /// 現在の再生位置を `[`（選択開始点）として設定する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn set_selection_range_start_at_playhead(&mut self) -> Result<String, String> {
+        let start = self.clock.current_frame();
+        let end = match self.document.selection_range {
+            Some(existing) if existing.end > start => existing.end,
+            _ => FrameIndex::new(start.get().saturating_add(1)),
+        };
+        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+    }
+
+    /// 現在の再生位置を `]`（選択終了点、当該フレームを含むため `playhead + 1`）として設定する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn set_selection_range_end_at_playhead(&mut self) -> Result<String, String> {
+        let end = FrameIndex::new(self.clock.current_frame().get().saturating_add(1));
+        let start = match self.document.selection_range {
+            Some(existing) if existing.start < end => existing.start,
+            Some(_) => FrameIndex::new(end.get().saturating_sub(1)),
+            None => FrameIndex::ZERO,
+        };
+        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+    }
+
+    /// 指定クリップの指定エフェクト座標へ中間点を追加する。
+    ///
+    /// # Errors
+    ///
+    /// クリップ長が 3 フレーム未満、境界外、既存重複、ロック時。
+    pub fn add_midpoint(&mut self, clip_id: &ClipId, effect_frame: i64) -> Result<String, String> {
+        self.dispatch_command(&EditCommand::AddMidpoint {
+            clip_id: crate::core::ids::ClipRef::Id(clip_id.clone()),
+            effect_frame,
+        })
+    }
+
+    /// 選択中クリップの現在再生位置に中間点を追加する。
+    ///
+    /// # Errors
+    ///
+    /// クリップ未選択、再生位置がクリップ内部にない、または中間点制約違反時。
+    pub fn add_midpoint_at_playhead(&mut self) -> Result<String, String> {
+        let selected = self.effective_selected_clip_ids();
+        if selected.len() != 1 {
+            return Err("中間点追加は単一クリップ選択時のみ実行できます".to_owned());
+        }
+        let cid = selected[0].clone();
+        let (_, clip) = self
+            .document
+            .find_clip(&cid)
+            .ok_or_else(|| format!("クリップ `{cid}` が見つかりません"))?;
+        let playhead = self.clock.current_frame().get();
+        let start = clip.timeline_start.get();
+        let end = clip.timeline_end().map_err(|e| e.to_string())?.get();
+        if !(start < playhead && playhead + 1 < end) {
+            return Err("再生位置がクリップ内部の分割可能位置にありません".to_owned());
+        }
+        let local_i64 = i64::try_from(playhead - start).map_err(|_| "frame overflow".to_owned())?;
+        let eff_frame = clip
+            .effect_offset_frames
+            .checked_add(local_i64)
+            .ok_or_else(|| "effect frame overflow".to_owned())?;
+        self.add_midpoint(&cid, eff_frame)
+    }
+
+    /// 指定クリップ上の中間点を移動する。
+    ///
+    /// # Errors
+    ///
+    /// 移動先が範囲外または既存中間点と重複する場合。
+    pub fn move_midpoint(
+        &mut self,
+        clip_id: &ClipId,
+        old_effect_frame: i64,
+        new_effect_frame: i64,
+    ) -> Result<String, String> {
+        self.dispatch_command(&EditCommand::MoveMidpoint {
+            clip_id: crate::core::ids::ClipRef::Id(clip_id.clone()),
+            old_effect_frame,
+            new_effect_frame,
+        })
+    }
+
+    /// 指定クリップから指定中間点を削除する。
+    ///
+    /// # Errors
+    ///
+    /// 中間点未存在またはレイヤーロック時。
+    pub fn remove_midpoint(
+        &mut self,
+        clip_id: &ClipId,
+        effect_frame: i64,
+    ) -> Result<String, String> {
+        self.dispatch_command(&EditCommand::RemoveMidpoint {
+            clip_id: crate::core::ids::ClipRef::Id(clip_id.clone()),
+            effect_frame,
+        })
+    }
+
+    /// 選択中クリップについて再生位置と一致または直前の中間点を削除する (`Ctrl+/`)。
+    ///
+    /// # Errors
+    ///
+    /// クリップ未選択または対象中間点が存在しない場合。
+    pub fn remove_midpoint_near_playhead(&mut self) -> Result<String, String> {
+        let selected = self.effective_selected_clip_ids();
+        if selected.len() != 1 {
+            return Err("中間点削除は単一クリップ選択時のみ実行できます".to_owned());
+        }
+        let cid = selected[0].clone();
+        let (_, clip) = self
+            .document
+            .find_clip(&cid)
+            .ok_or_else(|| format!("クリップ `{cid}` が見つかりません"))?;
+        let playhead = self.clock.current_frame().get();
+        let start = clip.timeline_start.get();
+        let end = clip.timeline_end().map_err(|e| e.to_string())?.get();
+        if !(start <= playhead && playhead < end) {
+            return Err("再生位置が選択クリップの範囲外です".to_owned());
+        }
+        let local_i64 = i64::try_from(playhead - start).map_err(|_| "frame overflow".to_owned())?;
+        let eff_frame = clip
+            .effect_offset_frames
+            .checked_add(local_i64)
+            .ok_or_else(|| "effect frame overflow".to_owned())?;
+        let target_m = clip
+            .visible_midpoints()
+            .into_iter()
+            .rfind(|&m| m <= eff_frame)
+            .ok_or_else(|| "再生位置周辺に削除可能な中間点がありません".to_owned())?;
+        self.remove_midpoint(&cid, target_m)
+    }
+
+    /// 指定タイムライン位置に新しい字幕クリップを追加する。
+    ///
+    /// `layer_id` が `None` の場合は現在選択中または空いている非ロックレイヤーを選び、
+    /// 空きがなければ新規レイヤーを自動追加する（1 回の Undo で取り消し可能）。
+    ///
+    /// # Errors
+    ///
+    /// 指定レイヤーがロック状態または区間重複・ID 生成失敗時。
+    pub fn add_subtitle_clip_at(
+        &mut self,
+        layer_id: Option<&LayerId>,
+        start_frame: FrameIndex,
+        duration: FrameCount,
+        text: impl Into<String>,
+    ) -> Result<ClipId, String> {
+        let sub_text = text.into();
+        let new_clip_id =
+            ClipId::new(format!("clip-{}", self.next_seq())).map_err(|e| e.to_string())?;
+        let target_end = start_frame.get().saturating_add(duration.get());
+
+        let (needs_new_layer, layer_ref, chosen_layer_id) = if let Some(lid) = layer_id {
+            (
+                false,
+                crate::core::ids::LayerRef::Id(lid.clone()),
+                lid.clone(),
+            )
+        } else if let Some(found) = find_unlocked_free_layer(
+            &self.document,
+            self.selected_layer_id.as_ref(),
+            start_frame.get(),
+            target_end,
+        ) {
+            (false, crate::core::ids::LayerRef::Id(found.clone()), found)
+        } else {
+            let new_lid =
+                LayerId::new(format!("layer-{}", self.next_seq())).map_err(|e| e.to_string())?;
+            (
+                true,
+                crate::core::ids::LayerRef::Id(new_lid.clone()),
+                new_lid,
+            )
+        };
+
+        let mut cmds = Vec::new();
+        if needs_new_layer {
+            let idx = self.document.layers.len() + 1;
+            cmds.push(EditCommand::AddLayer {
+                temp_id: None,
+                id: Some(chosen_layer_id.clone()),
+                name: format!("Track {idx}"),
+                insert_index: None,
+            });
+        }
+        cmds.push(EditCommand::AddClip {
+            temp_id: None,
+            id: Some(new_clip_id.clone()),
+            layer_id: layer_ref,
+            clip: Box::new(NewClipSpec {
+                name: "字幕".to_owned(),
+                timeline_start: start_frame,
+                duration,
+                effect_offset_frames: 0,
+                effect_duration_frames: None,
+                midpoints: Vec::new(),
+                kind: NewClipKind::Subtitle(
+                    crate::media::visual_properties::SubtitleProperties::new(sub_text),
+                ),
+            }),
+        });
+        let batch = EditCommand::Batch { commands: cmds };
+        let _ = self.dispatch_command(&batch)?;
+        self.select_single_clip(Some(new_clip_id.clone()));
+        Ok(new_clip_id)
+    }
+
+    /// 指定名のトラックレイヤーを末尾に追加して選択する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn add_layer(&mut self, name: impl Into<String>) -> Result<LayerId, String> {
+        let new_id =
+            LayerId::new(format!("layer-{}", self.next_seq())).map_err(|e| e.to_string())?;
+        let cmd = EditCommand::AddLayer {
+            temp_id: None,
+            id: Some(new_id.clone()),
+            name: name.into(),
+            insert_index: None,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.selected_layer_id = Some(new_id.clone());
+        Ok(new_id)
+    }
+
+    /// 指定レイヤーを削除する。
+    ///
+    /// # Errors
+    ///
+    /// レイヤーが存在しないか削除不可時。
+    pub fn remove_layer(&mut self, layer_id: &LayerId) -> Result<(), String> {
+        let _ = self.dispatch_command(&EditCommand::RemoveLayer {
+            layer_id: layer_id.clone(),
+        })?;
+        Ok(())
+    }
+
+    /// 指定レイヤー名を変更する。
+    ///
+    /// # Errors
+    ///
+    /// レイヤーが存在しないか変更失敗時。
+    pub fn rename_layer(
+        &mut self,
+        layer_id: &LayerId,
+        name: impl Into<String>,
+    ) -> Result<(), String> {
+        let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
+            layer_id: crate::core::ids::LayerRef::Id(layer_id.clone()),
+            name: Some(name.into()),
+            visible: None,
+            muted: None,
+            locked: None,
+        })?;
+        Ok(())
+    }
+
+    /// 指定レイヤーの可視フラグ (`visible`) を反転する。
+    ///
+    /// # Errors
+    ///
+    /// レイヤーが存在しない場合。
+    pub fn toggle_layer_visible(&mut self, layer_id: &LayerId) -> Result<(), String> {
+        let cur = self
+            .document
+            .find_layer(layer_id)
+            .ok_or_else(|| format!("レイヤー `{layer_id}` が見つかりません"))?
+            .visible;
+        let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
+            layer_id: crate::core::ids::LayerRef::Id(layer_id.clone()),
+            name: None,
+            visible: Some(!cur),
+            muted: None,
+            locked: None,
+        })?;
+        Ok(())
+    }
+
+    /// 指定レイヤーのロックフラグ (`locked`) を反転する。
+    ///
+    /// # Errors
+    ///
+    /// レイヤーが存在しない場合。
+    pub fn toggle_layer_locked(&mut self, layer_id: &LayerId) -> Result<(), String> {
+        let cur = self
+            .document
+            .find_layer(layer_id)
+            .ok_or_else(|| format!("レイヤー `{layer_id}` が見つかりません"))?
+            .locked;
+        let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
+            layer_id: crate::core::ids::LayerRef::Id(layer_id.clone()),
+            name: None,
+            visible: None,
+            muted: None,
+            locked: Some(!cur),
+        })?;
+        Ok(())
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -1616,8 +2254,8 @@ mod tests {
         let default_w = clamp_right_panel_width(1280.0, None);
         assert!((default_w - 256.0).abs() < 1e-4);
 
-        // 下限 220px・上限 50% (640px) でクランプ
-        assert!((clamp_right_panel_width(1280.0, Some(50.0)) - 220.0).abs() < 1e-4);
+        // 下限 240px・上限 50% (640px) でクランプ
+        assert!((clamp_right_panel_width(1280.0, Some(50.0)) - 240.0).abs() < 1e-4);
         assert!((clamp_right_panel_width(1280.0, Some(999.0)) - 640.0).abs() < 1e-4);
     }
 
@@ -1822,6 +2460,62 @@ mod tests {
         assert_eq!(controller.document.layers.len(), 1);
         assert_eq!(controller.document.layers[0].clips.len(), 1);
         assert_eq!(controller.document.layers[0].clips[0].duration.get(), 163);
+        Ok(())
+    }
+
+    #[test]
+    fn phase_d1_selection_range_midpoints_subtitle_and_layer_controls_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut controller = AppController::new();
+        controller.seek_to_frame(FrameIndex::new(150));
+        assert_eq!(controller.clock.current_frame().get(), 150);
+
+        controller.set_selection_range_start_at_playhead()?;
+        assert_eq!(
+            controller.document.selection_range,
+            Some(crate::timeline::document::FrameRange {
+                start: FrameIndex::new(150),
+                end: FrameIndex::new(151),
+            })
+        );
+        controller.seek_to_frame(FrameIndex::new(100));
+        controller.set_selection_range_end_at_playhead()?;
+        assert_eq!(
+            controller.document.selection_range,
+            Some(crate::timeline::document::FrameRange {
+                start: FrameIndex::new(100),
+                end: FrameIndex::new(101),
+            })
+        );
+
+        let sub_id =
+            controller.add_subtitle_clip_at(None, FrameIndex::ZERO, FrameCount::new(120)?, "Hi")?;
+        assert_eq!(
+            controller.effective_selected_clip_ids(),
+            vec![sub_id.clone()]
+        );
+        controller.seek_to_frame(FrameIndex::new(40));
+        controller.add_midpoint_at_playhead()?;
+        assert_eq!(
+            controller
+                .document
+                .find_clip(&sub_id)
+                .ok_or("missing sub")?
+                .1
+                .midpoints,
+            vec![40]
+        );
+
+        let lid = controller.document.layers[0].id.clone();
+        controller.toggle_layer_visible(&lid)?;
+        assert!(!controller.document.layers[0].visible);
+        controller.toggle_layer_muted(&lid)?;
+        assert!(controller.document.layers[0].muted);
+        controller.toggle_layer_locked(&lid)?;
+        assert!(controller.document.layers[0].locked);
+
+        controller.undo()?;
+        assert!(!controller.document.layers[0].locked);
         Ok(())
     }
 }

@@ -1505,6 +1505,7 @@ mod tests {
             duration: FrameCount::new(60)?,
             effect_offset_frames: 15,
             effect_duration_frames: Some(FrameCount::new(120)?),
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(sub),
         });
         doc.layers.push(layer);

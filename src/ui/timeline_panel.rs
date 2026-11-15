@@ -883,6 +883,7 @@ mod tests {
             duration: FrameCount::new(60)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("Drag Test")),
         });
         let layer2 = Layer::new(l2, "Track 2");

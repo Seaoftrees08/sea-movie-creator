@@ -158,6 +158,7 @@ mod tests {
             duration: FrameCount::new(30)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("One")),
         });
         l1.clips.push(Clip {
@@ -167,6 +168,7 @@ mod tests {
             duration: FrameCount::new(40)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("Block")),
         });
 
@@ -178,6 +180,7 @@ mod tests {
             duration: FrameCount::new(20)?,
             effect_offset_frames: 0,
             effect_duration_frames: None,
+            midpoints: Vec::new(),
             kind: ClipKind::Subtitle(SubtitleProperties::new("Two")),
         });
         doc.layers.push(l1);
