@@ -20,3 +20,9 @@
 | ID | タイトル | ステータス | ファイル |
 | --- | --- | --- | --- |
 | - | 設計書テンプレート | Template | [`_template.md`](_template.md) |
+| - | 要件メモ（初期実装の要件定義） | Draft | [`initial-implementation/draft.md`](initial-implementation/draft.md) |
+| - | 全体基本設計書（アーキテクチャ・AI ネイティブ設計） | Draft | [`draft.md`](draft.md) |
+| - | 初期実装設計書：Phase A（基盤・評価・再生・GPUI 骨格） | Draft | [`initial-implementation/PhaseA.md`](initial-implementation/PhaseA.md) |
+| - | 初期実装設計書：Phase B（編集 UI・GPU 合成・書き出しプラグイン） | Draft | [`initial-implementation/PhaseB.md`](initial-implementation/PhaseB.md) |
+| - | 初期実装設計書：Phase C（AI チャット/プラグイン・VST3/CLAP・拡張） | Draft | [`initial-implementation/PhaseC.md`](initial-implementation/PhaseC.md) |
+| 001 | ゆっくり実況向け専用モジュール（初期設計完了後・将来機能） | Draft | [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md) |

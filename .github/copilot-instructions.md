@@ -33,10 +33,11 @@
   - 関数・モジュールは単一の責務に保ち、早期リターンを活用してネストを浅くする。
 - **重複の排除**:
   - 類似ロジックが複数箇所に現れる場合は、適切な共通関数・ヘルパーに抽出する。
-- **明示的なエラーハンドリング**:
+- **明示的なエラーハンドリング・安全境界（`unsafe` 制限）**:
   - エラーを黙殺せず、原因が特定できるコンテキストを付与して呼び出し元またはログに伝播する。
   - 本番コードで `unwrap()`・`expect()`・`panic!()` を安易に使用せず、`Result` / `Option` で安全に処理する。
   - 外部入力（ユーザー入力、ファイル、API レスポンス、環境変数）は境界で検証する。
+  - `Cargo.toml` 既定の `unsafe_code = "deny"` を維持し、FFI・OS メディア API・GPU 共有・共有メモリ IPC 等で `unsafe` が不可避な場合は、`backends/` 配下の専用モジュールまたは別クレートへ隔離し、最小単位で `#[allow(unsafe_code)]` を付与したうえで直前に必ず `// SAFETY:` コメントで安全不変条件を明記すること。
 - **セキュリティ**:
   - API キー・トークン・認証情報をハードコードしない。機密情報は環境変数やシークレット管理機構を経由する。
 - **コメントとドキュメント**:
@@ -49,13 +50,14 @@
   - ルートの `rustfmt.toml`、`clippy.toml`、および `Cargo.toml` の `[lints]` 設定に従ってコードを維持すること。
   - 理由なく `#[allow(...)]` でリント警告を抑制しないこと（やむを得ず抑制する場合は理由を日本語コメントで明記する）。
 - **作業完了時の必須チェック**:
-  - プログラムを作成・変更した際は、作業完了前に必ず以下の3コマンドをすべて実行し、警告・エラーがゼロであることを確認すること。
+  - プログラムを作成・変更した際は、作業完了前に必ず以下のコマンドをすべて実行し、警告・エラーがゼロであることを確認すること（Workspace 導入後は `--workspace` を含める）。
     1. 見た目の自動整形: `cargo fmt --check`（差分がある場合は `cargo fmt` で整形後に再確認）
-    2. ミスの自動検出: `cargo clippy --all-targets --all-features -- -D warnings`
-    3. すべてのテスト実行: `cargo test --all-targets --all-features`
+    2. ミスの自動検出: `cargo clippy --all-targets --all-features -- -D warnings`（Workspace 導入後は `--workspace --all-targets --all-features -- -D warnings`、各メンバー `Cargo.toml` には `[lints] workspace = true` を必須設定）
+    3. ビルドおよびすべてのテスト実行: Workspace 導入後はプラグインバイナリ欠損を防ぐため `cargo build --workspace --all-targets` のうえで `cargo test --workspace --all-targets --all-features`（導入前は `cargo test --all-targets --all-features`）
+  - 実 GPU・OS HW エンコーダ・実外部 CLI 等に依存しヘッドレス CI で実行不可なテストには `#[ignore = "理由"]` を付与し、通常の `cargo test --all-targets --all-features` が環境依存なく全通過する状態を維持する（実機検証時は `cargo test -- --ignored` を併用）。
 - **テストの配置ルール**:
   - **部品ごとの小さなテスト（単体テスト）**: 各部品の `.rs` ファイル内の最後に `#[cfg(test)] mod tests { ... }` として記述すること。
-  - **組み合わせテスト・全体テスト（結合テスト）**: `tests/<実装名>/` フォルダ内に記述し、自動テスト（`cargo test`）および `cargo fmt` で確実に認識されるよう入り口となる `tests/<実装名>.rs` もあわせて配置すること。
+  - **組み合わせテスト・全体テスト（結合テスト）**: `tests/<実装名>/` フォルダ内に記述し、自動テスト（`cargo test`）および `cargo fmt` で確実に認識されるよう入り口となる `tests/<実装名>.rs` と `tests/<実装名>/mod.rs` をあわせて配置すること。
     - 実装例：`tests/<実装名>.rs` に `#[path = "<実装名>/mod.rs"] mod <実装名>;` を記述し、`tests/<実装名>/mod.rs` から配下の各テストファイルを `mod <テスト名>;` で読み込む。
 
 ## 5. ディレクトリ運用ルール
