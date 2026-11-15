@@ -13,12 +13,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AppContext as _, Bounds, Context, Div, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window,
-    WindowBounds, WindowOptions, div, px, size,
+    MouseButton, MouseMoveEvent, ParentElement as _, PathPromptOptions, Render, SharedString,
+    Styled as _, Subscription, Window, WindowBounds, WindowOptions, div, px, size,
 };
 
-use crate::core::time::FrameIndex;
-use crate::timeline::document::ClipKind;
+use crate::core::ids::LayerId;
+use crate::core::time::{FrameCount, FrameIndex};
+use crate::timeline::document::{ClipKind, TimelineLengthMode};
 use crate::ui::ai_chat_panel::{
     AiProviderSelectItem, build_provider_select_items, provider_select_index,
 };
@@ -31,11 +32,22 @@ use crate::ui::menu_bar::{
 };
 use crate::ui::preview_panel::render_preview_panel;
 use crate::ui::right_panel::{RightPanelWidgets, render_right_panel};
-use crate::ui::timeline_panel::render_timeline_panel;
+use crate::ui::timeline_panel::{
+    TRACK_HEADER_WIDTH, handle_timeline_window_mouse_move, handle_timeline_window_mouse_up,
+    parse_timeline_length_input, render_timeline_length_modal_overlay, render_timeline_panel,
+};
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
 const TICK_INTERVAL_MS: u64 = 16;
+
+/// 手動タイムライン総尺指定モーダルの一時状態。
+pub(crate) struct TimelineLengthModalState {
+    /// 手動指定モードが選択されているか。
+    pub is_manual: bool,
+    /// 手動総尺入力欄のテキスト状態。
+    pub input: Entity<InputState>,
+}
 
 /// `sea-movie-creator` のメインエディタウィンドウビュー。
 pub struct SeaEditorWindow {
@@ -52,7 +64,15 @@ pub struct SeaEditorWindow {
     pub(crate) ai_provider_select: Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄のテキスト入力状態。
     pub(crate) ai_chat_input: Entity<InputState>,
-    timeline_scroll: VirtualListScrollHandle,
+    pub(crate) timeline_scroll: VirtualListScrollHandle,
+    /// インライン名前変更中の対象レイヤー ID。
+    pub(crate) layer_rename_target: Option<LayerId>,
+    /// レイヤー名インライン編集用テキスト入力状態。
+    pub(crate) layer_rename_input: Option<Entity<InputState>>,
+    /// タイムライン長変更モーダルの状態（`None` なら閉）。
+    pub(crate) timeline_length_modal: Option<TimelineLengthModalState>,
+    #[allow(dead_code)]
+    dynamic_input_sub: Option<Subscription>,
     sliders_dirty: bool,
     syncing_widgets: bool,
     _subscriptions: Vec<Subscription>,
@@ -122,6 +142,10 @@ impl SeaEditorWindow {
             ai_provider_select,
             ai_chat_input,
             timeline_scroll: VirtualListScrollHandle::new(),
+            layer_rename_target: None,
+            layer_rename_input: None,
+            timeline_length_modal: None,
+            dynamic_input_sub: None,
             sliders_dirty: true,
             syncing_widgets: false,
             _subscriptions: subscriptions,
@@ -129,6 +153,126 @@ impl SeaEditorWindow {
         this.sync_sliders_now(window, cx);
         Self::spawn_playback_loop(cx);
         this
+    }
+
+    /// 指定レイヤー名のインライン編集を開始する（ダブルクリック時）。
+    pub(crate) fn begin_layer_rename(
+        &mut self,
+        layer_id: LayerId,
+        current_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        let sub =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, entity, event: &InputEvent, _, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } | InputEvent::Blur => {
+                        let val = entity.read(cx).value().to_string();
+                        this.commit_layer_rename(&val, cx);
+                    }
+                    _ => {}
+                },
+            );
+        self.layer_rename_target = Some(layer_id);
+        self.layer_rename_input = Some(input);
+        self.dynamic_input_sub = Some(sub);
+        cx.notify();
+    }
+
+    fn commit_layer_rename(&mut self, raw_name: &str, cx: &mut Context<Self>) {
+        if let Some(layer_id) = self.layer_rename_target.take() {
+            let trimmed = raw_name.trim();
+            if !trimmed.is_empty()
+                && let Err(err) = self.controller.rename_layer(&layer_id, trimmed)
+            {
+                self.controller.status_message = format!("レイヤー名変更失敗: {err}");
+            }
+        }
+        self.layer_rename_input = None;
+        self.dynamic_input_sub = None;
+        cx.notify();
+    }
+
+    /// タイムライン長変更モーダルを開く。
+    pub(crate) fn open_timeline_length_modal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (is_manual, initial_text) = match self.controller.document.timeline_length {
+            TimelineLengthMode::AutoToLastClip => (
+                false,
+                format!(
+                    "{}f",
+                    self.controller.document.total_duration_frames().max(1)
+                ),
+            ),
+            TimelineLengthMode::Manual { end_frame } => (true, format!("{}f", end_frame.get())),
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("フレーム数 / 10s / HH:MM:SS:FF")
+                .default_value(initial_text)
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                if let Some(modal) = &mut this.timeline_length_modal {
+                    modal.is_manual = true;
+                }
+                this.apply_timeline_length_modal(window, cx);
+            }
+        });
+        self.timeline_length_modal = Some(TimelineLengthModalState { is_manual, input });
+        self.dynamic_input_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// モーダルの設定を `EditCommand::SetTimelineLength` として適用する。
+    pub(crate) fn apply_timeline_length_modal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = match self.timeline_length_modal.as_ref() {
+            Some(modal) if modal.is_manual => {
+                let raw = modal.input.read(cx).value().to_string();
+                match parse_timeline_length_input(&raw, self.controller.document.fps) {
+                    Ok(frames) => match FrameCount::new(frames) {
+                        Ok(end_frame) => TimelineLengthMode::Manual { end_frame },
+                        Err(err) => {
+                            self.controller.status_message = err.to_string();
+                            cx.notify();
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        self.controller.status_message = err;
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            _ => TimelineLengthMode::AutoToLastClip,
+        };
+
+        if let Err(err) = self.controller.set_timeline_length(mode) {
+            self.controller.status_message = err;
+        }
+        self.close_timeline_length_modal();
+        self.mark_sliders_dirty();
+        self.sync_sliders_now(window, cx);
+        cx.notify();
+    }
+
+    /// タイムライン長変更モーダルを閉じる。
+    pub(crate) fn close_timeline_length_modal(&mut self) {
+        self.timeline_length_modal = None;
+        self.dynamic_input_sub = None;
     }
 
     /// 次回描画時にスライダ表示をコントローラ状態へ同期するよう印を付ける。
@@ -421,6 +565,8 @@ impl SeaEditorWindow {
     ) -> impl IntoElement + use<> {
         let win_w = f32::from(window.viewport_size().width).max(DEFAULT_WINDOW_WIDTH);
         let default_right_w = clamp_right_panel_width(win_w, self.controller.right_panel_width);
+        self.controller.timeline_viewport_canvas_width_px =
+            (win_w - default_right_w - TRACK_HEADER_WIDTH).max(200.0);
 
         let left_area = v_resizable("main-left-vertical")
             .child(
@@ -551,6 +697,23 @@ impl Render for SeaEditorWindow {
         let workspace = self.build_workspace_split(window, cx);
 
         let root = Self::bind_actions(v_flex().size_full().relative().bg(theme.background), cx)
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if this.controller.timeline_gesture.is_some()
+                    || this.controller.timeline_drag.is_some()
+                {
+                    handle_timeline_window_mouse_move(this, ev, window, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.controller.timeline_gesture.is_some()
+                        || this.controller.timeline_drag.is_some()
+                    {
+                        handle_timeline_window_mouse_up(this, window, cx);
+                    }
+                }),
+            )
             .child(top_bar)
             .child(
                 div()
@@ -565,6 +728,8 @@ impl Render for SeaEditorWindow {
                 &self.controller.export_dialog,
                 cx,
             ))
+        } else if self.timeline_length_modal.is_some() {
+            root.child(render_timeline_length_modal_overlay(self, cx))
         } else {
             root
         }

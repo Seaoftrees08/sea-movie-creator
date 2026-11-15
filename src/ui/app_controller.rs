@@ -293,6 +293,10 @@ pub struct AppController {
     pub snap_guide_frame: Option<u64>,
     /// タイムライン上のアクティブなドラッグ編集状態。
     pub timeline_drag: Option<crate::ui::timeline_panel::TimelineDragState>,
+    /// タイムライン上の一般化ポインタジェスチャ状態（マーキー・中間点・Ctrl複製等）。
+    pub timeline_gesture: Option<crate::ui::timeline::state::TimelinePointerGesture>,
+    /// タイムラインキャンバスの推定表示幅 (px)。
+    pub timeline_viewport_canvas_width_px: f32,
     /// 音声デバイス稼働状態と共有スナップショット。
     audio_shared: SharedPlaybackState,
     audio_handle: Option<AudioOutputHandle>,
@@ -372,6 +376,8 @@ impl AppController {
             snap_config: crate::timeline::snap::SnapConfig::default(),
             snap_guide_frame: None,
             timeline_drag: None,
+            timeline_gesture: None,
+            timeline_viewport_canvas_width_px: 900.0,
             audio_shared,
             audio_handle: None,
             gpu_compositor: WgpuCompositor::try_new().ok(),
@@ -416,6 +422,7 @@ impl AppController {
         self.video_decoders.clear();
         self.selected_layer_id = None;
         self.clear_clip_selection();
+        self.timeline_gesture = None;
         self.timeline_scroll_y_px = 0.0;
         "新規プロジェクトを作成しました".clone_into(&mut self.status_message);
         self.sync_shared_state();
@@ -708,6 +715,8 @@ impl AppController {
             .undo(&mut self.document)
             .map_err(|err| err.to_string())?;
         if let Some(label) = undone {
+            self.timeline_gesture = None;
+            self.timeline_drag = None;
             self.sync_selection_after_edit();
             self.sync_shared_state();
             self.dirty_preview = true;
@@ -729,6 +738,8 @@ impl AppController {
             .redo(&mut self.document)
             .map_err(|err| err.to_string())?;
         if let Some(label) = redone {
+            self.timeline_gesture = None;
+            self.timeline_drag = None;
             self.sync_selection_after_edit();
             self.sync_shared_state();
             self.dirty_preview = true;
@@ -1269,6 +1280,31 @@ impl AppController {
         self.selected_clip_ids.clear();
         self.selected_clip_id = None;
         self.selected_segment_index = None;
+    }
+
+    /// 指定クリップおよびセグメントインデックスを単一選択する。
+    pub fn select_clip_segment(&mut self, clip_id: &ClipId, segment_index: usize) {
+        self.select_single_clip(Some(clip_id.clone()));
+        if let Some((_, clip)) = self.document.find_clip(clip_id) {
+            let max_seg = clip.grid_frames().len().saturating_sub(2);
+            self.selected_segment_index = Some(segment_index.min(max_seg));
+        }
+    }
+
+    /// タイムラインキャンバスのウィンドウ X 原点（ヘッダ幅）を返す。
+    #[must_use]
+    pub const fn timeline_canvas_origin_x(&self) -> f32 {
+        crate::ui::timeline::state::TRACK_HEADER_WIDTH
+    }
+
+    /// タイムラインのスナップ有効・無効を切り替える。
+    pub fn toggle_snap_enabled(&mut self) {
+        self.snap_config.enabled = !self.snap_config.enabled;
+    }
+
+    /// 再生位置移動時の選択クリップ追従を切り替える。
+    pub fn toggle_follow_selected_on_seek(&mut self) {
+        self.follow_selected_on_seek = !self.follow_selected_on_seek;
     }
 
     /// 時間表示単位 (`Timecode` / `Frames`) を切り替える。

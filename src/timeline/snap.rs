@@ -39,6 +39,12 @@ pub enum SnapEdgeKind {
     ClipStart,
     /// 他クリップの終了フレーム。
     ClipEnd,
+    /// 他クリップの中間点フレーム。
+    Midpoint,
+    /// 選択範囲 `[start, end)` の境界フレーム。
+    SelectionBoundary,
+    /// タイムライン総尺終端フレーム。
+    TimelineEnd,
 }
 
 /// 単一フレーム位置に対するスナップ候補解決結果。
@@ -63,7 +69,7 @@ pub struct SnapMoveResult {
     pub edge_kind: Option<SnapEdgeKind>,
 }
 
-/// 指定タイムライン内のスナップ基準点（原点・再生ヘッド・他クリップ両端）を収集する。
+/// 指定タイムライン内のスナップ基準点（原点・再生ヘッド・他クリップ両端・中間点・選択範囲・総尺終端）を収集する。
 #[must_use]
 pub fn collect_snap_anchors(
     doc: &ProjectDocument,
@@ -85,9 +91,19 @@ pub fn collect_snap_anchors(
                 let end = start.saturating_add(clip.duration.get());
                 anchors.push((start, SnapEdgeKind::ClipStart));
                 anchors.push((end, SnapEdgeKind::ClipEnd));
+                for rel in clip.visible_midpoints() {
+                    if let Ok(rel_u64) = u64::try_from(rel) {
+                        anchors.push((start.saturating_add(rel_u64), SnapEdgeKind::Midpoint));
+                    }
+                }
             }
         }
     }
+    if let Some(range) = doc.selection_range {
+        anchors.push((range.start.get(), SnapEdgeKind::SelectionBoundary));
+        anchors.push((range.end.get(), SnapEdgeKind::SelectionBoundary));
+    }
+    anchors.push((doc.total_duration_frames(), SnapEdgeKind::TimelineEnd));
     anchors
 }
 
@@ -266,6 +282,35 @@ mod tests {
         assert_eq!(right_snap.snapped_start, FrameIndex::new(60));
         assert_eq!(right_snap.guide_frame, Some(100));
         assert_eq!(right_snap.edge_kind, Some(SnapEdgeKind::ClipStart));
+        Ok(())
+    }
+
+    #[test]
+    fn collects_midpoint_selection_range_and_timeline_end_anchors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::timeline::document::{FrameRange, TimelineLengthMode};
+
+        let (mut doc, _c1, c2) = build_two_clip_doc()?;
+        // c1 spans 100..150; add midpoint at relative frame 25 => absolute 125
+        doc.layers[0].clips[0].midpoints = vec![25];
+        doc.selection_range = Some(FrameRange {
+            start: FrameIndex::new(15),
+            end: FrameIndex::new(310),
+        });
+        doc.timeline_length = TimelineLengthMode::Manual {
+            end_frame: FrameCount::new(400)?,
+        };
+
+        let anchors = collect_snap_anchors(
+            &doc,
+            FrameIndex::new(10),
+            std::slice::from_ref(&c2),
+            &SnapConfig::default(),
+        );
+        assert!(anchors.contains(&(125, SnapEdgeKind::Midpoint)));
+        assert!(anchors.contains(&(15, SnapEdgeKind::SelectionBoundary)));
+        assert!(anchors.contains(&(310, SnapEdgeKind::SelectionBoundary)));
+        assert!(anchors.contains(&(400, SnapEdgeKind::TimelineEnd)));
         Ok(())
     }
 }
