@@ -4,15 +4,19 @@ use std::sync::mpsc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
-use gpui_kit::{Context, IntoElement, ParentElement as _, Styled as _, div};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::select::{Select, SelectItem, SelectState};
+use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::{
+    Anchor, Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
+};
 
 use crate::ai::context_builder::build_ai_request;
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::plugin_host::AiPluginRegistry;
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiProviderKind, AiRequest, AiRole, AiStreamEvent,
-    SecretString,
+    AiChatMessage, AiError, AiModelPreset, AiProvider, AiProviderKind, AiRequest, AiRole,
+    AiStreamEvent, AiThinkingLevel, SecretString,
 };
 use crate::ai::providers::anthropic::{AnthropicConfig, AnthropicProvider};
 use crate::ai::providers::credentials::resolve_api_key;
@@ -47,12 +51,56 @@ struct AiChatJobHandle {
     prompt: String,
 }
 
+/// API / プロバイダ切り替えコンボボックス用アイテム。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiProviderSelectItem {
+    /// コンボボックスに表示する名称。
+    pub title: SharedString,
+    /// 選択時に適用されるプロバイダ種別。
+    pub kind: AiProviderKind,
+}
+
+impl SelectItem for AiProviderSelectItem {
+    type Value = AiProviderKind;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// API 切り替えコンボボックス初期化用のプロバイダ一覧を生成する。
+#[must_use]
+pub fn build_provider_select_items() -> Vec<AiProviderSelectItem> {
+    AiProviderKind::ui_selectable_providers()
+        .into_iter()
+        .map(|kind| AiProviderSelectItem {
+            title: kind.ui_combo_label().into(),
+            kind,
+        })
+        .collect()
+}
+
+/// 選択中プロバイダに対応するコンボボックス上の `IndexPath` を返す。
+#[must_use]
+pub fn provider_select_index(kind: &AiProviderKind) -> Option<IndexPath> {
+    AiProviderKind::ui_selectable_providers()
+        .iter()
+        .position(|candidate| candidate == kind)
+        .map(IndexPath::new)
+}
+
 /// UI 状態と履歴を管理する AI チャットパネル状態。
 pub struct AiChatState {
     /// 選択中 AI プロバイダ種別。
     pub selected_provider: AiProviderKind,
     /// 選択中のモデル ID。
     pub model_name: String,
+    /// 選択中の思考・推論レベル (`Low` / `Medium` / `High` / `Extra` / `Auto`)。
+    pub thinking_level: AiThinkingLevel,
     /// `OpenAI` 互換（Ollama 等）のベース URL。
     pub custom_base_url: String,
     /// 会話スレッド履歴。
@@ -76,6 +124,7 @@ impl std::fmt::Debug for AiChatState {
         f.debug_struct("AiChatState")
             .field("selected_provider", &self.selected_provider)
             .field("model_name", &self.model_name)
+            .field("thinking_level", &self.thinking_level)
             .field("turns_len", &self.turns.len())
             .field("has_runtime_key", &self.runtime_api_key.is_some())
             .finish_non_exhaustive()
@@ -87,7 +136,8 @@ impl Default for AiChatState {
         let default_kind = AiProviderKind::OpenAi;
         Self {
             selected_provider: default_kind.clone(),
-            model_name: default_kind.default_model().to_owned(),
+            model_name: default_kind.preferred_default_model().to_owned(),
+            thinking_level: default_kind.default_thinking_level(),
             custom_base_url: default_kind.default_base_url().to_owned(),
             turns: Vec::new(),
             streaming_preview: String::new(),
@@ -103,13 +153,76 @@ impl Default for AiChatState {
 }
 
 impl AiChatState {
-    /// プロバイダ種別を切り替え、既定モデル・ベース URL を更新する。
+    /// プロバイダ種別を切り替え、既定モデル・思考レベル・ベース URL を更新する。
     pub fn select_provider(&mut self, kind: AiProviderKind) {
-        kind.default_model().clone_into(&mut self.model_name);
+        kind.preferred_default_model()
+            .clone_into(&mut self.model_name);
+        self.thinking_level = kind.default_thinking_level();
         kind.default_base_url()
             .clone_into(&mut self.custom_base_url);
         self.selected_provider = kind;
         self.last_error = None;
+    }
+
+    /// モデルと思考レベルを同時に選択し、そのモデルで無効なレベルは自動補正する。
+    pub fn select_model(&mut self, model_id: &str, thinking: AiThinkingLevel) {
+        model_id.clone_into(&mut self.model_name);
+        self.thinking_level = match self.selected_provider.model_preset(model_id) {
+            Some(preset) if preset.thinking_levels.is_empty() => AiThinkingLevel::Auto,
+            Some(preset) if preset.thinking_levels.contains(&thinking) => thinking,
+            Some(preset) => preset.default_thinking,
+            None => thinking,
+        };
+        self.last_error = None;
+    }
+
+    /// 現在選択中のモデルに対して思考レベルを切り替える。
+    pub fn select_thinking_level(&mut self, level: AiThinkingLevel) {
+        let allowed = self.active_thinking_options();
+        self.thinking_level = if allowed.is_empty() {
+            AiThinkingLevel::Auto
+        } else if allowed.contains(&level) {
+            level
+        } else {
+            self.active_model_preset()
+                .map_or(AiThinkingLevel::Auto, |preset| preset.default_thinking)
+        };
+        self.last_error = None;
+    }
+
+    /// 現在選択中モデルに対応するカタログ定義を返す。
+    #[must_use]
+    pub fn active_model_preset(&self) -> Option<&'static AiModelPreset> {
+        self.selected_provider.model_preset(&self.model_name)
+    }
+
+    /// 現在選択中モデルで切り替え可能な思考レベル一覧を返す。
+    #[must_use]
+    pub fn active_thinking_options(&self) -> &'static [AiThinkingLevel] {
+        self.active_model_preset()
+            .map_or(&[], |preset| preset.thinking_levels)
+    }
+
+    /// UI 向けの短いモデル表示名（未登録モデルは ID そのまま）を返す。
+    #[must_use]
+    pub fn active_model_display_name(&self) -> String {
+        self.active_model_preset().map_or_else(
+            || self.model_name.clone(),
+            |preset| preset.display_name.to_owned(),
+        )
+    }
+
+    /// 思考レベルを含めた UI ボタン表示ラベル（例: `Gemini 4 Hydrogen Extra`）を返す。
+    #[must_use]
+    pub fn active_model_label(&self) -> String {
+        let base = self.active_model_display_name();
+        if self.active_thinking_options().is_empty() {
+            return base;
+        }
+        match self.thinking_level.badge_label() {
+            Some(level_badge) => format!("{base} {level_badge}"),
+            None => base,
+        }
     }
 
     /// メモリ上の一時 API キーを設定または解除する（プロジェクト JSON には保存されない）。
@@ -136,10 +249,11 @@ impl AiChatState {
     #[must_use]
     pub fn build_provider(&self) -> Box<dyn AiProvider> {
         let model = if self.model_name.trim().is_empty() {
-            self.selected_provider.default_model().to_owned()
+            self.selected_provider.preferred_default_model().to_owned()
         } else {
             self.model_name.clone()
         };
+        let thinking = self.thinking_level;
         let key = self.runtime_api_key.clone();
         match &self.selected_provider {
             AiProviderKind::Mock => Box::new(MockAiProvider::with_responses([
@@ -148,7 +262,11 @@ impl AiChatState {
             AiProviderKind::Plugin { plugin_id } => {
                 let registry = AiPluginRegistry::discover_default();
                 match registry.resolve_provider(plugin_id) {
-                    Ok(provider) => Box::new(provider.with_model(model)),
+                    Ok(provider) => Box::new(
+                        provider
+                            .with_model(model)
+                            .with_thinking_level(thinking.acp_thought_level().map(str::to_owned)),
+                    ),
                     Err(err) => Box::new(FailedPluginProvider {
                         id: plugin_id.clone(),
                         message: err.to_string(),
@@ -156,14 +274,15 @@ impl AiChatState {
                 }
             }
             AiProviderKind::OpenAi => {
-                let mut cfg = OpenAiCompatConfig::openai(model, key);
+                let mut cfg = OpenAiCompatConfig::openai(model, key).with_thinking_level(thinking);
                 if !self.custom_base_url.trim().is_empty() {
                     cfg.base_url.clone_from(&self.custom_base_url);
                 }
                 Box::new(OpenAiCompatProvider::new(cfg))
             }
             AiProviderKind::OpenRouter => {
-                let mut cfg = OpenAiCompatConfig::openrouter(model, key);
+                let mut cfg =
+                    OpenAiCompatConfig::openrouter(model, key).with_thinking_level(thinking);
                 if !self.custom_base_url.trim().is_empty() {
                     cfg.base_url.clone_from(&self.custom_base_url);
                 }
@@ -176,13 +295,16 @@ impl AiChatState {
                     self.custom_base_url.clone()
                 };
                 Box::new(OpenAiCompatProvider::new(
-                    OpenAiCompatConfig::local_compatible(base, model, key),
+                    OpenAiCompatConfig::local_compatible(base, model, key)
+                        .with_thinking_level(thinking),
                 ))
             }
-            AiProviderKind::Gemini => Box::new(GeminiProvider::new(GeminiConfig::new(model, key))),
-            AiProviderKind::Anthropic => {
-                Box::new(AnthropicProvider::new(AnthropicConfig::new(model, key)))
-            }
+            AiProviderKind::Gemini => Box::new(GeminiProvider::new(
+                GeminiConfig::new(model, key).with_thinking_level(thinking),
+            )),
+            AiProviderKind::Anthropic => Box::new(AnthropicProvider::new(
+                AnthropicConfig::new(model, key).with_thinking_level(thinking),
+            )),
         }
     }
 
@@ -400,8 +522,24 @@ impl AppController {
         raw_text: &str,
     ) -> Result<(), String> {
         match dry_run_validate(&self.document, raw_text) {
+            Ok(plan) if plan.is_no_op() => {
+                let reply_text = plan
+                    .reply_note
+                    .clone()
+                    .unwrap_or_else(|| "応答を受信しました（タイムライン変更なし）".to_owned());
+                self.ai_chat.last_error = None;
+                self.ai_chat.pending_proposal = None;
+                self.ai_chat.turns.push(AiChatTurn {
+                    role: AiRole::Assistant,
+                    text: reply_text,
+                });
+                "応答を受信しました（タイムライン変更なし）"
+                    .clone_into(&mut self.ai_chat.status_banner);
+                Ok(())
+            }
             Ok(plan) => {
                 let summary_preview = plan.summary_lines.join("\n");
+                self.ai_chat.last_error = None;
                 self.ai_chat.turns.push(AiChatTurn {
                     role: AiRole::Assistant,
                     text: summary_preview,
@@ -469,30 +607,26 @@ impl AiProvider for FailedPluginProvider {
 /// 右側 AI Chat タブの VS Code 風チャットパネルを描画する。
 pub fn render_ai_chat_panel(
     controller: &AppController,
-    ai_chat_input: &gpui_kit::Entity<InputState>,
+    ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
+    ai_chat_input: &Entity<InputState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
     let chat = &controller.ai_chat;
-    let cred_label = if chat.has_resolved_credentials() {
-        "認証: OK (Env/Keyring)".to_owned()
-    } else if let Some(var) = chat.selected_provider.default_env_var() {
-        format!("認証未設定: 環境変数 {var}")
-    } else {
-        "認証不要".to_owned()
-    };
+    let cred_label = format_cred_label(chat);
 
     let mut panel = v_flex()
         .size_full()
         .p_3()
         .gap_2()
         .text_xs()
-        .child(render_provider_bar(&chat.selected_provider, cx))
+        .child(render_provider_combo_bar(ai_provider_select, &theme))
         .child(
             h_flex()
                 .justify_between()
+                .gap_2()
                 .text_color(theme.muted_foreground)
-                .child(format!("Model: {}", chat.model_name))
+                .child(format!("Model: {}", chat.active_model_label()))
                 .child(cred_label),
         );
     if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
@@ -528,49 +662,34 @@ pub fn render_ai_chat_panel(
         panel = panel.child(div().text_color(theme.danger).child(err.clone()));
     }
 
-    panel.child(render_prompt_bar(chat.is_busy(), ai_chat_input, cx))
+    panel.child(render_prompt_composer(chat, ai_chat_input, cx))
 }
 
-fn render_provider_bar(
-    selected: &AiProviderKind,
-    cx: &mut Context<SeaEditorWindow>,
-) -> impl IntoElement {
-    let options = [
-        ("p-openai", "OpenAI", AiProviderKind::OpenAi),
-        ("p-openrouter", "OpenRouter", AiProviderKind::OpenRouter),
-        ("p-ollama", "Local", AiProviderKind::OllamaCompat),
-        ("p-gemini", "Gemini", AiProviderKind::Gemini),
-        ("p-claude", "Claude", AiProviderKind::Anthropic),
-        (
-            "p-agy",
-            "Antigravity",
-            AiProviderKind::Plugin {
-                plugin_id: "sea.ai.antigravity".to_owned(),
-            },
-        ),
-        (
-            "p-acp",
-            "ACP CLI",
-            AiProviderKind::Plugin {
-                plugin_id: "sea.ai.acp".to_owned(),
-            },
-        ),
-    ];
-    let mut row = h_flex().gap_1().flex_wrap();
-    for (id, label, kind) in options {
-        let is_active = *selected == kind;
-        let btn = Button::new(id).small().label(label);
-        let btn = if is_active {
-            btn.primary()
-        } else {
-            btn.ghost()
-        };
-        row = row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
-            this.controller.ai_chat.select_provider(kind.clone());
-            cx.notify();
-        })));
+fn format_cred_label(chat: &AiChatState) -> String {
+    if chat.has_resolved_credentials() {
+        "認証: OK".to_owned()
+    } else if let Some(var) = chat.selected_provider.default_env_var() {
+        format!("未設定: {var}")
+    } else {
+        "認証不要".to_owned()
     }
-    row
+}
+
+fn render_provider_combo_bar(
+    ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(div().text_color(theme.muted_foreground).child("API"))
+        .child(
+            div().flex_1().min_w(px(120.)).child(
+                Select::new(ai_provider_select)
+                    .menu_width(px(260.))
+                    .with_size(Size::Small),
+            ),
+        )
 }
 
 fn render_thread_box(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
@@ -672,40 +791,198 @@ fn render_diff_card(
     )
 }
 
-fn render_prompt_bar(
-    is_busy: bool,
-    ai_chat_input: &gpui_kit::Entity<InputState>,
+fn format_model_menu_label(
+    preset: &AiModelPreset,
+    is_selected: bool,
+    current_thinking: AiThinkingLevel,
+) -> String {
+    let mut parts = vec![preset.display_name.to_owned()];
+    if !preset.thinking_levels.is_empty() {
+        let displayed_level = if is_selected {
+            current_thinking
+        } else {
+            preset.default_thinking
+        };
+        parts.push(displayed_level.display_label().to_owned());
+    }
+    if let Some(badge) = preset.badge {
+        parts.push(format!("[{badge}]"));
+    }
+    parts.join("  ")
+}
+
+fn render_model_menu_button(
+    chat: &AiChatState,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    let send_label = if is_busy { "送信中..." } else { "送信" };
-    h_flex()
+    let weak = cx.weak_entity();
+    let catalog = chat.selected_provider.model_catalog();
+    let current_model = chat.model_name.clone();
+    let current_thinking = chat.thinking_level;
+    let trigger_label = format!("{} ▾", chat.active_model_label());
+
+    Button::new("ai-model-picker")
+        .ghost()
+        .xsmall()
+        .label(trigger_label)
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, cx| {
+            let mut popup = menu
+                .min_w(px(230.))
+                .max_h(px(340.))
+                .scrollable(true)
+                .check_side(Side::Right)
+                .label("Model");
+
+            for preset in catalog {
+                let is_selected = preset.id == current_model;
+                let row_label = format_model_menu_label(preset, is_selected, current_thinking);
+                let model_id = preset.id;
+
+                if preset.thinking_levels.is_empty() {
+                    let weak_item = weak.clone();
+                    let default_thinking = preset.default_thinking;
+                    popup =
+                        popup.item(PopupMenuItem::new(row_label).checked(is_selected).on_click(
+                            move |_, _, cx| {
+                                let _ = weak_item.update(cx, |view, cx| {
+                                    view.controller
+                                        .ai_chat
+                                        .select_model(model_id, default_thinking);
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                } else {
+                    let weak_sub = weak.clone();
+                    let levels = preset.thinking_levels;
+                    popup = popup.submenu_with_icon(
+                        None,
+                        row_label,
+                        window,
+                        cx,
+                        move |sub, _window, _cx| {
+                            let mut sub_menu = sub.min_w(px(136.)).check_side(Side::Right);
+                            for &level in levels {
+                                let weak_level = weak_sub.clone();
+                                let checked = is_selected && current_thinking == level;
+                                sub_menu = sub_menu.item(
+                                    PopupMenuItem::new(level.display_label())
+                                        .checked(checked)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = weak_level.update(cx, |view, cx| {
+                                                view.controller
+                                                    .ai_chat
+                                                    .select_model(model_id, level);
+                                                cx.notify();
+                                            });
+                                        }),
+                                );
+                            }
+                            sub_menu
+                        },
+                    );
+                }
+            }
+            popup
+        })
+}
+
+fn render_thinking_menu_button(
+    chat: &AiChatState,
+    cx: &mut Context<SeaEditorWindow>,
+) -> Option<impl IntoElement> {
+    let options = chat.active_thinking_options();
+    if options.is_empty() {
+        return None;
+    }
+    let weak = cx.weak_entity();
+    let current = chat.thinking_level;
+    let label = format!("思考: {} ▾", current.display_label());
+
+    Some(
+        Button::new("ai-thinking-picker")
+            .ghost()
+            .xsmall()
+            .label(label)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
+                let mut popup = menu
+                    .min_w(px(136.))
+                    .check_side(Side::Right)
+                    .label("Thinking Level");
+                for &level in options {
+                    let weak_item = weak.clone();
+                    popup = popup.item(
+                        PopupMenuItem::new(level.display_label())
+                            .checked(level == current)
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_item.update(cx, |view, cx| {
+                                    view.controller.ai_chat.select_thinking_level(level);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                popup
+            }),
+    )
+}
+
+fn render_prompt_composer(
+    chat: &AiChatState,
+    ai_chat_input: &Entity<InputState>,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let send_label = if chat.is_busy() {
+        "送信中..."
+    } else {
+        "送信"
+    };
+
+    let mut selectors = h_flex()
+        .items_center()
+        .gap_1()
+        .flex_1()
+        .min_w_0()
+        .flex_wrap()
+        .child(render_model_menu_button(chat, cx));
+    if let Some(thinking_btn) = render_thinking_menu_button(chat, cx) {
+        selectors = selectors.child(thinking_btn);
+    }
+
+    v_flex()
         .gap_2()
-        .child(div().flex_1().child(Input::new(ai_chat_input)))
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .child(Input::new(ai_chat_input))
         .child(
-            Button::new("ai-send-btn")
-                .primary()
-                .small()
-                .label(send_label)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    let msg = this.ai_chat_input.read(cx).value().to_string();
-                    if !msg.trim().is_empty() && !this.controller.ai_chat.is_busy() {
-                        if let Err(err) = this.controller.start_ai_prompt_async(&msg) {
-                            this.controller.ai_chat.last_error = Some(err);
-                        } else {
-                            this.ai_chat_input.update(cx, |input, cx| {
-                                input.set_value("", window, cx);
-                            });
-                        }
-                    }
-                    cx.notify();
-                })),
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(selectors)
+                .child(
+                    Button::new("ai-send-btn")
+                        .primary()
+                        .xsmall()
+                        .label(send_label)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_ai_chat_input(window, cx);
+                        })),
+                ),
         )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::provider_safety_notice;
-    use crate::ai::provider::AiProviderKind;
+    use super::{
+        AiChatState, build_provider_select_items, format_model_menu_label, provider_safety_notice,
+        provider_select_index,
+    };
+    use crate::ai::provider::{AiProviderKind, AiThinkingLevel};
 
     #[test]
     fn antigravity_provider_exposes_safety_notice() {
@@ -716,5 +993,51 @@ mod tests {
         assert!(notice.is_some());
         assert!(notice.is_some_and(|text| text.contains("agy acp") && text.contains("Gemini")));
         assert_eq!(provider_safety_notice(&AiProviderKind::Gemini), None);
+    }
+
+    #[test]
+    fn provider_combo_items_and_model_thinking_state_transitions_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let items = build_provider_select_items();
+        assert_eq!(items.len(), 7);
+
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        let agy_idx = provider_select_index(&agy).ok_or("missing Antigravity index")?;
+        assert_eq!(agy_idx.row, 5);
+
+        let mut chat = AiChatState::default();
+        chat.select_provider(agy.clone());
+        assert_eq!(chat.model_name, "gemini-4-argon");
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Medium);
+        assert_eq!(chat.active_model_label(), "Gemini 4 Argon Medium");
+
+        chat.select_model("gemini-4-hydrogen", AiThinkingLevel::Extra);
+        assert_eq!(chat.model_name, "gemini-4-hydrogen");
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Extra);
+        assert_eq!(chat.active_model_label(), "Gemini 4 Hydrogen Extra");
+
+        // Extra 非対応モデルでは既定思考レベルに補正される
+        chat.select_model("gemini-4-argon", AiThinkingLevel::Extra);
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Medium);
+
+        // 思考レベルを持たないモデル (Orchestrator) へ切替時は Auto に戻り選択肢も空になる
+        chat.select_model("gemini-pro-orchestrator-g1-pro", AiThinkingLevel::High);
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
+        assert_eq!(chat.active_thinking_options(), []);
+        assert_eq!(chat.active_model_label(), "Orchestrator (Argon)");
+
+        chat.select_thinking_level(AiThinkingLevel::High);
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
+
+        let hydrogen = agy
+            .model_preset("gemini-4-hydrogen")
+            .ok_or("hydrogen preset missing")?;
+        let formatted = format_model_menu_label(hydrogen, true, AiThinkingLevel::Extra);
+        assert!(formatted.contains("Gemini 4 Hydrogen"));
+        assert!(formatted.contains("Extra"));
+        assert!(formatted.contains("[New]"));
+        Ok(())
     }
 }

@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{
     ActiveTheme as _, Theme, ThemeMode, TitleBar, VirtualListScrollHandle, h_flex, v_flex,
@@ -18,6 +19,9 @@ use gpui_kit::{
 
 use crate::core::time::FrameIndex;
 use crate::timeline::document::ClipKind;
+use crate::ui::ai_chat_panel::{
+    AiProviderSelectItem, build_provider_select_items, provider_select_index,
+};
 use crate::ui::app_controller::{AppController, clamp_right_panel_width};
 use crate::ui::export_dialog::render_export_dialog_overlay;
 use crate::ui::menu_bar::{
@@ -44,6 +48,8 @@ pub struct SeaEditorWindow {
     pub(crate) expr_input: Entity<InputState>,
     /// 字幕本文編集用テキスト入力状態。
     pub(crate) subtitle_text_input: Entity<InputState>,
+    /// AI API / プロバイダ切り替えコンボボックス状態。
+    pub(crate) ai_provider_select: Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄のテキスト入力状態。
     pub(crate) ai_chat_input: Entity<InputState>,
     timeline_scroll: VirtualListScrollHandle,
@@ -86,12 +92,24 @@ impl SeaEditorWindow {
             cx.new(|cx| InputState::new(window, cx).placeholder("例: sin(p * pi) * 90"));
         let subtitle_text_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("字幕テキストを入力..."));
-        let ai_chat_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("AI 編集指示を入力..."));
+        let initial_provider_idx = provider_select_index(&controller.ai_chat.selected_provider);
+        let ai_provider_select = cx.new(|cx| {
+            SelectState::new(
+                build_provider_select_items(),
+                initial_provider_idx,
+                window,
+                cx,
+            )
+        });
+        let ai_chat_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("AI 編集指示を入力 (Enter で送信)...")
+        });
 
         let subscriptions = vec![
             cx.subscribe_in(&scrub_slider, window, Self::on_scrub_slider),
             cx.subscribe_in(&opacity_slider, window, Self::on_opacity_slider),
+            cx.subscribe_in(&ai_provider_select, window, Self::on_ai_provider_select),
+            cx.subscribe_in(&ai_chat_input, window, Self::on_ai_chat_input_event),
         ];
 
         let mut this = Self {
@@ -101,6 +119,7 @@ impl SeaEditorWindow {
             opacity_slider,
             expr_input,
             subtitle_text_input,
+            ai_provider_select,
             ai_chat_input,
             timeline_scroll: VirtualListScrollHandle::new(),
             sliders_dirty: true,
@@ -198,6 +217,55 @@ impl SeaEditorWindow {
             }
         })
         .detach();
+    }
+
+    /// AI チャット入力欄の現在文字列を送信し、受理された場合は入力欄を空にする。
+    pub(crate) fn submit_ai_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.controller.ai_chat.is_busy() {
+            return;
+        }
+        let msg = self.ai_chat_input.read(cx).value().to_string();
+        if msg.trim().is_empty() {
+            return;
+        }
+        match self.controller.start_ai_prompt_async(&msg) {
+            Ok(()) => {
+                self.ai_chat_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            Err(err) => {
+                self.controller.ai_chat.last_error = Some(err);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_ai_provider_select(
+        &mut self,
+        _: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
+        event: &SelectEvent<Vec<AiProviderSelectItem>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let SelectEvent::Confirm(Some(kind)) = event
+            && &self.controller.ai_chat.selected_provider != kind
+        {
+            self.controller.ai_chat.select_provider(kind.clone());
+            cx.notify();
+        }
+    }
+
+    fn on_ai_chat_input_event(
+        &mut self,
+        _: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+            self.submit_ai_chat_input(window, cx);
+        }
     }
 
     fn on_scrub_slider(
@@ -390,6 +458,7 @@ impl SeaEditorWindow {
                             opacity_slider: &self.opacity_slider,
                             expr_input: &self.expr_input,
                             subtitle_text_input: &self.subtitle_text_input,
+                            ai_provider_select: &self.ai_provider_select,
                             ai_chat_input: &self.ai_chat_input,
                         },
                         cx,
@@ -565,6 +634,9 @@ mod tests {
             "icons/window-maximize.svg",
             "icons/window-restore.svg",
             "icons/window-close.svg",
+            "icons/check.svg",
+            "icons/chevron-down.svg",
+            "icons/chevron-right.svg",
         ] {
             let bytes = assets
                 .load(path)?

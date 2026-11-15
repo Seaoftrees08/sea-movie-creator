@@ -78,6 +78,402 @@ pub enum AiError {
     Io(#[from] std::io::Error),
 }
 
+/// AI モデルの思考・推論強度レベル (`Reasoning Effort` / `Thinking Level`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AiThinkingLevel {
+    /// プロバイダ既定（明示的な思考パラメータを上書きしない）。
+    #[default]
+    Auto,
+    /// 軽量・高速推論 (`low`)。
+    Low,
+    /// バランス重視 (`medium`)。
+    Medium,
+    /// 深い推論 (`high`)。
+    High,
+    /// 最大推論（Antigravity `xhigh` / `Extra` 等）。
+    Extra,
+}
+
+impl AiThinkingLevel {
+    /// 全レベル候補一覧を返す。
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Auto, Self::Low, Self::Medium, Self::High, Self::Extra]
+    }
+
+    /// UI 表示用ラベルを返す。
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Extra => "Extra",
+        }
+    }
+
+    /// モデルバッジ横などに添える短縮表記（`Auto` のときは `None`）。
+    #[must_use]
+    pub const fn badge_label(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some("Low"),
+            Self::Medium => Some("Medium"),
+            Self::High => Some("High"),
+            Self::Extra => Some("Extra"),
+        }
+    }
+
+    /// `agy acp` の `thought_level` 設定値を返す（`Auto` 時は `None`）。
+    #[must_use]
+    pub const fn acp_thought_level(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Extra => Some("xhigh"),
+        }
+    }
+
+    /// `OpenAI` / `OpenRouter` 系 `reasoning_effort` 文字列を返す。
+    #[must_use]
+    pub const fn reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Extra => Some("xhigh"),
+        }
+    }
+
+    /// Google Gemini 2.5 向け `thinkingBudget` トークン数を返す。
+    #[must_use]
+    pub const fn gemini_thinking_budget(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some(1024),
+            Self::Medium => Some(8192),
+            Self::High => Some(24576),
+            Self::Extra => Some(32768),
+        }
+    }
+
+    /// Google Gemini 3 / 4 系 REST API 向け `thinkingLevel` 文字列を返す。
+    #[must_use]
+    pub const fn gemini_thinking_level(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some("LOW"),
+            Self::Medium => Some("MEDIUM"),
+            Self::High | Self::Extra => Some("HIGH"),
+        }
+    }
+
+    /// Anthropic Messages API 向け `thinking.budget_tokens` を返す。
+    #[must_use]
+    pub const fn anthropic_budget_tokens(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some(1024),
+            Self::Medium => Some(4096),
+            Self::High => Some(10240),
+            Self::Extra => Some(16384),
+        }
+    }
+}
+
+/// UI のモデル選択メニューに表示するモデル定義。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiModelPreset {
+    /// API / プラグインへ渡すモデル識別子（または ACP プロファイル名）。
+    pub id: &'static str,
+    /// 人間向けの短い表示名。
+    pub display_name: &'static str,
+    /// UI 補助タグ（`"New"` 等）。
+    pub badge: Option<&'static str>,
+    /// 切り替え可能な思考レベル一覧（空スライスの場合はモデル固定）。
+    pub thinking_levels: &'static [AiThinkingLevel],
+    /// このモデル選択時の既定思考レベル。
+    pub default_thinking: AiThinkingLevel,
+}
+
+const THINKING_AUTO_TO_HIGH: &[AiThinkingLevel] = &[
+    AiThinkingLevel::Auto,
+    AiThinkingLevel::Low,
+    AiThinkingLevel::Medium,
+    AiThinkingLevel::High,
+];
+
+const THINKING_LOW_TO_HIGH: &[AiThinkingLevel] = &[
+    AiThinkingLevel::Low,
+    AiThinkingLevel::Medium,
+    AiThinkingLevel::High,
+];
+
+const THINKING_LOW_TO_EXTRA: &[AiThinkingLevel] = &[
+    AiThinkingLevel::Low,
+    AiThinkingLevel::Medium,
+    AiThinkingLevel::High,
+    AiThinkingLevel::Extra,
+];
+
+const OPENAI_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "gpt-4.1-mini",
+        display_name: "GPT-4.1 Mini",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gpt-4.1",
+        display_name: "GPT-4.1",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gpt-5",
+        display_name: "GPT-5",
+        badge: Some("New"),
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gpt-5-mini",
+        display_name: "GPT-5 Mini",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "o4-mini",
+        display_name: "o4-mini",
+        badge: None,
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "o3",
+        display_name: "o3",
+        badge: None,
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+];
+
+const OPENROUTER_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "openrouter/auto",
+        display_name: "OpenRouter Auto",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "google/gemini-2.5-pro",
+        display_name: "Gemini 2.5 Pro",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "anthropic/claude-sonnet-4",
+        display_name: "Claude Sonnet 4",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "openai/gpt-5",
+        display_name: "GPT-5",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "openai/gpt-4.1-mini",
+        display_name: "GPT-4.1 Mini",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const OLLAMA_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "llama3.2",
+        display_name: "Llama 3.2",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "qwen3:8b",
+        display_name: "Qwen 3 (8B)",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "deepseek-r1:8b",
+        display_name: "DeepSeek-R1 (8B)",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gemma3:12b",
+        display_name: "Gemma 3 (12B)",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const GEMINI_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "gemini-2.5-flash",
+        display_name: "Gemini 2.5 Flash",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gemini-2.5-pro",
+        display_name: "Gemini 2.5 Pro",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gemini-2.5-flash-lite",
+        display_name: "Gemini 2.5 Flash-Lite",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const ANTHROPIC_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "claude-sonnet-4-20250514",
+        display_name: "Claude Sonnet 4",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "claude-opus-4-1-20250805",
+        display_name: "Claude Opus 4.1",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "claude-3-7-sonnet-20250219",
+        display_name: "Claude 3.7 Sonnet",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "gemini-4-argon",
+        display_name: "Gemini 4 Argon",
+        badge: Some("New"),
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "gemini-4-hydrogen",
+        display_name: "Gemini 4 Hydrogen",
+        badge: Some("New"),
+        thinking_levels: THINKING_LOW_TO_EXTRA,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "gemini-pro-orchestrator-g1-pro",
+        display_name: "Orchestrator (Argon)",
+        badge: Some("New"),
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "gemini-3.8-flash",
+        display_name: "Gemini 3.8 Flash",
+        badge: None,
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "claude-opus-5-5",
+        display_name: "Claude Opus 5.5",
+        badge: Some("New"),
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "claude-sonnet-5-5",
+        display_name: "Claude Sonnet 5.5",
+        badge: Some("New"),
+        thinking_levels: THINKING_LOW_TO_HIGH,
+        default_thinking: AiThinkingLevel::Medium,
+    },
+    AiModelPreset {
+        id: "gpt-oss-120b-medium",
+        display_name: "GPT-OSS 120B (Medium)",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "plugin-default",
+        display_name: "Auto (agy Default)",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const ACP_CLI_MODELS: &[AiModelPreset] = &[
+    AiModelPreset {
+        id: "claude",
+        display_name: "Claude Code (ACP)",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "codex",
+        display_name: "OpenAI Codex CLI (ACP)",
+        badge: None,
+        thinking_levels: THINKING_AUTO_TO_HIGH,
+        default_thinking: AiThinkingLevel::Auto,
+    },
+    AiModelPreset {
+        id: "copilot",
+        display_name: "GitHub Copilot CLI (ACP)",
+        badge: None,
+        thinking_levels: &[],
+        default_thinking: AiThinkingLevel::Auto,
+    },
+];
+
+const MOCK_MODELS: &[AiModelPreset] = &[AiModelPreset {
+    id: "mock-editor-v1",
+    display_name: "Mock Editor v1",
+    badge: None,
+    thinking_levels: &[],
+    default_thinking: AiThinkingLevel::Auto,
+}];
+
 /// 利用可能な組み込み HTTP・プラグイン AI プロバイダ種別。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +573,82 @@ impl AiProviderKind {
             Self::Mock | Self::Plugin { .. } => None,
         }
     }
+
+    /// UI の API 切り替えコンボボックスに表示するプロバイダ一覧を返す。
+    #[must_use]
+    pub fn ui_selectable_providers() -> Vec<Self> {
+        vec![
+            Self::OpenAi,
+            Self::OpenRouter,
+            Self::OllamaCompat,
+            Self::Gemini,
+            Self::Anthropic,
+            Self::Plugin {
+                plugin_id: "sea.ai.antigravity".to_owned(),
+            },
+            Self::Plugin {
+                plugin_id: "sea.ai.acp".to_owned(),
+            },
+        ]
+    }
+
+    /// UI のコンボボックス表示向けラベルを返す。
+    #[must_use]
+    pub fn ui_combo_label(&self) -> String {
+        match self {
+            Self::OpenAi => "OpenAI API".to_owned(),
+            Self::OpenRouter => "OpenRouter API".to_owned(),
+            Self::OllamaCompat => "Local (Ollama / LM Studio)".to_owned(),
+            Self::Gemini => "Google Gemini API".to_owned(),
+            Self::Anthropic => "Anthropic Claude API".to_owned(),
+            Self::Plugin { plugin_id } => match plugin_id.as_str() {
+                "sea.ai.antigravity" => "Antigravity (agy CLI)".to_owned(),
+                "sea.ai.acp" => "ACP CLI (Claude / Codex / Copilot)".to_owned(),
+                _ => format!("Plugin: {plugin_id}"),
+            },
+            Self::Mock => "Mock (Offline Test)".to_owned(),
+        }
+    }
+
+    /// このプロバイダで利用可能なモデル定義カタログを返す。
+    #[must_use]
+    pub fn model_catalog(&self) -> &'static [AiModelPreset] {
+        match self {
+            Self::Mock => MOCK_MODELS,
+            Self::OpenAi => OPENAI_MODELS,
+            Self::OpenRouter => OPENROUTER_MODELS,
+            Self::OllamaCompat => OLLAMA_MODELS,
+            Self::Gemini => GEMINI_MODELS,
+            Self::Anthropic => ANTHROPIC_MODELS,
+            Self::Plugin { plugin_id } => match plugin_id.as_str() {
+                "sea.ai.antigravity" => ANTIGRAVITY_MODELS,
+                "sea.ai.acp" => ACP_CLI_MODELS,
+                _ => MOCK_MODELS,
+            },
+        }
+    }
+
+    /// モデル ID に一致するカタログ定義を検索する。
+    #[must_use]
+    pub fn model_preset(&self, model_id: &str) -> Option<&'static AiModelPreset> {
+        self.model_catalog().iter().find(|m| m.id == model_id)
+    }
+
+    /// UI でこのプロバイダを選んだときの推奨初期モデル ID を返す。
+    #[must_use]
+    pub fn preferred_default_model(&self) -> &'static str {
+        self.model_catalog()
+            .first()
+            .map_or_else(|| self.default_model(), |m| m.id)
+    }
+
+    /// UI でこのプロバイダを選んだときの推奨初期思考レベルを返す。
+    #[must_use]
+    pub fn default_thinking_level(&self) -> AiThinkingLevel {
+        self.model_catalog()
+            .first()
+            .map_or(AiThinkingLevel::Auto, |m| m.default_thinking)
+    }
 }
 
 /// 会話メッセージの発言者ロール。
@@ -273,5 +745,23 @@ mod tests {
         assert!(dbg.contains("REDACTED"));
         assert!(!disp.contains("12345"));
         assert_eq!(secret.expose(), "sk-live-very-secret-12345");
+    }
+
+    #[test]
+    fn provider_catalog_and_thinking_level_mappings_are_consistent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        assert_eq!(agy.preferred_default_model(), "gemini-4-argon");
+        assert_eq!(agy.default_thinking_level(), AiThinkingLevel::Medium);
+        let hydrogen = agy
+            .model_preset("gemini-4-hydrogen")
+            .ok_or("hydrogen preset missing")?;
+        assert!(hydrogen.thinking_levels.contains(&AiThinkingLevel::Extra));
+        assert_eq!(AiThinkingLevel::Extra.acp_thought_level(), Some("xhigh"));
+        assert_eq!(AiThinkingLevel::Auto.acp_thought_level(), None);
+        assert_eq!(AiProviderKind::ui_selectable_providers().len(), 7);
+        Ok(())
     }
 }

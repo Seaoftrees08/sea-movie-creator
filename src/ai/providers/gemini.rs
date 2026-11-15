@@ -3,7 +3,8 @@
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
-    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent, SecretString,
+    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent,
+    AiThinkingLevel, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync};
@@ -15,6 +16,8 @@ pub struct GeminiConfig {
     pub base_url: String,
     /// モデル ID（例: `gemini-2.5-flash`）。
     pub model: String,
+    /// 思考強度レベル（`Auto` 時は `thinkingConfig` 未付与）。
+    pub thinking_level: AiThinkingLevel,
     /// 明示指定 API キー（`None` 時は `GEMINI_API_KEY` / OS keyring を使用）。
     pub api_key: Option<SecretString>,
     /// SSE ストリーミングを使うか。
@@ -30,10 +33,18 @@ impl GeminiConfig {
         Self {
             base_url: AiProviderKind::Gemini.default_base_url().to_owned(),
             model: model.into(),
+            thinking_level: AiThinkingLevel::Auto,
             api_key,
             use_streaming: true,
             timeout_secs: 60,
         }
+    }
+
+    /// 思考強度レベルを指定する。
+    #[must_use]
+    pub const fn with_thinking_level(mut self, thinking_level: AiThinkingLevel) -> Self {
+        self.thinking_level = thinking_level;
+        self
     }
 }
 
@@ -52,7 +63,7 @@ impl GeminiProvider {
         Self { config, label }
     }
 
-    fn build_request_body(request: &AiRequest) -> Value {
+    fn build_request_body(&self, request: &AiRequest) -> Value {
         let system_text = format!(
             "{}\n\n# EditCommand JSON Schema\n{}\n\n# Current Timeline Context\n{}",
             request.system_prompt, request.command_schema_json, request.context_summary
@@ -73,15 +84,25 @@ impl GeminiProvider {
             "parts": [{ "text": request.user_prompt }],
         }));
 
+        let mut gen_cfg = json!({
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        });
+        let lower_model = self.config.model.to_ascii_lowercase();
+        if lower_model.contains("gemini-3") || lower_model.contains("gemini-4") {
+            if let Some(level) = self.config.thinking_level.gemini_thinking_level() {
+                gen_cfg["thinkingConfig"] = json!({ "thinkingLevel": level });
+            }
+        } else if let Some(budget) = self.config.thinking_level.gemini_thinking_budget() {
+            gen_cfg["thinkingConfig"] = json!({ "thinkingBudget": budget });
+        }
+
         json!({
             "systemInstruction": {
                 "parts": [{ "text": system_text }]
             },
             "contents": contents,
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-            }
+            "generationConfig": gen_cfg,
         })
     }
 }
@@ -116,7 +137,7 @@ impl AiProvider for GeminiProvider {
         } else {
             format!("{base}/models/{}:generateContent", self.config.model)
         };
-        let body = Self::build_request_body(request);
+        let body = self.build_request_body(request);
         let headers = [("x-goog-api-key", key.expose())];
 
         on_event(AiStreamEvent::Status(
@@ -204,6 +225,15 @@ mod tests {
             .map_err(|_| "server join failed")??
             .to_ascii_lowercase();
         assert!(captured.contains("x-goog-api-key: gem-secret-abc"));
+
+        let req_thinking = GeminiProvider::new(
+            GeminiConfig::new("gemini-2.5-pro", None).with_thinking_level(AiThinkingLevel::High),
+        )
+        .build_request_body(&req);
+        assert_eq!(
+            req_thinking["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(24576)
+        );
         Ok(())
     }
 

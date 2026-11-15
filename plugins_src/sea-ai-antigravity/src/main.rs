@@ -54,6 +54,8 @@ struct CallParams {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    thinking_level: Option<String>,
+    #[serde(default)]
     external_cli: Option<String>,
     #[serde(default)]
     external_args: Vec<String>,
@@ -71,6 +73,20 @@ fn normalize_requested_model(model: Option<&str>) -> Option<&str> {
     model
         .map(str::trim)
         .filter(|m| !m.is_empty() && *m != "plugin-default")
+}
+
+fn normalize_requested_thinking_level(level: Option<&str>) -> Option<&'static str> {
+    let trimmed = level?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "extra" => Some("xhigh"),
+        _ => None,
+    }
 }
 
 fn build_agy_acp_args(external_args: &[String]) -> Vec<String> {
@@ -161,21 +177,37 @@ fn build_session_new_request(id: u64, sandbox_cwd: &Path) -> Value {
     })
 }
 
-fn session_supports_model_config(session_resp: &Value) -> bool {
+fn session_has_config_option(session_resp: &Value, config_id: &str) -> bool {
     session_resp["result"]["configOptions"]
         .as_array()
-        .is_some_and(|opts| opts.iter().any(|opt| opt["id"].as_str() == Some("model")))
+        .is_some_and(|opts| opts.iter().any(|opt| opt["id"].as_str() == Some(config_id)))
 }
 
-fn build_set_model_config_request(id: u64, session_id: &str, model_id: &str) -> Value {
+fn config_option_allows_value(resp: &Value, config_id: &str, candidate: &str) -> bool {
+    resp["result"]["configOptions"]
+        .as_array()
+        .and_then(|opts| {
+            opts.iter()
+                .find(|opt| opt["id"].as_str() == Some(config_id))
+        })
+        .and_then(|opt| opt["options"].as_array())
+        .is_some_and(|vals| vals.iter().any(|v| v["value"].as_str() == Some(candidate)))
+}
+
+fn build_set_config_option_request(
+    id: u64,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/set_config_option",
         "params": {
             "sessionId": session_id,
-            "configId": "model",
-            "value": model_id,
+            "configId": config_id,
+            "value": value,
         }
     })
 }
@@ -184,7 +216,7 @@ fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) 
     let prompt_text = format!(
         "{}\n\n# Sandbox Constraints\n\
          Do NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.\n\
-         Respond ONLY with valid JSON matching the EditCommand schema below.\n\n\
+         Always output a valid EditCommand JSON object matching the schema below (use {{\"type\":\"batch\",\"commands\":[]}} with a brief text answer before a ```json fence or in \"message\" if no edits are needed).\n\n\
          # EditCommand JSON Schema\n{}\n\n\
          # Timeline Context\n{}\n\n\
          # Instruction\n{}",
@@ -365,15 +397,30 @@ fn execute_acp_conversation(
         .to_owned();
 
     let requested_model = normalize_requested_model(params.model.as_deref());
+    let requested_thinking = normalize_requested_thinking_level(params.thinking_level.as_deref());
+    let mut latest_config_resp = session_resp.clone();
     let mut next_id = 3_u64;
     if let Some(model_id) = requested_model
-        && session_supports_model_config(&session_resp)
+        && session_has_config_option(&latest_config_resp, "model")
     {
         write_jsonrpc_line(
             stdin,
-            &build_set_model_config_request(next_id, &session_id, model_id),
+            &build_set_config_option_request(next_id, &session_id, "model", model_id),
         )?;
-        let _cfg_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
+        latest_config_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
+        next_id += 1;
+    }
+
+    let mut applied_thinking: Option<&'static str> = None;
+    if let Some(level) = requested_thinking
+        && config_option_allows_value(&latest_config_resp, "thought_level", level)
+    {
+        write_jsonrpc_line(
+            stdin,
+            &build_set_config_option_request(next_id, &session_id, "thought_level", level),
+        )?;
+        let _thought_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
+        applied_thinking = Some(level);
         next_id += 1;
     }
 
@@ -382,10 +429,13 @@ fn execute_acp_conversation(
         &build_session_prompt_request(next_id, &session_id, params),
     )?;
     let prompt_resp = read_acp_until_response(reader, stdin, next_id, streamed)?;
-    let active_model = requested_model
+    let base_model = requested_model
         .or_else(|| session_resp["result"]["models"]["currentModelId"].as_str())
-        .unwrap_or("antigravity")
-        .to_owned();
+        .unwrap_or("antigravity");
+    let active_model = match applied_thinking {
+        Some(level) => format!("{base_model} ({level})"),
+        None => base_model.to_owned(),
+    };
 
     Ok((extract_fallback_result_text(&prompt_resp), active_model))
 }
@@ -591,5 +641,36 @@ mod tests {
             fallback["result"]["outcome"],
             json!({ "outcome": "cancelled" })
         );
+    }
+
+    #[test]
+    fn thinking_level_normalization_and_config_option_checks_work() {
+        assert_eq!(normalize_requested_thinking_level(None), None);
+        assert_eq!(normalize_requested_thinking_level(Some("auto")), None);
+        assert_eq!(
+            normalize_requested_thinking_level(Some("Extra")),
+            Some("xhigh")
+        );
+        assert_eq!(
+            normalize_requested_thinking_level(Some("HIGH")),
+            Some("high")
+        );
+
+        let cfg = json!({
+            "result": {
+                "configOptions": [
+                    { "id": "model", "options": [{ "value": "gemini-4-hydrogen" }] },
+                    { "id": "thought_level", "options": [
+                        { "value": "low" },
+                        { "value": "medium" },
+                        { "value": "high" },
+                        { "value": "xhigh" }
+                    ]}
+                ]
+            }
+        });
+        assert!(session_has_config_option(&cfg, "model"));
+        assert!(config_option_allows_value(&cfg, "thought_level", "xhigh"));
+        assert!(!config_option_allows_value(&cfg, "thought_level", "auto"));
     }
 }

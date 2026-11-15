@@ -3,7 +3,8 @@
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
-    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent, SecretString,
+    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent,
+    AiThinkingLevel, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync};
@@ -17,6 +18,8 @@ pub struct AnthropicConfig {
     pub base_url: String,
     /// モデル ID（例: `claude-sonnet-4-20250514`）。
     pub model: String,
+    /// 思考強度レベル（`Auto` 時は拡張思考を付与しない）。
+    pub thinking_level: AiThinkingLevel,
     /// 明示指定 API キー（`None` 時は `ANTHROPIC_API_KEY` / OS keyring を参照）。
     pub api_key: Option<SecretString>,
     /// 最大生成トークン数。
@@ -34,11 +37,19 @@ impl AnthropicConfig {
         Self {
             base_url: AiProviderKind::Anthropic.default_base_url().to_owned(),
             model: model.into(),
+            thinking_level: AiThinkingLevel::Auto,
             api_key,
             max_tokens: 4096,
             use_streaming: true,
             timeout_secs: 60,
         }
+    }
+
+    /// 思考強度レベルを指定する。
+    #[must_use]
+    pub const fn with_thinking_level(mut self, thinking_level: AiThinkingLevel) -> Self {
+        self.thinking_level = thinking_level;
+        self
     }
 }
 
@@ -75,13 +86,25 @@ impl AnthropicProvider {
         }
         messages.push(json!({ "role": "user", "content": request.user_prompt }));
 
-        json!({
+        let budget = self.config.thinking_level.anthropic_budget_tokens();
+        let max_tokens = match budget {
+            Some(b) => self.config.max_tokens.max(b.saturating_add(4096)),
+            None => self.config.max_tokens,
+        };
+        let mut body = json!({
             "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": max_tokens,
             "system": system_text,
             "messages": messages,
             "stream": stream,
-        })
+        });
+        if let Some(budget_tokens) = budget {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            });
+        }
+        body
     }
 }
 
@@ -203,6 +226,14 @@ mod tests {
             .to_ascii_lowercase();
         assert!(captured.contains("x-api-key: sk-ant-secret"));
         assert!(captured.contains("anthropic-version: 2023-06-01"));
+
+        let thinking_body = AnthropicProvider::new(
+            AnthropicConfig::new("claude-sonnet-4-20250514", None)
+                .with_thinking_level(AiThinkingLevel::High),
+        )
+        .build_request_body(&req, false);
+        assert_eq!(thinking_body["thinking"]["budget_tokens"], json!(10240));
+        assert_eq!(thinking_body["max_tokens"], json!(14336));
         Ok(())
     }
 

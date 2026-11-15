@@ -146,6 +146,9 @@ pub struct AiPluginCallParams {
     /// 使用モデルまたはプロファイル指定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 思考強度レベル指定（`low` / `medium` / `high` / `xhigh` 等）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// テストやユーザー指定による外部 CLI バイナリ上書きパス。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_cli: Option<String>,
@@ -324,6 +327,7 @@ pub struct AiPluginProvider {
     args: Vec<String>,
     protocol: AiPluginProtocol,
     model_override: Option<String>,
+    thinking_level_override: Option<String>,
     external_cli_override: Option<String>,
     external_args_override: Vec<String>,
     extra_env: Vec<(String, String)>,
@@ -340,6 +344,7 @@ impl AiPluginProvider {
             args: plugin.manifest.args.clone(),
             protocol: plugin.manifest.protocol,
             model_override: None,
+            thinking_level_override: None,
             external_cli_override: None,
             external_args_override: Vec::new(),
             extra_env: Vec::new(),
@@ -350,6 +355,13 @@ impl AiPluginProvider {
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
+        self
+    }
+
+    /// 思考強度レベル（`low` / `medium` / `high` / `xhigh`）を設定する。
+    #[must_use]
+    pub fn with_thinking_level(mut self, level: Option<String>) -> Self {
+        self.thinking_level_override = level;
         self
     }
 
@@ -407,6 +419,7 @@ impl AiPluginProvider {
                 user_prompt: request.user_prompt.clone(),
                 stream: request.stream,
                 model: self.model_override.clone(),
+                thinking_level: self.thinking_level_override.clone(),
                 external_cli: self.external_cli_override.clone(),
                 external_args: self.external_args_override.clone(),
             },

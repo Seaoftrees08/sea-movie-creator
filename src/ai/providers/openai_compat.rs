@@ -3,7 +3,8 @@
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
-    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent, SecretString,
+    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent,
+    AiThinkingLevel, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync};
@@ -17,6 +18,8 @@ pub struct OpenAiCompatConfig {
     pub base_url: String,
     /// 使用モデル ID。
     pub model: String,
+    /// 推論・思考強度レベル（`Auto` 時は未指定）。
+    pub thinking_level: AiThinkingLevel,
     /// 明示指定のランタイム API キー（`None` 時は環境変数 / OS keyring を参照）。
     pub api_key: Option<SecretString>,
     /// SSE ストリーミングを使用するか。
@@ -33,6 +36,7 @@ impl OpenAiCompatConfig {
             kind: AiProviderKind::OpenAi,
             base_url: AiProviderKind::OpenAi.default_base_url().to_owned(),
             model: model.into(),
+            thinking_level: AiThinkingLevel::Auto,
             api_key,
             use_streaming: true,
             timeout_secs: 60,
@@ -46,6 +50,7 @@ impl OpenAiCompatConfig {
             kind: AiProviderKind::OpenRouter,
             base_url: AiProviderKind::OpenRouter.default_base_url().to_owned(),
             model: model.into(),
+            thinking_level: AiThinkingLevel::Auto,
             api_key,
             use_streaming: true,
             timeout_secs: 60,
@@ -63,10 +68,18 @@ impl OpenAiCompatConfig {
             kind: AiProviderKind::OllamaCompat,
             base_url: base_url.into(),
             model: model.into(),
+            thinking_level: AiThinkingLevel::Auto,
             api_key,
             use_streaming: true,
             timeout_secs: 120,
         }
+    }
+
+    /// 推論・思考強度レベルを指定する。
+    #[must_use]
+    pub const fn with_thinking_level(mut self, thinking_level: AiThinkingLevel) -> Self {
+        self.thinking_level = thinking_level;
+        self
     }
 }
 
@@ -104,12 +117,22 @@ impl OpenAiCompatProvider {
         }
         messages.push(json!({ "role": "user", "content": request.user_prompt }));
 
+        let effort = self.config.thinking_level.reasoning_effort();
         let mut body = json!({
             "model": self.config.model,
             "messages": messages,
-            "temperature": 0.1,
             "stream": stream,
         });
+        if effort.is_none() || !matches!(self.config.kind, AiProviderKind::OpenAi) {
+            body["temperature"] = json!(0.1);
+        }
+        if let Some(effort_str) = effort {
+            if matches!(self.config.kind, AiProviderKind::OpenRouter) {
+                body["reasoning"] = json!({ "effort": effort_str });
+            } else {
+                body["reasoning_effort"] = json!(effort_str);
+            }
+        }
         // Ollama/OpenAI 互換の多くで有効な JSON 出力モードヒントを付与
         if matches!(
             self.config.kind,
@@ -261,6 +284,20 @@ mod tests {
         let captured_lower = captured_req.to_ascii_lowercase();
         assert!(captured_lower.contains("authorization: bearer or-secret-test"));
         assert!(captured_lower.contains("x-title: sea-movie-creator"));
+
+        let openai_thinking = OpenAiCompatProvider::new(
+            OpenAiCompatConfig::openai("o4-mini", None).with_thinking_level(AiThinkingLevel::High),
+        )
+        .build_request_body(&sample_request(false), false);
+        assert_eq!(openai_thinking["reasoning_effort"], json!("high"));
+        assert!(openai_thinking.get("temperature").is_none());
+
+        let router_thinking = OpenAiCompatProvider::new(
+            OpenAiCompatConfig::openrouter("openai/gpt-5", None)
+                .with_thinking_level(AiThinkingLevel::Medium),
+        )
+        .build_request_body(&sample_request(false), false);
+        assert_eq!(router_thinking["reasoning"]["effort"], json!("medium"));
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 //! AI チャット (`AppController` + `MockAiProvider` + `dry_run_validate`) の承認フローおよび一括 Undo 検証。
 
-use sea_movie_creator::ai::provider::AiError;
+use sea_movie_creator::ai::provider::{AiError, AiRole};
 use sea_movie_creator::ai::providers::mock::MockAiProvider;
 use sea_movie_creator::core::animation::{AnimatedParameter, EvaluationContext};
 use sea_movie_creator::core::ids::{ClipRef, LayerRef};
@@ -202,4 +202,39 @@ fn ai_chat_rejects_invalid_output_and_keeps_document_untouched() {
     );
     assert!(controller.ai_chat.pending_proposal.is_none());
     assert_eq!(controller.document, snapshot_before);
+}
+
+#[test]
+fn ai_chat_accepts_empty_batch_no_op_without_error() -> Result<(), Box<dyn std::error::Error>> {
+    let mut controller = AppController::new();
+    let snapshot_before = controller.document.clone();
+    let mock = MockAiProvider::with_responses([
+        "pong!\n```json\n{\"type\":\"batch\",\"commands\":[]}\n```",
+        "{\"type\":\"batch\",\"commands\":[]}",
+    ]);
+
+    controller.submit_ai_prompt_with_provider("ping", &mock)?;
+    assert!(controller.ai_chat.last_error.is_none());
+    assert!(controller.ai_chat.pending_proposal.is_none());
+    assert_eq!(controller.document, snapshot_before);
+    let last_turn = controller
+        .ai_chat
+        .turns
+        .last()
+        .ok_or("assistant reply turn should be recorded")?;
+    assert_eq!(last_turn.role, AiRole::Assistant);
+    assert_eq!(last_turn.text, "pong!");
+
+    controller.submit_ai_prompt_with_provider("ping again", &mock)?;
+    assert!(controller.ai_chat.last_error.is_none());
+    assert!(controller.ai_chat.pending_proposal.is_none());
+    assert_eq!(controller.document, snapshot_before);
+    let bare_turn = controller
+        .ai_chat
+        .turns
+        .last()
+        .ok_or("assistant fallback reply turn should be recorded")?;
+    assert_eq!(bare_turn.role, AiRole::Assistant);
+    assert_eq!(bare_turn.text, "応答を受信しました（タイムライン変更なし）");
+    Ok(())
 }

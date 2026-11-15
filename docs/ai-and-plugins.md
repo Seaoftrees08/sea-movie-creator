@@ -19,17 +19,25 @@ AI の応答は直ちにプロジェクトへ反映されません。必ず以�
 
 ### 選択できる AI プロバイダと認証設定
 
-API キーなどの機密情報は **絶対に `.smc.json` プロジェクトファイルへ保存されません**。環境変数または OS 資格情報ストア（service 名: `sea-movie-creator`）から解決されます。
+画面上部の **API コンボボックス** から利用する AI サービス・ローカルエンドポイント・プラグインを切り替えられます。API キーなどの機密情報は **絶対に `.smc.json` プロジェクトファイルへ保存されません**。環境変数または OS 資格情報ストア（service 名: `sea-movie-creator`）から解決されます。
 
-| UI ボタン名 | 対象サービス / プロトコル | 既定ベース URL / CLI | 認証用の環境変数 / 備考 |
+| コンボボックス表示名 | 対象サービス / プロトコル | 既定ベース URL / CLI | 認証用の環境変数 / 備考 |
 | :--- | :--- | :--- | :--- |
-| `OpenAI` | OpenAI Chat Completions (SSE) | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
-| `OpenRouter` | OpenRouter API | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
-| `Local` | Ollama / LM Studio / vLLM (`OpenAI` 互換) | `http://127.0.0.1:11434/v1` | ローカルサーバーは既定で認証キー任意（必要な場合のみ `OPENAI_API_KEY`） |
-| `Gemini` | Google Gemini REST API | `generativelanguage.googleapis.com` | `GEMINI_API_KEY` |
-| `Claude` | Anthropic Messages API | `api.anthropic.com` | `ANTHROPIC_API_KEY` |
-| `Antigravity` | Google Antigravity CLI (`sea.ai.antigravity`) | `agy acp --sandbox --stdio` | 公式外部エディタ向け ACP プロトコル使用。先に `agy`（または `agy acp --login`）でサインインし `PATH` を通す（パス上書きは `SEA_ANTIGRAVITY_CLI`）。※ 安全注意事項は下記参照 |
-| `ACP CLI` | 外部エージェント (`sea.ai.acp` / ACP over stdio) | `claude` / `codex` / `copilot` | 各公式 CLI が内部で使用するプロファイルに従います。CLI パスは `SEA_ACP_CMD`、引数は `SEA_ACP_ARGS` で上書き可能 |
+| `OpenAI API` | OpenAI Chat Completions (SSE) | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `OpenRouter API` | OpenRouter API | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `Local (Ollama / LM Studio)` | Ollama / LM Studio / vLLM (`OpenAI` 互換) | `http://127.0.0.1:11434/v1` | ローカルサーバーは既定で認証キー任意（必要な場合のみ `OPENAI_API_KEY`） |
+| `Google Gemini API` | Google Gemini REST API | `generativelanguage.googleapis.com` | `GEMINI_API_KEY` |
+| `Anthropic Claude API` | Anthropic Messages API | `api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| `Antigravity (agy CLI)` | Google Antigravity CLI (`sea.ai.antigravity`) | `agy acp --sandbox --stdio` | 公式外部エディタ向け ACP プロトコル使用。先に `agy`（または `agy acp --login`）でサインインし `PATH` を通す（パス上書きは `SEA_ANTIGRAVITY_CLI`）。※ 安全注意事項は下記参照 |
+| `ACP CLI (Claude / Codex / Copilot)` | 外部エージェント (`sea.ai.acp` / ACP over stdio) | `claude` / `codex` / `copilot` | 各公式 CLI が内部で使用するプロファイルに従います。CLI パスは `SEA_ACP_CMD`、引数は `SEA_ACP_ARGS` で上書き可能 |
+
+### モデル・思考レベルの選択と送信操作
+
+- **モデル選択・思考レベル (`Low` / `Medium` / `High` / `Extra` / `Auto`)**:
+  入力欄左下のモデルメニュー（例: `Gemini 4 Argon Medium ▾`）を開くと、選択中プロバイダに応じたモデル一覧が表示されます。推論強度を切り替えられるモデルでは、モデル名に続けて思考レベルのサブメニューが開き、さらに隣の **`思考:`** ボタンからも現在のモデルの思考レベルを 1 クリックで切り替えられます（非対応モデル選択時は自動で無効化 / `Auto` に戻ります）。
+  - **Antigravity (`agy CLI`)**: `Gemini 4 Hydrogen` では `Extra` (`xhigh`) まで切り替えられ、`Orchestrator (Argon)` など非対応モデルでは自動的にスキップされます。
+  - **Gemini / Claude / OpenAI / OpenRouter**: 対応モデル選択時、それぞれ REST / API 仕様に合わせた `thinkingLevel` / `thinkingBudget` / `thinking.budget_tokens` / `reasoning_effort` が自動付与されます。
+- **送信ショートカット**: 入力欄で **`Enter`** を押すとそのまま送信され、`送信` ボタンからも送信できます。
 
 > [!WARNING]
 > **Antigravity (`agy acp`) 利用時の利用規約・アカウント保護に関する注意**

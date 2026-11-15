@@ -2,12 +2,14 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::InputState;
+use gpui_kit::component::select::SelectState;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{Context, Entity, IntoElement, ParentElement as _, Styled as _, div};
 
 use crate::timeline::document::ClipKind;
+use crate::ui::ai_chat_panel::AiProviderSelectItem;
 use crate::ui::app_controller::{AppController, RightPanelTab};
 use crate::ui::inspector_panel::{InspectorWidgets, render_clip_inspector};
 use crate::ui::window::SeaEditorWindow;
@@ -21,6 +23,8 @@ pub struct RightPanelWidgets<'a> {
     pub expr_input: &'a Entity<InputState>,
     /// 字幕テキスト入力欄。
     pub subtitle_text_input: &'a Entity<InputState>,
+    /// AI API / プロバイダ切り替えコンボボックス状態。
+    pub ai_provider_select: &'a Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄テキスト入力欄。
     pub ai_chat_input: &'a Entity<InputState>,
 }
@@ -76,9 +80,13 @@ pub fn render_right_panel(
                 cx,
             )
             .into_any_element(),
-            RightPanelTab::AiChat => {
-                render_ai_chat_tab(controller, widgets.ai_chat_input, cx).into_any_element()
-            }
+            RightPanelTab::AiChat => render_ai_chat_tab(
+                controller,
+                widgets.ai_provider_select,
+                widgets.ai_chat_input,
+                cx,
+            )
+            .into_any_element(),
             RightPanelTab::LayerList => render_layers_tab(controller, cx).into_any_element(),
             RightPanelTab::ProjectInfo => render_project_tab(controller, cx).into_any_element(),
         })
@@ -177,10 +185,16 @@ fn speed_button(
 
 fn render_ai_chat_tab(
     controller: &AppController,
+    ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
     ai_chat_input: &Entity<InputState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    crate::ui::ai_chat_panel::render_ai_chat_panel(controller, ai_chat_input, cx)
+    crate::ui::ai_chat_panel::render_ai_chat_panel(
+        controller,
+        ai_provider_select,
+        ai_chat_input,
+        cx,
+    )
 }
 
 fn render_layers_tab(

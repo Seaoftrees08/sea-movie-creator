@@ -15,10 +15,20 @@ pub struct AiEditPlan {
     pub raw_json: String,
     /// パース済み統一編集コマンド。
     pub command: EditCommand,
+    /// モデル応答に含まれるテキスト補足（`"message"` / `"reply"` フィールドや JSON 外テキスト）。
+    pub reply_note: Option<String>,
     /// UI の差分カードへ表示する人間向け要約行一覧。
     pub summary_lines: Vec<String>,
     /// 変更対象となる識別子一覧。
     pub affected_targets: Vec<String>,
+}
+
+impl AiEditPlan {
+    /// タイムライン変更を伴わない空バッチ（応答専用）計画かどうかを返す。
+    #[must_use]
+    pub const fn is_no_op(&self) -> bool {
+        matches!(&self.command, EditCommand::Batch { commands } if commands.is_empty())
+    }
 }
 
 /// AI 出力のパースまたは事前検証失敗エラー。
@@ -41,6 +51,13 @@ pub enum AiPlanError {
 ///
 /// JSON ブロックが見つからない場合や `EditCommand` スキーマに適合しない場合。
 pub fn extract_edit_command_from_text(raw: &str) -> Result<(String, EditCommand), AiPlanError> {
+    let (raw_json, command, _) = extract_edit_command_and_note(raw)?;
+    Ok((raw_json, command))
+}
+
+fn extract_edit_command_and_note(
+    raw: &str,
+) -> Result<(String, EditCommand, Option<String>), AiPlanError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AiPlanError::NoJsonCommand(
@@ -48,15 +65,20 @@ pub fn extract_edit_command_from_text(raw: &str) -> Result<(String, EditCommand)
         ));
     }
 
+    let fenced_blocks = scan_fenced_blocks(trimmed);
     let mut candidates = Vec::new();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         candidates.push(trimmed.to_owned());
     }
-    collect_fenced_json_blocks(trimmed, &mut candidates);
+    for (_, _, json_body) in &fenced_blocks {
+        if let Some(body) = json_body {
+            candidates.push(body.clone());
+        }
+    }
     if candidates.is_empty()
-        && let Some(obj) = find_first_balanced_json_object(trimmed)
+        && let Some((start, end)) = find_first_balanced_json_span(trimmed)
     {
-        candidates.push(obj);
+        candidates.push(trimmed[start..end].to_owned());
     }
 
     if candidates.is_empty() {
@@ -67,7 +89,11 @@ pub fn extract_edit_command_from_text(raw: &str) -> Result<(String, EditCommand)
     let mut last_err = String::new();
     for cand in candidates {
         match parse_command_candidate(&cand) {
-            Ok((normalized, cmd)) => return Ok((normalized, cmd)),
+            Ok((normalized, cmd, json_note)) => {
+                let reply_note =
+                    json_note.or_else(|| strip_outside_json_text(trimmed, &fenced_blocks));
+                return Ok((normalized, cmd, reply_note));
+            }
             Err(err) => last_err = err,
         }
     }
@@ -78,6 +104,7 @@ pub fn extract_edit_command_from_text(raw: &str) -> Result<(String, EditCommand)
 /// モデル出力をパースしたうえで複製ドキュメント上でドライランし、安全な [`AiEditPlan`] を生成する。
 ///
 /// 呼び出し元の `doc` および履歴には一切の副作用を残さない。
+/// 空のバッチ (`{"type":"batch","commands":[]}`) は変更なしの有効な応答（no-op 計画）として受理する。
 ///
 /// # Errors
 ///
@@ -86,7 +113,20 @@ pub fn dry_run_validate(
     doc: &ProjectDocument,
     raw_response: &str,
 ) -> Result<AiEditPlan, AiPlanError> {
-    let (raw_json, command) = extract_edit_command_from_text(raw_response)?;
+    let (raw_json, command, reply_note) = extract_edit_command_and_note(raw_response)?;
+    let is_no_op = matches!(&command, EditCommand::Batch { commands } if commands.is_empty());
+
+    if is_no_op {
+        doc.validate().map_err(CommandError::from)?;
+        return Ok(AiEditPlan {
+            raw_json,
+            command,
+            reply_note,
+            summary_lines: vec!["タイムライン変更なし（0 ステップ）".to_owned()],
+            affected_targets: Vec::new(),
+        });
+    }
+
     let mut trial_doc = doc.clone();
     let mut trial_dispatcher = CommandDispatcher::new();
     trial_dispatcher.dispatch(&mut trial_doc, &command)?;
@@ -98,6 +138,7 @@ pub fn dry_run_validate(
     Ok(AiEditPlan {
         raw_json,
         command,
+        reply_note,
         summary_lines,
         affected_targets,
     })
@@ -113,17 +154,32 @@ pub fn apply_plan(
     dispatcher: &mut CommandDispatcher,
     plan: &AiEditPlan,
 ) -> Result<(), CommandError> {
+    if plan.is_no_op() {
+        return Ok(());
+    }
     dispatcher.dispatch(doc, &plan.command)?;
     Ok(())
 }
 
-fn parse_command_candidate(candidate: &str) -> Result<(String, EditCommand), String> {
+fn extract_json_reply_note(val: &Value) -> Option<String> {
+    ["message", "reply", "answer"]
+        .into_iter()
+        .find_map(|key| val.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_command_candidate(
+    candidate: &str,
+) -> Result<(String, EditCommand, Option<String>), String> {
     let val: Value =
         serde_json::from_str(candidate).map_err(|err| format!("JSON syntax error: {err}"))?;
+    let json_note = extract_json_reply_note(&val);
 
     if let Ok(cmd) = serde_json::from_value::<EditCommand>(val.clone()) {
         let pretty = serde_json::to_string_pretty(&cmd).unwrap_or_else(|_| candidate.to_owned());
-        return Ok((pretty, cmd));
+        return Ok((pretty, cmd, json_note));
     }
 
     // `"commands": [...]` をルートに持つオブジェクトもバッチに昇格許容する
@@ -132,7 +188,7 @@ fn parse_command_candidate(candidate: &str) -> Result<(String, EditCommand), Str
     {
         let batch = EditCommand::Batch { commands };
         let pretty = serde_json::to_string_pretty(&batch).unwrap_or_else(|_| candidate.to_owned());
-        return Ok((pretty, batch));
+        return Ok((pretty, batch, json_note));
     }
 
     Err(format!(
@@ -143,27 +199,65 @@ fn parse_command_candidate(candidate: &str) -> Result<(String, EditCommand), Str
     ))
 }
 
-fn collect_fenced_json_blocks(raw: &str, out: &mut Vec<String>) {
-    let mut rest = raw;
-    while let Some(start) = rest.find("```") {
-        let after_ticks = &rest[start + 3..];
-        let Some(newline) = after_ticks.find('\n') else {
+fn scan_fenced_blocks(raw: &str) -> Vec<(usize, usize, Option<String>)> {
+    let mut blocks = Vec::new();
+    let mut offset = 0_usize;
+    while let Some(rel_start) = raw[offset..].find("```") {
+        let fence_start = offset + rel_start;
+        let after_ticks = fence_start + 3;
+        let Some(rel_newline) = raw[after_ticks..].find('\n') else {
             break;
         };
-        let lang = after_ticks[..newline].trim().to_ascii_lowercase();
-        let body_start = &after_ticks[newline + 1..];
-        let Some(end) = body_start.find("```") else {
+        let header_end = after_ticks + rel_newline;
+        let lang = raw[after_ticks..header_end].trim().to_ascii_lowercase();
+        let body_start = header_end + 1;
+        let Some(rel_end) = raw[body_start..].find("```") else {
             break;
         };
-        let body = body_start[..end].trim();
-        if (lang.is_empty() || lang == "json") && !body.is_empty() {
-            out.push(body.to_owned());
-        }
-        rest = &body_start[end + 3..];
+        let body_end = body_start + rel_end;
+        let fence_end = body_end + 3;
+        let body = raw[body_start..body_end].trim();
+        let json_candidate =
+            ((lang.is_empty() || lang == "json") && !body.is_empty()).then(|| body.to_owned());
+        blocks.push((fence_start, fence_end, json_candidate));
+        offset = fence_end;
     }
+    blocks
 }
 
-fn find_first_balanced_json_object(raw: &str) -> Option<String> {
+fn strip_outside_json_text(
+    trimmed: &str,
+    fenced_blocks: &[(usize, usize, Option<String>)],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if fenced_blocks.is_empty() {
+        let (start, end) = find_first_balanced_json_span(trimmed)?;
+        let before = trimmed[..start].trim();
+        if !before.is_empty() {
+            parts.push(before);
+        }
+        let after = trimmed[end..].trim();
+        if !after.is_empty() {
+            parts.push(after);
+        }
+    } else {
+        let mut cursor = 0_usize;
+        for &(start, end, _) in fenced_blocks {
+            let segment = trimmed[cursor..start].trim();
+            if !segment.is_empty() {
+                parts.push(segment);
+            }
+            cursor = end;
+        }
+        let tail = trimmed[cursor..].trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn find_first_balanced_json_span(raw: &str) -> Option<(usize, usize)> {
     let start_byte = raw.find('{')?;
     let mut depth = 0_usize;
     let mut in_string = false;
@@ -187,7 +281,7 @@ fn find_first_balanced_json_object(raw: &str) -> Option<String> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let end = start_byte + rel_idx + 1;
-                    return Some(raw[start_byte..end].to_owned());
+                    return Some((start_byte, end));
                 }
             }
             _ => {}
@@ -439,5 +533,40 @@ mod tests {
             dry_run_validate(&doc, bad_id),
             Err(AiPlanError::ValidationFailed(_))
         ));
+    }
+
+    #[test]
+    fn dry_run_accepts_empty_batch_no_op_and_extracts_reply_note()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let doc = ProjectDocument::new("NoOpTest");
+
+        let bare = dry_run_validate(&doc, r#"{"type":"batch","commands":[]}"#)?;
+        assert!(bare.is_no_op());
+        assert!(bare.reply_note.is_none());
+
+        let with_prose = dry_run_validate(
+            &doc,
+            "pong! 応答テスト OK です。\n```json\n{\"type\":\"batch\",\"commands\":[]}\n```",
+        )?;
+        assert!(with_prose.is_no_op());
+        assert_eq!(
+            with_prose.reply_note.as_deref(),
+            Some("pong! 応答テスト OK です。")
+        );
+
+        let with_json_message = dry_run_validate(
+            &doc,
+            r#"{"type":"batch","commands":[],"message":"現在の長さは 0 フレームです。"}"#,
+        )?;
+        assert!(with_json_message.is_no_op());
+        assert_eq!(
+            with_json_message.reply_note.as_deref(),
+            Some("現在の長さは 0 フレームです。")
+        );
+
+        let mut doc_copy = doc;
+        let mut dispatcher = CommandDispatcher::new();
+        apply_plan(&mut doc_copy, &mut dispatcher, &bare)?;
+        Ok(())
     }
 }
