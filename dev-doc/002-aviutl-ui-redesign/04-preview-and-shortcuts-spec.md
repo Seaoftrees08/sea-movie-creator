@@ -31,7 +31,7 @@ AviUtl ではメインウィンドウ上で映像・図形・テキストを **�
 - [`AppMenuBar`](../../src/ui/menu_bar.rs) 拡張メニュー構造とキーボードショートカット／フォーカスガード仕様。
 
 ### 対象外（Out of Scope）
-- GPU シェーダ合成パイプラインそのものの変更（既存の [`build_render_scene`](../../src/media/compositor/mod.rs) と `RenderLayerItem::quad_vertices` をそのまま利用）。
+- GPU シェーダ合成パイプラインそのものの変更（既存の [`build_render_scene`](../../src/media/compositor/mod.rs) や [`compute_layer_quad_ndc`](../../src/media/compositor/mod.rs#L110) の数学基盤をそのまま利用）。
 
 ---
 
@@ -108,9 +108,9 @@ pub fn screen_delta_to_canvas_delta(
 ```
 
 - **前面優先ヒットテスト（Point-in-Quad）**:
-  - 既存の [`RenderLayerItem::quad_vertices`](../../src/media/compositor/mod.rs) は 4 頂点 `[LayerVertex; 4]`（回転・拡縮・アンカー反映済み）を保持している。
-  - 各レンダリングレイヤーの `quad_vertices` を `image_rect` スケールでウィンドウ座標へ射影し、**描画配列の末尾（最前面レイヤー）から逆順に** 四角形内判定（2 三角形の外積符号判定）を行う。
-  - ロック済みレイヤー（`layer.locked == true`）に属するオブジェクトはヒットテストからスキップ（背景上のオブジェクト操作を妨げない）するか、ロックアイコン表示のみ行う。
+  - [`RenderLayerItem`](../../src/media/compositor/mod.rs#L77) 自体は `clip_id` を保持しないため、既存コンポジタ型・結合テストを一切壊さず、UI 向けに [`compute_layer_quad_ndc`](../../src/media/compositor/mod.rs#L110) と [`Matrix2D::transform_point`](../../src/media/visual_properties.rs#L43) を流用する軽量判定データ `PreviewLayerHitQuad { clip_id, layer_locked, ndc_vertices: [LayerVertex; 4], anchor_ndc, rotation_deg }` を再生フレーム単位で構築する。
+  - 各レイヤーの `ndc_vertices` を `image_rect` スケールでウィンドウ座標へ射影し、**描画配列の末尾（最前面レイヤー）から逆順に** 四角形内判定（2 三角形の外積符号判定）を行う。
+  - ロック済みレイヤー（`layer_locked == true`）に属するオブジェクトはヒットテストからスキップ（背面オブジェクト操作を妨げない）する。
   - バウンディングボックスがすでに描画されている選択中オブジェクトに対しては、まず **ハンドル判定（8 点拡縮ハンドル・上端回転ハンドル・中心アンカー `⊕` 各半径 `8px`）** を最優先でチェックする。
 
 #### B. ドラッグ操作種別と更新先アニメーション規約
@@ -123,12 +123,15 @@ pub fn screen_delta_to_canvas_delta(
 | `Ctrl + Alt` + 中心十字 `⊕` ドラッグ | `中心X/Y` | `AnchorX`, `AnchorY` | アンカー位置調整（ピクセル単位） |
 
 **アニメーション中（`Easing` / `Keyframes`）オブジェクトをプレビューでドラッグした際の更新先ルール**:
-AviUtl や実務編集で不整合を起こさないため、以下の決定表に従って書き換え先を決める。
-1. **`Constant`**: 定数 `value` を直接変更する。
+マウスカーソルとオブジェクト描画位置の `1:1` 追従（および線形・非線形全カーブでの波形破綻防止）を保証するため、以下の確定ルールに従って書き換え先を決める。
+1. **`Constant`**: 定数 `value` を直接更新する（`value += delta`）。
 2. **`Keyframes`**：
-   - 現在再生位置 `eff_playhead` と一致するキーフレームが存在する場合：そのキーフレームの値を更新する。
-   - 存在しない場合（区間途中）：現在アクティブな区間（`selected_segment_index`）の **開始点と終了点のうち再生位置に近い側** のキーフレームを更新し、右パネル設定ダイアログ側も同区間へ自動フォーカスする。
-3. **`Easing`**：現在再生位置がクリップ前半なら `start`、後半なら `end` を更新（またはクリップ先頭/末尾一致側）。
+   - 未整列（旧 JSON／AI 直後）のクリップを初回操作した場合は、同一コマンド先頭で `sync_and_align_clip_keyframes` を実行して `grid(clip) = [eff_start, ...visible_midpoints..., eff_last]` へ 1:1 整列する。
+   - **境界／中間点フレーム一致時（`eff_playhead == k_i`）**：該当キーフレーム `keyframes[i]` の値のみを更新する（`value += delta`、カーソル `1:1` 追従）。
+   - **区間途中時（`k_i < eff_playhead < k_{i+1}`）**：現在再生位置 `eff_playhead` が属する区間 `playhead_seg = i` を特定し（右パネル設定ダイアログも同区間 `selected_segment_index = i` へフォーカス切替）、**その区間の開始キー `keyframes[i]` と終了キー `keyframes[i + 1]` の両方に同じ `delta` を加算して区間全体を平行移動する**（補間カーブに関わらずカーソル移動量と表示位置変化が常に `1:1` 完全一致し、50% 境界付近での対象急変も起きない。片端のみ変えたいユーザー向けにツールチップ/ステータスへ「開始点・中間点・終了点へ移動または `P` で中間点追加すると単点編集可」とガイド表示）。
+3. **`Easing`**：
+   - **未カット状態**（`effect_offset_frames == 0` かつ `effect_duration_frames.is_none_or(|d| d == clip.duration.get())`）：`eff_playhead == eff_start` なら `start_value += delta`、`eff_playhead == eff_last` なら `end_value += delta`、区間途中 `(eff_start < eff_playhead < eff_last)` なら **`start_value += delta` と `end_value += delta` の両方を平行移動** する。
+   - **カット済み状態**（`effect_offset_frames != 0` 等）：[`03-inspector-dialog-spec.md`](03-inspector-dialog-spec.md) §6 規約に従い、プレビュードラッグの初回コマンド実行時に確認なしで現在評価値ベースの `Keyframes([eff_start, ...visible..., eff_last])` へ自動昇格した上で、上記 2 と同じ規則で更新する。
 4. **`Expression`**：数式による動的計算中のため直接ドラッグ変更は不可とし、キャンバス上に「`f(t)` 制御中のためプレビュー移動不可」ツールチップを一瞬表示する。
 
 #### C. Media Offline 表示＋再リンク導線
@@ -139,7 +142,11 @@ AviUtl や実務編集で不整合を起こさないため、以下の決定表�
 ### 4.4 主音声波形ストリップ＆トランスポートバー仕様
 
 #### A. 主音声波形ストリップ（プレビュー直下・高さ `34px`）
-- **参照データ**: [`AudioMixer::mix_timeline_window`](../../src/audio/mixer.rs) を用いて現在再生フレーム前後（例：**中央基準 `±2.5 秒`（計 5 秒間）**）の最終ミックス済みモノラル/ステレオピーク波形を生成（UI バックグラウンドまたは軽量サンプル間引きキャッシュ）。
+- **キャッシュ済みデータ生成（`MasterWaveformCache`）**:
+  - プレビュー再生中（`16ms` 描画フレーム毎）に UI スレッド上で重たい [`AudioMixer::mix_timeline_window`](../../src/audio/mixer.rs#L132) を直接全計算しないよう、**リビジョン管理＋チャンク LRU キャッシュ `MasterWaveformCache`** を設ける。
+  - **解像度と単位**: ピーク列は `10ms` ビン（`100 bins/sec`、左右 `(min_l, max_l, min_r, max_r)` またはモノラル `(min, max)`）で保持し、バックグラウンド生成時は [`AudioMixer::mix_timeline_window`](../../src/audio/mixer.rs#L132) を軽量レート `target_sample_rate = 4_000 Hz`（1 秒あたり `40 samples/bin` で十分な包絡線ピーク抽出可能）で呼び出してピーク集約する。
+  - **チャンク＆無効化**: `10秒 = 1,000 bin` を 1 チャンクとして最大 16 チャンク（160 秒分）をキャッシュし、キーは `(doc_audio_revision: u64, chunk_index: u64)` とする。タイムライン上で音声に影響する `EditCommand`（音声/動画クリップ追加・移動・削除・トリム・`PlaybackRate`・`AudioVolume`・`AudioPan`・ミュート・Undo/Redo）適用時のみ `doc_audio_revision` をインクリメントしてバックグラウンドワーカースレッド（古い `revision` の結果は破棄）へ再生成を依頼する。
+  - **描画パス (`O(viewport_bars)`)**: 毎フレーム描画時は、キャッシュ済みチャンクから現在再生フレーム前後 **`±2.5 秒`（計 5 秒間 = 500 bins）** の範囲をビューポート横幅 `bars` 本へ間引くだけで即座に描画する（キャッシュ未生成チャンク到着時は `cx.notify()` で再描画し、未到着部分のみベースライン表示）。
 - **描画**:
   - 黒背景 `#0B0D11` に鮮やかなグリーン（`#22C55E` / `#4ADE80`）の縦バー群を描画。画面写真と同一の視認性を確保する。
   - 中央の赤またはシアン `1px` 縦線が「現在再生フレーム位置」。
@@ -166,45 +173,52 @@ AviUtl や実務編集で不整合を起こさないため、以下の決定表�
 | --- | --- |
 | **ファイル** | `新規プロジェクト (Ctrl+N)` / `開く... (Ctrl+O)` / `保存 (Ctrl+S)` / `名前を付けて保存... (Ctrl+Shift+S)` / `メディアの読み込み... (Ctrl+I)` / `書き出し... (Ctrl+Shift+E)` / `終了` |
 | **編集** | `元に戻す (Ctrl+Z)` / `やり直す (Ctrl+Y)` / `切り取り (Ctrl+X)` / `コピー (Ctrl+C)` / `貼り付け (Ctrl+V)` / `複製 (Ctrl+D)` / `削除 (Del)` / `分割 (S)` / `すべて選択 (Ctrl+A)` |
-| **タイムライン** | `中間点を追加 (P)` / `現在位置を開始位置に ([)` / `現在位置を終了位置に (])` / `選択範囲を解除` / `最後のオブジェクト位置を最終フレームにする` / `タイムライン長を設定...` / `タイムラインにテキストを追加` |
-| **表示** | `バウンディング枠・中心を表示` (Check) / `グリッド線を表示` (Check) / `主音声波形を表示` (Check) / `スナップを有効にする` (Check) / `時間表示: タイムコード / フレーム` / `選択オブジェクトの追従` (Check) / `ズーム拡大・縮小` |
+| **タイムライン** | `中間点を追加 (P)` / `現在位置を開始位置に ([)` / `現在位置を終了位置に (])` / `選択範囲を解除 (Ctrl+Shift+A)` / `最後のオブジェクト位置を最終フレームにする` / `タイムライン長を設定...` / `タイムラインにテキストを追加` |
+| **設定** | `キーコンフィグ設定（ショートカット変更）...` / `タイムコード表示単位 (Timecode / Frames)` |
+| **表示** | `バウンディング枠・中心を表示` (Check) / `グリッド線を表示` (Check) / `主音声波形を表示` (Check) / `スナップを有効にする` (Check) / `選択オブジェクトの追従` (Check) / `ズーム拡大・縮小` |
 | **再生** | `再生 / 一時停止 (Space)` / `先頭へ (Home)` / `末尾へ (End)` / `1フレーム戻る (Left)` / `1フレーム進む (Right)` / `前の中間点・境界 ( , )` / `次の中間点・境界 ( . )` |
 | **書き出し** | `書き出し設定ダイアログを開く... (Ctrl+Shift+E)` / `選択範囲のみ書き出し切替` |
 
 ---
 
-### 4.6 キーボードショートカット体系＆フォーカス競合防止
+### 4.6 キーボードショートカット体系・キーコンフィグ・フォーカス競合防止
 
-#### A. ショートカット一覧（AviUtl 準拠）
+#### A. 既定ショートカット一覧（AviUtl 準拠 ＋ 競合解消済み）
 
-| キー | コンテキスト | 機能 | AviUtl 対応 |
+| キー | コンテキスト | 機能 | AviUtl 対応・補足 |
 | --- | --- | --- | --- |
-| `Space` | Global（非入力時） | 再生 / 一時停止トグル | AviUtl `Space` |
-| `Left` / `Right` | Global（非入力時） | `-1f` / `+1f` コマ送り | AviUtl `←` / `→` |
-| `Shift+Left` / `Shift+Right` | Global（非入力時） | `-10f` / `+10f`（または設定フレーム数）ジャンプ | AviUtl `Shift+←/→` |
-| `Home` / `End` | Global（非入力時） | プロジェクト先頭 `0f` / 最終フレームへ移動 | AviUtl `Home` / `End` |
-| `,` / `.` | Global（非入力時） | 前・次のクリップ境界または中間点へシークジャンプ | AviUtl カメラ/フレーム移動系相当 |
-| `S` | Global（非入力時） | 再生位置で選択クリップを分割 | 動画編集標準 / 既存仕様継承 |
-| `P` | Global（非入力時） | 再生位置へ中間点を追加（`Keyframes` 挿入） | AviUtl `P`（中間点追加） |
-| `[` / `]` | Global（非入力時） | 現在位置を選択範囲開始 / 終了に設定 | AviUtl 範囲指定標準 |
-| `Delete` / `Backspace` | Global（非入力時） | 選択中の全クリップを削除 | AviUtl `Delete` |
-| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` / `Ctrl+D` | Global（非入力時） | 切り取り / コピー / 貼り付け / 複製 | AviUtl & 既存継承 |
-| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Global（非入力時） | Undo / Redo | AviUtl & 既存継承 |
-| `Ctrl+A` | Timeline | 全クリップ選択（ルーラー/選択範囲内） | 汎用編集標準 |
-| `Tab` | Global（非入力時） | 現在再生位置にあるオブジェクトを選択・巡回 | 複数重なり時の選択切替 |
-| `^` / `\` または `Ctrl++` / `Ctrl+-` | Global（非入力時） | タイムラインズームイン / ズームアウト | AviUtl `^` / `\` |
-| `Alt + Arrow` / `Alt+Shift + Arrow` | クリップ選択時 | プレビュー上 `X/Y` を `1px` / `10px` 微調整 | AviUtl 矢印微調整（移動衝突回避で `Alt` 修飾） |
-| `*` / `/`（`Alt+*` / `Alt+/` も可） | クリップ選択時（非入力時） | 回転角 `+5°` / `-5°`（`Shift` で `1°`） | AviUtl `*` / `/` 回転 |
+| `Space` | `EditorMain` | 再生 / 一時停止トグル | AviUtl `Space` |
+| `Left` / `Right` | `EditorMain` | `-1f` / `+1f` コマ送り | AviUtl `←` / `→` |
+| `Shift+Left` / `Shift+Right` | `EditorMain` | `-10f` / `+10f`（または設定フレーム数）ジャンプ | AviUtl `Shift+←/→` |
+| `Home` / `End` | `EditorMain` | プロジェクト先頭 `0f` / 最終フレームへ移動 | AviUtl `Home` / `End` |
+| `,` / `.` | `EditorMain` | 前・次のクリップ境界または中間点へシークジャンプ | AviUtl 相当 |
+| `S` | `EditorMain` | 再生位置で選択クリップを分割 | 動画編集標準 / 既存継承 |
+| `P` | `EditorMain` | 再生位置へ中間点を追加（`EditCommand::AddMidpoint`） | AviUtl `P`（中間点追加） |
+| `[` / `]` | `EditorMain` | 現在位置を選択範囲開始 / 終了（`end = current + 1`）に設定 | AviUtl 範囲指定標準 |
+| `Ctrl+A` | `EditorMain` | **全クリップ選択** | 汎用編集標準（範囲解除と分離） |
+| `Ctrl+Shift+A` / `Escape` | `EditorMain` | **選択範囲（`[` `]`）を解除**（`Escape` はモーダル閉 → テキストフォーカス解除 → `selection_range` 解除 → `selected_clip_ids` 解除の優先順） | 選択クリア専用 |
+| `Delete` / `Backspace` | `EditorMain` | 選択中の全クリップを削除 | AviUtl `Delete` |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` / `Ctrl+D` | `EditorMain` | 切り取り / コピー / 貼り付け / 複製 | AviUtl & 既存継承 |
+| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | `EditorMain` | Undo / Redo | AviUtl & 既存継承 |
+| `Tab` | `EditorMain` | 現在再生位置にあるオブジェクトを選択・巡回（テキスト欄/モーダルフォーカス時は標準フォーカス移動を優先） | 複数重なり時の選択切替 |
+| `^` / `\` または `Ctrl++` / `Ctrl+-` | `EditorMain` | タイムラインズームイン / ズームアウト | AviUtl `^` / `\` |
+| `Alt + Arrow` / `Alt+Shift + Arrow` | `EditorMain`（選択時） | プレビュー上 `X/Y` を `1px` / `10px` 微調整 | 矢印コマ送りと安全分離 |
+| `*` / `/`（Numpad 等）<br>微調整: `Ctrl + *` / `Ctrl + /` | `EditorMain`（選択時） | 回転角 `+5°` / `-5°`（`Ctrl` 併用で **`1°` 刻み**） | JIS 配列で `*` 自体が `Shift+:` のため、`Shift` ではなく **`Ctrl` 修飾** で 1° 刻みを識別（マウス回転ハンドルドラッグのみ `Shift` 15° スナップ可） |
 
-#### B. テキスト入力中のフォーカス保護設計（最重要ルール）
-GPUI のアクションディスパッチと `InputState` の競合による文字入力阻害（「`S` を押すと分割されてしまい字幕に `"s"` が打てない」「`Space` で再生が動き出しスペースが打てない」バグ）を完全に防ぐため、以下 2 重のガードを義務化する。
+#### B. メニューバーからのキーコンフィグ設定（カスタマイズ・衝突回避）
+JIS / US 配列差やユーザー個人の AviUtl カスタム割り当て（例：タイムライン上での `Alt` / `Ctrl` 好み、回転キーを `Q`/`E` へ割当など）を自由に調整できるよう、メニューバー **`設定` → `キーコンフィグ設定...`** モーダルを提供する。
+- `ShortcutAction`（全エディタアクション列挙体）⇔ キー組合せ文字列のマップ構造体 `KeyConfig` を [`AppController`](../../src/ui/app_controller.rs) およびアプリローカル設定ファイル（OS 標準設定ディレクトリ配下の `key_config.json`、プロジェクトファイル `.smc.json` には混入させない）へ保持。
+- モーダル内でアクション行をクリック→新しいキーを押下してリアルタイム変更し、**他アクションとのキー重複があれば警告ハイライト表示**（確認の上で上書き可）。
+- 「`AviUtl 既定に戻す`」ボタンを備え、変更時は即座に `cx.bind_keys(...)` を再登録して再起動不要で反映する。
 
-1. **GPUI KeyContext 分離**:
-   - `InputState`（設定ダイアログの数値欄、`f(t)` 欄、字幕テキスト欄、レイヤー名リネーム欄、AI チャット欄、エクスポートパス欄）は `gpui_component::input` 内部の `"Input"` キーコンテキストで動作する。
-   - **単一文字・記号キー（`Space`, `S`, `P`, `[`, `]`, `,`, `.`, `*`, `/`, `Left`, `Right`, `Home`, `End`, `Delete`, `Backspace`, `Tab`, `Ctrl+C/V/X/A`）のショートカットはすべて `EditorMain` キーコンテキスト（入力ボックスにフォーカスが無い親コンテナのみ設定、または条件ガード）に限定バインド**する。
-2. **アクションハンドラ冒頭での防御判定（`is_text_input_focused`）**:
-   - [`window.rs`](../../src/ui/window.rs) にヘルパー `fn is_any_text_input_focused(&self, window: &Window, cx: &App) -> bool` を設け、登録済みの全 `InputState`（`inspector` 各欄、`ai_chat_input`、`layer_rename_input`、`timeline_length_input`、`export_dialog` 各欄）の `focus_handle(cx).is_focused(window)` を検査する。
-   - フォーカス中であれば編集ショートカット側ハンドラは何もせず `cx.propagate()` し、テキストボックス側の自然な入力・選択コピー＆ペーストを絶対優先する（例外：`Ctrl+Z`/`Ctrl+S` 等はテキスト欄の Undo が不要な確定前以外、基本 `Ctrl+S` 保存のみグローバル許可等も明確分離）。
+#### C. 既存グローバルバインド移行とテキスト入力中のフォーカス保護（必須移行作業）
+現行 [`menu_bar.rs#L47-L63`](../../src/ui/menu_bar.rs#L47-L63) は `KeyBinding::new("space", TogglePlayback, None)` や `KeyBinding::new("s", SplitAtPlayhead, None)` のように **キーコンテキスト `None`（ウィンドウ無条件グローバル）** で登録されており、かつ [`window.rs#L469-L527`](../../src/ui/window.rs#L469-L527) の `on_action` でも入力フォーカス検査を行っていない。このまま新入力欄を増やすと、字幕や `f(t)` 欄への入力中に `"s"` や `" "` が奪われるため、以下 2 重の移行・保護作業を Phase D-4 に必須で組み込む。
+
+1. **既存グローバル `KeyBinding` の `"EditorMain"` コンテキスト移行**:
+   - [`menu_bar.rs#L47-L63`](../../src/ui/menu_bar.rs#L47-L63) の既存 15 バインディング（および新規ショートカット群）のコンテキストを **`None` → `Some("EditorMain")`** へすべて移行し、[`window.rs`](../../src/ui/window.rs) の非入力ワークスペース外枠のみ `.key_context("EditorMain")` を設定（`InputState` は自身の `"Input"` コンテキストを持つため単一キーが自動マスクされる）。
+2. **アクションハンドラ冒頭での防御判定（`is_any_text_input_focused`）**:
+   - [`window.rs`](../../src/ui/window.rs) にヘルパー `fn is_any_text_input_focused(&self, window: &Window, cx: &App) -> bool` を設け、登録済みの全 `InputState`（設定ダイアログ数値欄、`f(t)` 欄、字幕テキスト欄、`ai_chat_input`、`layer_rename_input`、`timeline_length_input`、`export_dialog` 等）の `focus_handle(cx).is_focused(window)` を検査する。
+   - いずれかがフォーカス中であれば、編集・再生・削除系アクション（`Ctrl+S` 等を除く）は何もせず即リターン／`cx.propagate()` し、文字入力・テキスト欄内コピー＆ペーストを絶対優先する。
 
 ---
 
@@ -223,13 +237,20 @@ pub enum PreviewDragMode {
     ScrubMasterWaveform { start_frame: u64 },
 }
 
-/// 4頂点 RenderLayerItem へのウィンドウ座標ヒット判定（逆順・最前面優先）。
+/// プレビューヒット判定用のクリップ領域情報（RenderLayerItem とは独立に構築）。
+pub struct PreviewLayerHitQuad {
+    pub clip_id: ClipId,
+    pub layer_locked: bool,
+    pub ndc_vertices: [LayerVertex; 4],
+    pub anchor_ndc: [f32; 2],
+    pub rotation_deg: f64,
+}
+
+/// 4頂点ヒット領域一覧へのウィンドウ座標ヒット判定（逆順・最前面優先）。
 pub fn hit_test_preview_layers(
-    items: &[RenderLayerItem],
-    layer_lock_lookup: &dyn Fn(&ClipId) -> bool,
+    quads: &[PreviewLayerHitQuad],
     window_pos: (f32, f32),
     image_rect: (f32, f32, f32, f32),
-    project_size: (u32, u32),
 ) -> Option<ClipId>;
 ```
 

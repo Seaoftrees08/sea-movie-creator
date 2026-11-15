@@ -86,17 +86,26 @@
   - ヘッダ時刻バッジのクリックで `Timecode` ⇔ `Frames` を即座にトグル可能とする。
 
 #### B. 動的目盛りアルゴリズム（ルーラーティック）
-`px_per_frame` と `fps` に応じ、文字が重ならない（最小ラベル間隔 `84px` 以上）最大の視認ステップを選択する。
+`px_per_frame` と `fps`（実フレームレート `fps_f64 = fps.as_f64().max(1.0)`, `px_per_sec = px_per_frame * fps_f64`）に応じ、**文字ラベルが絶対に重ならない最小間隔 `>= 84.0px` を満たす最小候補（最も細かい視認ステップ）** を選択する。また小数秒（`0.1s` 等）を排し、全目盛りを整数フレーム座標へスナップすることで `23.976 / 24 / 25 / 29.97 / 60 fps` でもドリフトしない。
 
-| `px_per_sec = px_per_frame * fps` | 大目盛り（数値ラベル付き・高さ 12px） | 中目盛り（高さ 7px） | 小目盛り（高さ 4px） |
-| --- | --- | --- | --- |
-| `< 12 px/s` | `30s` 間隔 | `10s` | `5s` |
-| `12 .. 30 px/s` | `10s` 間隔 | `5s` | `1s` |
-| `30 .. 70 px/s` | `5s` 間隔 | `1s` | `0.5s`（`fps/2`） |
-| `70 .. 180 px/s` | `1s` 間隔 | `0.5s` | `0.1s`（または `5f`） |
-| `>= 180 px/s` | `0.5s` または `10f` 間隔 | `5f` | `1f` 境界線（`px_per_frame >= 6.0` で全フレーム線描画） |
+- **`TimeDisplayUnit::Timecode` モードの候補選定（先頭から評価し最初に `major_px >= 84.0` を満たす行を採用）**:
 
-- `TimeDisplayUnit::Frames` 時は、秒ステップの代わりに `1f / 5f / 10f / 30f / 60f / 120f / 300f / 600f` ステップから `px_per_frame * step >= 72px` となる最小候補を採用する。
+| 選定条件（先頭一致） | 大目盛り `major`（数値ラベル付き・12px） | 中目盛り `mid`（7px） | 小目盛り `minor`（4px） | 適用閾値目安（`60fps` / `29.97fps`） |
+| --- | --- | --- | --- | --- |
+| `10.0 * px_per_frame >= 84.0` | `10f` 間隔 | `5f` | `1f`（全フレーム線） | `px_per_frame >= 8.4 px` |
+| `0.5s相当フレーム * px_per_frame >= 84.0`（`fps_nom = fps_f64.round()` が偶数のときのみ採用、例 `30f@60fps`, `12f@24fps`, `15f@29.97fps`） | `0.5s`（偶数半秒フレーム） | `5f`（または `major/3`） | `1f`（`px_per_frame >= 6.0` 時のみ） | `px_per_sec >= 168 px/s` |
+| `1.0 * px_per_sec >= 84.0` | `1s` 間隔（`round(1*fps)` 基準） | 約 `0.5s` 位置 | `5f` 間隔（`>= 5.0px` 時のみ） | `px_per_sec >= 84 px/s` |
+| `2.0 * px_per_sec >= 84.0` | `2s` 間隔 | `1s` | 約 `0.5s` 位置 | `42.0 .. 84.0 px/s` |
+| `5.0 * px_per_sec >= 84.0` | `5s` 間隔 | `1s` | （省略／`1s` 以上時は `0.5s`） | `16.8 .. 42.0 px/s` |
+| `10.0 * px_per_sec >= 84.0` | `10s` 間隔 | `5s` | `1s` | `8.4 .. 16.8 px/s` |
+| `30.0 * px_per_sec >= 84.0` | `30s` 間隔 | `10s` | `5s` | `2.8 .. 8.4 px/s` |
+| `60.0 * px_per_sec >= 84.0` | `60s`（1 分）間隔 | `30s` | `10s` | `1.4 .. 2.8 px/s` |
+| 上記未満（超広域・低 FPS） | `60s * 2^k >= 84.0 / px_per_sec`（例: `120s`, `300s`, ...） | `major / 2` | `major / 6` | `< 1.4 px/s` |
+
+- **整数フレームスナップ＆間引き規則**:
+  - 大目盛りのフレーム位置は 秒ステップ時 `frame = (k as f64 * step_sec * fps_f64).round() as u64` で整数フレームへ配置する。
+  - 中目盛り・小目盛りについても隣接間隔（`delta_f * px_per_frame`）が **`< 5.0px` の場合は自動省略** し、視覚的なベタ塗り潰れを防止する。
+- **`TimeDisplayUnit::Frames` モード**: `[1f, 5f, 10f, 30f, 60f, 120f, 300f, 600f, 1800f, 3600f]`（足りなければ 2 倍延長）から `major_f as f64 * px_per_frame >= 72.0` を満たす最小候補を採用する。
 - 可視開始フレーム `visible_start_f = timeline_scroll_x_frames`、可視終了フレーム `visible_end_f = visible_start_f + ceil(viewport_w / px_per_frame)` に対して、該当範囲の目盛りだけをループ生成する。
 
 #### C. 正確な座標変換と再生ヘッドシーク（バグ修正）
@@ -107,18 +116,18 @@ track_canvas_origin_x = timeline_panel_origin_x + TRACK_HEADER_WIDTH
 local_canvas_x        = f32::from(evt.position.x) - track_canvas_origin_x
 raw_frame_f64         = timeline_scroll_x_frames as f64 + (local_canvas_x as f64 / px_per_frame as f64)
 target_frame          = raw_frame_f64.round().max(0.0) as u64
-clamped_frame         = target_frame.min(seek_upper_bound_frames)
+clamped_frame         = target_frame.min(document.seek_upper_bound_frames())
 ```
 
 - **ルーラー左クリック（`MouseDown`）**:
   1. 再生中（`PlaybackState::Playing`）であれば一時停止（`Pause`）。
-  2. `Shift` キー非押下時：`seek_to_frame(clamped_frame)` を即時実行し、`TimelineDragState::ScrubPlayhead` を開始する。
+  2. `Shift` キー非押下時：`seek_to_frame(clamped_frame)` を即時実行し（`AutoToLastClip` 時はクリップ有無を問わず `seek_upper_bound_frames() == ruler_display_span_frames()` により短尺クリップ末尾より先や空状態でもルーラー表示域全域へシーク可能）、`TimelineDragState::ScrubPlayhead` を開始する。
   3. ルーラー外へドラッグが続いても（ウィンドウの `on_mouse_move` キャプチャ経由で）連続スクラブを継続し、左/右端付近にカーソルが出た場合は自動オートスクロールを行う。
   4. `MouseUp` で `ScrubPlayhead` を終了し、最終フレームを正確評価する。
 - **再生ヘッド表示**:
   - ルーラー下端（y = 20..32px）に下向き逆三角形（幅 `11px`）を描画し、そのまま全レイヤーを貫通して最下段まで `1.5px` 縦線（`#38BDF8`、再生中は高輝度）を描画する。
 - **ルーラー上 `Shift + 左ドラッグ`（選択範囲指定）**:
-  - ドラッグ開始フレーム `anchor_f` と現在フレーム `cur_f` から `FrameRange { start: min(anchor_f, cur_f), end: max(anchor_f, cur_f).max(min + 1) }` を構成し、`MouseUp` 時に `EditCommand::SetSelectionRange` を発行する。
+  - ドラッグ開始フレーム `anchor_f` と現在フレーム `cur_f` から半開区間 `FrameRange { start: FrameIndex::new(anchor_f.min(cur_f)), end: FrameIndex::new(anchor_f.max(cur_f).saturating_add(1)) }`（両端フレームを含む `[start, end)`）を構成し、`MouseUp` 時に `EditCommand::SetSelectionRange` を発行する。
 
 ---
 
@@ -192,13 +201,13 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
                                 ^                   ^
                             中間点 (| + 上端◆)   中間点 (| + 上端◆)
 ```
-- **中間点描画**: `clip_midpoint_effect_frames(&clip.id)` のうち有効範囲（`eff_start < m < eff_end`）の各フレーム位置に、`2px` 白色縦線 + 上端 `6px` 菱形ハンドル（選択中/ホバー時 `#FACC15` 強調）を描画する。
+- **中間点描画**: [`Clip::midpoints`](../../src/timeline/document.rs#L346) から抽出した `visible_clip_midpoints(clip)`（有効範囲 `eff_start < m && m < eff_last`、`eff_last = eff_start + duration - 1`）の各フレーム位置に、`2px` 白色縦線 + 上端 `6px` 菱形ハンドル（選択中/ホバー時 `#FACC15` 強調）を描画する。
 - **区間ハイライト**: `selected_clip_id` に一致するクリップでは、外枠を `#FACC15`（2px）で囲み、さらに `selected_segment_index` 以外の区間をわずかに暗め（黒 `20%` オーバーレイ）または現在区間の背景上端に `2px` 青ハイライトラインを引くことで「今どの区間を設定ダイアログで編集中か」を一目で分かるようにする。
-- **クリップ左クリック（区間自動連動）**:
-  - クリック位置 X から `clicked_eff_frame` を算出し、そのクリップ内の中間点列 `[eff_start, m_1, ..., m_k, eff_end]` の何番目の区間に落ちたかを特定する。
+- **クリップ左クリック（区間自動連動 & `Ctrl+Click` / `Ctrl+Drag` 閾値分離）**:
+  - クリック位置 X から `clicked_eff_frame` を算出し、そのクリップ内の区間列 `[eff_start, m_1, ..., m_k, eff_last]` の何番目の区間に落ちたかを特定する。
   - 修飾キーなしクリック：`select_single_clip(Some(clip_id), segment_index)`。これにより **中間点の左側をクリックすれば前半設定、右側をクリックすれば後半設定** が設定ダイアログに即座に表示される（AviUtl と同一挙動）。
-  - `Ctrl + クリック`：`toggle_clip_selection(&clip_id)`（複数選択の追加・除外）。
-  - **中間点マーカー自体の左クリック＆ドラッグ**：マーカー周囲 `±5px` 内であれば `TimelineDragState::MoveMidpoint { clip_id, old_eff_frame, current_eff_frame }` へ入り、ドラッグで中間点位置を前後へ移動する。
+  - **`Ctrl + 左ボタン押下`（クリック選択トグルとドラッグ複製の競合解消）**：`MouseDown` 時は即座に選択状態を反転させず待機状態（`PendingCtrlGesture`）とし、移動距離が **`4.0px` 未満のまま `MouseUp` された場合のみ `toggle_clip_selection(&clip_id)`（複数選択の追加・除外）** を実行する。移動距離が **`4.0px` 以上** に達した場合は選択状態を変えずに `DuplicateAndMoveClips`（元位置を残した複製ドラッグ）へ遷移する。
+  - **中間点マーカー自体の左クリック＆ドラッグ**：マーカー周囲 `±5px` 内であれば `TimelineDragState::MoveMidpoint { clip_id, old_eff_frame, current_eff_frame }` へ入り、ドラッグ確定時に `EditCommand::MoveMidpoint` で中間点位置を前後へ移動する。
   - **中間点マーカーダブルクリック**：その中間点時刻へ再生ヘッドを即座にジャンプ。
 
 #### B. 音声波形オーバーレイ描画
@@ -211,7 +220,7 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
 | マウス操作 | ヒット対象 | 状態 (`TimelineDragState`) | 確定時に発行する `EditCommand` |
 | --- | --- | --- | --- |
 | 左ドラッグ | クリップ中央（非端・非中間点） | `MoveClips { initial, delta_frames, target_layer_delta }` | 単一：`MoveClip`、複数：`Batch([MoveClip...])`（衝突回避順生成） |
-| **`Ctrl + 左ドラッグ`** | 選択クリップ中央 | `DuplicateAndMoveClips { clones_preview, delta_frames, target_layer_delta }` | `build_duplicate_selection_command` 相当＋移動先の `Batch`（元クリップは残置、ゴースト表示） |
+| **`Ctrl + 左ドラッグ` (`>= 4px`)** | クリップ中央（対象が選択群内なら全選択クリップ、非選択ならクリック対象のみ） | `DuplicateAndMoveClips { clones_preview, delta_frames, target_layer_delta }` | `build_duplicate_selection_command` 相当＋移動先の `Batch`（元クリップは残置、ゴースト表示） |
 | 左ドラッグ | クリップ左端 `±6px` | `TrimLeft { clip_id, new_start }` | `EditCommand::TrimLeft`（最小 `1f` 制限） |
 | 左ドラッグ | クリップ右端 `±6px` | `TrimRight { clip_id, new_end }` | `EditCommand::TrimRight`（最小 `1f` 制限） |
 | 左ドラッグ | タイムライン空白部 | `MarqueeSelect { start_pos, current_pos, additive }` | （`EditCommand` なし・`select_clips_in_rect()` 更新） |
@@ -223,7 +232,7 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
     2. 同一・他レイヤーのクリップ開始端および終了端
     3. 他レイヤーの中間点
     4. 選択範囲の `[` / `]` 境界およびプロジェクト最終フレーム
-  - `Shift` キーを押しながらドラッグしている間はスナップを一時無効化し、`1f` 単位で自由に配置可能（Alt でも切替可）。
+  - `Shift` キーを押しながらドラッグしている間はスナップを一時無効化し、`1f` 単位で自由に配置可能（スナップの恒常 ON/OFF はタイムラインヘッダの `[Snap]` トグル／メニュー「タイムライン → スナップ有効」で切替）。
 
 ---
 
@@ -242,7 +251,7 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
 - **範囲設定** サブメニュー:
   - `現在位置を開始位置にする ([)`
   - `現在位置を終了位置にする (])`
-  - `選択範囲を解除`
+  - `選択範囲を解除 (Ctrl+Shift+A)`
   - ---
   - `最後のオブジェクト位置を最終フレームにする`
   - `クリップ末尾に自動追従（Auto）`
@@ -253,9 +262,9 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
 
 #### 2. オブジェクト（クリップ）右クリック
 （対象クリップが未選択だった場合はそのクリップを単一選択してからメニュー表示；複数選択中のいずれかを右クリックした場合は複数一括メニューとして扱う）
-- `分割 (S)`（再生位置がクリック内にある場合有効；または「クリック位置で分割」）
-- `中間点を追加 (P)`（対象クリップ内再生ヘッド位置へ追加）
-- `指定位置の中間点を削除`（中間点付近右クリック時のみ有効）
+- `分割 (S)`（再生位置がクリップ内にある場合有効；または「クリック位置で分割」）
+- `中間点を追加 (P)`（対象クリップ内再生ヘッド位置へ `EditCommand::AddMidpoint` 実行）
+- `指定位置の中間点を削除`（中間点付近右クリック時のみ有効、`EditCommand::RemoveMidpoint` 実行）
 - ---
 - `切り取り (Ctrl+X)` / `コピー (Ctrl+C)` / `複製 (Ctrl+D)` / `削除 (Del)`
 - ---
@@ -265,7 +274,7 @@ clamped_frame         = target_frame.min(seek_upper_bound_frames)
 
 #### 3. ルーラー右クリック
 - `時間表示形式: 時分秒 (Timecode)` / `フレーム数 (Frames)`
-- `開始位置に設定 ([)` / `終了位置に設定 (])` / `選択範囲を解除`
+- `開始位置に設定 ([)` / `終了位置に設定 (])` / `選択範囲を解除 (Ctrl+Shift+A)`
 - `最後のオブジェクト位置を最終フレームにする`
 - `タイムライン長を設定...`
 
@@ -320,7 +329,7 @@ pub fn segment_index_for_timeline_frame(
 - **パネル幅極小時（例：横幅 400px 以下）**: `TRACK_HEADER_WIDTH` は `136px` を維持しつつトラック領域が `0px` 以下にならないようクランプし、ゼロ除算や負幅によるスクロール崩壊を防ぐ。
 - **ドラッグ中のウィンドウ外マウスリリース**: タイムライン全体だけでなくウィンドウルート（[`window.rs`](../../src/ui/window.rs)）側でも `on_mouse_up` / `on_mouse_move` をフックし、ルーラーやパネル外へマウスが出て指を離してもドラッグ状態が張り付かないように保証する。
 - **重なり衝突時の挙動**: 複数クリップドラッグ先がロック中レイヤー、または非選択クリップと重複する場合、ドロップ前にリアルタイム衝突検査結果を赤色半透明ゴーストで警告表示し、ドロップ時にも検証失敗した場合は元位置へ安全にロールバック＋ステータスメッセージ通知する。
-- **最小クリップ長 `1f` 制約**: `TrimLeft` / `TrimRight` ドラッグで幅が `0f` 以下にならないよう `1f` でクランプする。中間点移動も `[eff_start + 1, eff_end - 1]` かつ隣接中間点と `1f` 以上離す。
+- **最小クリップ長 `1f` 制約**: `TrimLeft` / `TrimRight` ドラッグで幅が `0f` 以下にならないよう `1f` でクランプする。中間点移動も `[eff_start + 1, eff_last - 1]` かつ隣接中間点と `1f` 以上離す（`eff_last = eff_start + duration - 1`）。
 - **長尺タイムラインでの数値オーバーフロー**: `frame * px_per_frame` は計算時に `f64` を経由してから描画ローカル座標へ変換し、スクロール先が巨大（例：10 時間 = 2,160,000f）でも丸めジッタや `i32` 飽和を起こさない。
 
 ---
