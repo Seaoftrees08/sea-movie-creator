@@ -10,7 +10,9 @@ use crate::audio::playback::{
     start_audio_output,
 };
 use crate::core::ids::{AssetId, AssetRef, ClipId, ClipRef, LayerId, LayerRef};
-use crate::core::time::{FrameCount, FrameIndex, PlaybackRate, RationalDuration};
+use crate::core::time::{
+    FrameCount, FrameIndex, FrameRate, PlaybackRate, RationalDuration, frames_to_project_seconds,
+};
 use crate::media::compositor::WgpuCompositor;
 use crate::media::decoder::{
     BackendPreference, VideoDecoder, open_audio_decoder, open_video_decoder, probe_media,
@@ -1169,18 +1171,15 @@ impl AppController {
         path: &Path,
     ) -> Result<(AssetKind, FrameCount, PreparedClipKind), String> {
         let dec = open_audio_decoder(path, BackendPreference::Auto).map_err(|e| e.to_string())?;
-        let dur_sec = dec.duration_seconds().unwrap_or(1.0).max(0.1);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let millis = (dur_sec * 1_000.0).round() as u64;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let frames = (dur_sec * self.document.fps.as_f64()).ceil().max(1.0) as u64;
+        let (source_duration, frame_count) =
+            quantize_source_duration_and_frames(dec.duration_seconds(), 1.0, self.document.fps)?;
         Ok((
             AssetKind::Audio {
                 sample_rate_hz: dec.sample_rate(),
                 channels: dec.channels(),
-                source_duration: RationalDuration::from_millis(millis.max(100)),
+                source_duration,
             },
-            FrameCount::new(frames).map_err(|e| e.to_string())?,
+            frame_count,
             PreparedClipKind::Audio,
         ))
     }
@@ -1190,16 +1189,12 @@ impl AppController {
         path: &Path,
     ) -> Result<(AssetKind, FrameCount, PreparedClipKind), String> {
         let info = probe_media(path, BackendPreference::Auto).map_err(|e| e.to_string())?;
-        let dur_sec = info.duration_seconds.unwrap_or(2.0).max(0.1);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let millis = (dur_sec * 1_000.0).round() as u64;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let frames = (dur_sec * self.document.fps.as_f64()).ceil().max(1.0) as u64;
-        let frame_count = FrameCount::new(frames).map_err(|e| e.to_string())?;
+        let (source_duration, frame_count) =
+            quantize_source_duration_and_frames(info.duration_seconds, 2.0, self.document.fps)?;
         let default_fps = info
             .frame_rate_num
             .zip(info.frame_rate_den)
-            .and_then(|(n, d)| crate::core::time::FrameRate::new(n.max(1), d.max(1)).ok());
+            .and_then(|(n, d)| FrameRate::new(n.max(1), d.max(1)).ok());
         Ok((
             AssetKind::Video {
                 has_audio: info.has_audio,
@@ -1207,7 +1202,7 @@ impl AppController {
                 duration_frames: Some(frame_count),
                 width: info.width,
                 height: info.height,
-                source_duration: RationalDuration::from_millis(millis.max(100)),
+                source_duration,
             },
             frame_count,
             PreparedClipKind::Video {
@@ -1524,6 +1519,34 @@ fn format_drop_import_status(
     }
 }
 
+fn quantize_source_duration_and_frames(
+    duration_secs: Option<f64>,
+    default_secs: f64,
+    fps: FrameRate,
+) -> Result<(RationalDuration, FrameCount), String> {
+    let raw_sec = duration_secs
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(default_secs)
+        .max(0.1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let millis = (raw_sec * 1_000.0).round() as u64;
+    let initial_source = RationalDuration::from_millis(millis.max(100));
+
+    // ドキュメント検証 (`frames_to_project_seconds(frames, fps) <= source_duration`) を常に満たすよう切り捨て計算する
+    let scaled_num = u128::from(initial_source.numerator()) * u128::from(fps.numerator());
+    let scaled_den = u128::from(initial_source.denominator()) * u128::from(fps.denominator());
+    let floored_frames = u64::try_from(scaled_num / scaled_den.max(1)).unwrap_or(u64::MAX);
+
+    if floored_frames == 0 {
+        let min_source = frames_to_project_seconds(1, fps).map_err(|e| e.to_string())?;
+        let adjusted = initial_source.max(min_source);
+        Ok((adjusted, FrameCount::ONE))
+    } else {
+        let frame_count = FrameCount::new(floored_frames).map_err(|e| e.to_string())?;
+        Ok((initial_source, frame_count))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,6 +1580,33 @@ mod tests {
     fn write_test_png(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
         img.save(path)?;
+        Ok(())
+    }
+
+    fn write_test_wav_mono_i16(
+        path: &Path,
+        sample_rate_hz: u32,
+        sample_count: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_bytes = u32::try_from(sample_count * 2)?;
+        let riff_size = data_bytes + 36;
+        let byte_rate = sample_rate_hz * 2;
+        let mut buf = Vec::with_capacity(44 + usize::try_from(data_bytes)?);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&riff_size.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16_u32.to_le_bytes());
+        buf.extend_from_slice(&1_u16.to_le_bytes());
+        buf.extend_from_slice(&1_u16.to_le_bytes());
+        buf.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&2_u16.to_le_bytes());
+        buf.extend_from_slice(&16_u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_bytes.to_le_bytes());
+        buf.resize(44 + usize::try_from(data_bytes)?, 0);
+        std::fs::write(path, buf)?;
         Ok(())
     }
 
@@ -1728,6 +1778,50 @@ mod tests {
             .ok_or("Track 2 missing after locked drop")?;
         assert_eq!(layer2_after_locked.clips.len(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn quantize_source_duration_never_exceeds_asset_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (src, frames) =
+            quantize_source_duration_and_frames(Some(2.717), 2.0, FrameRate::FPS_60)?;
+        assert_eq!(src, RationalDuration::from_millis(2_717));
+        assert_eq!(frames.get(), 163);
+        assert!(frames_to_project_seconds(frames.get(), FrameRate::FPS_60)? <= src);
+
+        let (ntsc_src, ntsc_frames) =
+            quantize_source_duration_and_frames(Some(2.717), 2.0, FrameRate::FPS_29_97)?;
+        assert!(frames_to_project_seconds(ntsc_frames.get(), FrameRate::FPS_29_97)? <= ntsc_src);
+
+        let (fallback_src, fallback_frames) =
+            quantize_source_duration_and_frames(Some(f64::NAN), 2.0, FrameRate::FPS_60)?;
+        assert_eq!(fallback_src, RationalDuration::from_millis(2_000));
+        assert_eq!(fallback_frames.get(), 120);
+
+        let fps_1 = FrameRate::new(1, 1)?;
+        let (tiny_src, tiny_frames) = quantize_source_duration_and_frames(Some(0.1), 1.0, fps_1)?;
+        assert_eq!(tiny_frames.get(), 1);
+        assert!(frames_to_project_seconds(tiny_frames.get(), fps_1)? <= tiny_src);
+        Ok(())
+    }
+
+    #[test]
+    fn drop_fractional_duration_wav_2717ms_validates_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("dnd_2717ms")?;
+        let wav_path = temp.path().join("sample_2717ms.wav");
+        // 48_000 Hz * 2.717 s = 130_416 samples
+        write_test_wav_mono_i16(&wav_path, 48_000, 130_416)?;
+
+        let mut controller = AppController::new();
+        let added =
+            controller.import_media_files_at_drop(&[wav_path], None, Some(FrameIndex::ZERO))?;
+        assert_eq!(added.len(), 1);
+        controller.document.validate()?;
+        assert_eq!(controller.document.layers.len(), 1);
+        assert_eq!(controller.document.layers[0].clips.len(), 1);
+        assert_eq!(controller.document.layers[0].clips[0].duration.get(), 163);
         Ok(())
     }
 }
