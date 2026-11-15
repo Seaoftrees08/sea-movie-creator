@@ -2,10 +2,11 @@
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-15
-- **更新日**: 2026-11-15
+- **更新日**: 2026-11-16
 - **関連ドキュメント**:
-  - 要件メモ: [`initial-implementation/draft.md`](initial-implementation/draft.md)
-  - 初期実装計画: [`initial-implementation/PhaseA.md`](initial-implementation/PhaseA.md), [`initial-implementation/PhaseB.md`](initial-implementation/PhaseB.md), [`initial-implementation/PhaseC.md`](initial-implementation/PhaseC.md)
+  - 要件メモ: [`completed/initial-implementation/draft.md`](completed/initial-implementation/draft.md)
+  - 初期実装計画: [`completed/initial-implementation/PhaseA.md`](completed/initial-implementation/PhaseA.md), [`completed/initial-implementation/PhaseB.md`](completed/initial-implementation/PhaseB.md), [`completed/initial-implementation/PhaseC.md`](completed/initial-implementation/PhaseC.md)
+  - UI 大幅修正詳細設計書（AviUtl 準拠タイムライン・設定ダイアログ・プレビュー操作）: [`002-aviutl-ui-redesign/README.md`](002-aviutl-ui-redesign/README.md)
   - 将来機能設計: [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md)
   - 開発ルール: [`.github/copilot-instructions.md`](../.github/copilot-instructions.md)
 
@@ -34,7 +35,7 @@
 
 ### 2.1 1 ウィンドウ画面構成（UI 方針・GPUI 現実解）
 
-- **操作感**: AviUtl ライクな自由レイヤー配置・直感的なカット/ドラッグ操作とインスペクタ数値調整。
+- **操作感**: AviUtl ライクな自由レイヤー配置・直感的なカット/ドラッグ操作とインスペクタ数値調整（詳細 UI/UX 仕様は [`002-aviutl-ui-redesign/README.md`](002-aviutl-ui-redesign/README.md) を正とする）。
 - **ビジュアル・配色**: DaVinci Resolve / VS Code に近いダークテーマ基調・高コントラストかつ余白を抑えた情報密度。
 - **チャット UI**: VS Code の Chat / Copilot パネルに準拠したメッセージスレッド・編集差分（適用コマンド一覧）プレビュー・承認/取り消し操作。
 - **UI ウィジェット基盤とメニューバー方針**:
