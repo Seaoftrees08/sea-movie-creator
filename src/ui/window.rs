@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::AppMenuBar;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{
@@ -19,12 +19,13 @@ use gpui_kit::{
 
 use crate::core::ids::LayerId;
 use crate::core::time::{FrameCount, FrameIndex};
-use crate::timeline::document::{ClipKind, TimelineLengthMode};
+use crate::timeline::document::TimelineLengthMode;
 use crate::ui::ai_chat_panel::{
     AiProviderSelectItem, build_provider_select_items, provider_select_index,
 };
 use crate::ui::app_controller::{AppController, clamp_right_panel_width};
 use crate::ui::export_dialog::render_export_dialog_overlay;
+use crate::ui::inspector_panel::InspectorWidgetBank;
 use crate::ui::menu_bar::{
     CopySelectedClip, DeleteSelectedClip, DuplicateSelectedClip, ImportMedia, NewProject,
     OpenExportDialog, OpenProject, PasteAtPlayhead, QuitApp, RedoAction, SaveProject,
@@ -55,11 +56,8 @@ pub struct SeaEditorWindow {
     pub controller: AppController,
     menu_bar: Entity<AppMenuBar>,
     scrub_slider: Entity<SliderState>,
-    opacity_slider: Entity<SliderState>,
-    /// 数式 `f(t)` 編集用テキスト入力状態。
-    pub(crate) expr_input: Entity<InputState>,
-    /// 字幕本文編集用テキスト入力状態。
-    pub(crate) subtitle_text_input: Entity<InputState>,
+    /// 右インスペクタ全ウィジェット群。
+    pub(crate) inspector_widgets: InspectorWidgetBank,
     /// AI API / プロバイダ切り替えコンボボックス状態。
     pub(crate) ai_provider_select: Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄のテキスト入力状態。
@@ -74,7 +72,7 @@ pub struct SeaEditorWindow {
     #[allow(dead_code)]
     dynamic_input_sub: Option<Subscription>,
     sliders_dirty: bool,
-    syncing_widgets: bool,
+    pub(crate) syncing_widgets: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -101,17 +99,6 @@ impl SeaEditorWindow {
                 .step(0.5)
                 .default_value(0.0)
         });
-        let opacity_slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.0)
-                .max(1.0)
-                .step(0.05)
-                .default_value(1.0)
-        });
-        let expr_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("例: sin(p * pi) * 90"));
-        let subtitle_text_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("字幕テキストを入力..."));
         let initial_provider_idx = provider_select_index(&controller.ai_chat.selected_provider);
         let ai_provider_select = cx.new(|cx| {
             SelectState::new(
@@ -125,20 +112,18 @@ impl SeaEditorWindow {
             InputState::new(window, cx).placeholder("AI 編集指示を入力 (Enter で送信)...")
         });
 
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&scrub_slider, window, Self::on_scrub_slider),
-            cx.subscribe_in(&opacity_slider, window, Self::on_opacity_slider),
             cx.subscribe_in(&ai_provider_select, window, Self::on_ai_provider_select),
             cx.subscribe_in(&ai_chat_input, window, Self::on_ai_chat_input_event),
         ];
+        let inspector_widgets = InspectorWidgetBank::new(window, cx, &mut subscriptions);
 
         let mut this = Self {
             controller,
             menu_bar,
             scrub_slider,
-            opacity_slider,
-            expr_input,
-            subtitle_text_input,
+            inspector_widgets,
             ai_provider_select,
             ai_chat_input,
             timeline_scroll: VirtualListScrollHandle::new(),
@@ -294,40 +279,8 @@ impl SeaEditorWindow {
             }
         });
 
-        if let Some((_, clip)) = self.controller.selected_clip() {
-            let clip_owned = clip.clone();
-            let head = self.controller.clock.current_frame();
-            let inspector_synced = self.controller.inspector.sync_from_clip(
-                &self.controller.document,
-                &clip_owned,
-                head,
-            );
-            if inspector_synced {
-                let expr_text = self.controller.inspector.expr_draft.clone();
-                self.expr_input.update(cx, |input, cx| {
-                    input.set_value(&expr_text, window, cx);
-                });
-                let sub_text = self.controller.inspector.subtitle_text_draft.clone();
-                self.subtitle_text_input.update(cx, |input, cx| {
-                    input.set_value(&sub_text, window, cx);
-                });
-            }
-
-            let op_val = match &clip_owned.kind {
-                ClipKind::Video { visual, .. } | ClipKind::Image { visual, .. } => {
-                    visual.opacity.evaluate_constant_or_one()
-                }
-                ClipKind::Subtitle(sub) => sub.visual.opacity.evaluate_constant_or_one(),
-                ClipKind::Audio { .. } => 1.0,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let op_f32 = op_val.clamp(0.0, 1.0) as f32;
-            self.opacity_slider.update(cx, |slider, cx| {
-                if (slider.value().end() - op_f32).abs() > 0.005 {
-                    slider.set_value(op_f32, window, cx);
-                }
-            });
-        }
+        self.inspector_widgets
+            .sync_from_controller(&mut self.controller, window, cx);
         self.syncing_widgets = false;
     }
 
@@ -436,23 +389,6 @@ impl SeaEditorWindow {
         cx.notify();
     }
 
-    fn on_opacity_slider(
-        &mut self,
-        _: &Entity<SliderState>,
-        event: &SliderEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.syncing_widgets {
-            return;
-        }
-        let (SliderEvent::Change(val) | SliderEvent::Release(val)) = event;
-        let _ = self
-            .controller
-            .set_selected_clip_opacity(f64::from(val.end()));
-        cx.notify();
-    }
-
     fn on_new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
         self.controller.new_project();
         self.sync_sliders_now(window, cx);
@@ -544,19 +480,6 @@ impl SeaEditorWindow {
     }
 }
 
-trait AnimatedOpacityQuickHelper {
-    fn evaluate_constant_or_one(&self) -> f64;
-}
-
-impl AnimatedOpacityQuickHelper for crate::core::animation::AnimatedParameter {
-    fn evaluate_constant_or_one(&self) -> f64 {
-        match self {
-            Self::Constant { value } => *value,
-            _ => 1.0,
-        }
-    }
-}
-
 impl SeaEditorWindow {
     fn build_workspace_split(
         &mut self,
@@ -591,7 +514,25 @@ impl SeaEditorWindow {
                     )),
             );
 
+        let win_entity = cx.entity().clone();
         h_resizable("main-workspace-split")
+            .on_resize(move |state: &Entity<ResizableState>, _, cx| {
+                let sizes = state.read(cx).sizes();
+                if let Some(&right_px) = sizes.get(1) {
+                    let right_f32: f32 = right_px / px(1.0);
+                    win_entity.update(cx, |this, cx| {
+                        let clamped = clamp_right_panel_width(win_w, Some(right_f32));
+                        if this
+                            .controller
+                            .right_panel_width
+                            .is_none_or(|prev| (prev - clamped).abs() > 0.5)
+                        {
+                            this.controller.right_panel_width = Some(clamped);
+                            cx.notify();
+                        }
+                    });
+                }
+            })
             .child(resizable_panel().child(left_area))
             .child(
                 resizable_panel()
@@ -601,9 +542,7 @@ impl SeaEditorWindow {
                     .child(render_right_panel(
                         &self.controller,
                         RightPanelWidgets {
-                            opacity_slider: &self.opacity_slider,
-                            expr_input: &self.expr_input,
-                            subtitle_text_input: &self.subtitle_text_input,
+                            inspector_bank: &self.inspector_widgets,
                             ai_provider_select: &self.ai_provider_select,
                             ai_chat_input: &self.ai_chat_input,
                         },
@@ -698,7 +637,12 @@ impl Render for SeaEditorWindow {
 
         let root = Self::bind_actions(v_flex().size_full().relative().bg(theme.background), cx)
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
-                if this.controller.timeline_gesture.is_some()
+                if this.controller.trackbar_drag.is_some() {
+                    let mx: f32 = ev.position.x / px(1.0);
+                    this.controller.update_trackbar_drag(mx, ev.modifiers.shift);
+                    this.sliders_dirty = true;
+                    cx.notify();
+                } else if this.controller.timeline_gesture.is_some()
                     || this.controller.timeline_drag.is_some()
                 {
                     handle_timeline_window_mouse_move(this, ev, window, cx);
@@ -707,7 +651,13 @@ impl Render for SeaEditorWindow {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
-                    if this.controller.timeline_gesture.is_some()
+                    if this.controller.trackbar_drag.is_some() {
+                        if this.controller.finish_trackbar_drag().is_ok() {
+                            this.controller.inspector.invalidate_sync();
+                            this.sync_sliders_now(window, cx);
+                        }
+                        cx.notify();
+                    } else if this.controller.timeline_gesture.is_some()
                         || this.controller.timeline_drag.is_some()
                     {
                         handle_timeline_window_mouse_up(this, window, cx);
