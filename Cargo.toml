@@ -1,0 +1,37 @@
+[package]
+name = "sea-movie-creator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "AI-native lightweight movie editor built with Rust"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+unused = { level = "deny", priority = -1 }
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+unused_must_use = "deny"
+unreachable_code = "deny"
+deprecated = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+module_name_repetitions = "allow"

@@ -24,6 +24,8 @@ tmp/
 temp/
 
 # Build & Dependencies (add stack-specific entries as needed)
+/target/
+**/*.rs.bk
 node_modules/
 dist/
 build/
