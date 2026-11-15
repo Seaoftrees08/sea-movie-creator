@@ -2,6 +2,8 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
 
 # Editors / IDEs
 .vscode/*
@@ -10,22 +12,43 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+*~
 
 # Environment & Secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+*.crt
+credentials*.json
+service-account*.json
+secrets/
 
 # Logs & Temp
 *.log
 tmp/
 temp/
+*.tmp
+*.bak
 
-# Build & Dependencies (add stack-specific entries as needed)
+# Rust build artifacts
 /target/
 **/*.rs.bk
+*.pdb
+
+# Coverage / profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+/coverage/
+flamegraph.svg
+perf.data*
+
+# Other stacks (kept for tooling)
 node_modules/
 dist/
 build/
@@ -33,3 +56,27 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Media files (test footage / render outputs; do not commit large binaries)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.wav
+*.mp3
+*.flac
+*.aac
+*.m4a
+/output/
+/renders/
+# Allow small test fixtures explicitly if needed:
+# !tests/fixtures/**
+
+# AI model weights / caches
+*.onnx
+*.gguf
+*.safetensors
+*.ckpt
+*.bin
+/models/

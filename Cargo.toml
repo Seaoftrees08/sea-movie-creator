@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "AI-native lightweight movie editor built with Rust"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+gpui-kit = "0.9.1"
+image = "0.25"
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+smallvec = "1.13"
+
+[dev-dependencies]
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 
 [lints.rust]
 unsafe_code = "deny"
