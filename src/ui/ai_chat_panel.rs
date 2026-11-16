@@ -1,10 +1,11 @@
 //! VS Code 風 AI チャットパネル状態管理、非同期ストリーミングポーリング、差分適用/1クリック Undo UI。
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
@@ -48,9 +49,40 @@ pub struct PendingAiProposal {
     pub plan: AiEditPlan,
 }
 
+/// AI 編集プランの承認・適用モード。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AiApprovalMode {
+    /// 適用前に差分カードを確認し、「承認して適用」押下で反映する（既定）。
+    #[default]
+    Manual,
+    /// ドライラン検証を通過した編集プランを自動でタイムラインへ適用する（1 クリック Undo 可能）。
+    Autopilot,
+}
+
+impl AiApprovalMode {
+    /// UI セレクタに表示する短いモード名を返す。
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Autopilot => "Autopilot",
+        }
+    }
+
+    /// ドロップダウンメニュー内で表示する説明付きラベルを返す。
+    #[must_use]
+    pub const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual（承認して適用）",
+            Self::Autopilot => "Autopilot（検証後に自動適用）",
+        }
+    }
+}
+
 struct AiChatJobHandle {
     rx: mpsc::Receiver<AiStreamEvent>,
     prompt: String,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// API / プロバイダ切り替えコンボボックス用アイテム。
@@ -117,6 +149,8 @@ pub struct AiChatState {
     pub last_error: Option<String>,
     /// 直前の承認適用を 1 クリック Undo できるか。
     pub can_one_click_undo: bool,
+    /// 提案の適用方法 (`Manual` / `Autopilot`)。
+    pub approval_mode: AiApprovalMode,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
 }
@@ -148,6 +182,7 @@ impl Default for AiChatState {
             pending_proposal: None,
             last_error: None,
             can_one_click_undo: false,
+            approval_mode: AiApprovalMode::Manual,
             runtime_api_key: None,
             running_job: None,
         }
@@ -155,6 +190,11 @@ impl Default for AiChatState {
 }
 
 impl AiChatState {
+    /// 編集プランの承認モード (`Manual` / `Autopilot`) を切り替える。
+    pub const fn set_approval_mode(&mut self, mode: AiApprovalMode) {
+        self.approval_mode = mode;
+    }
+
     /// プロバイダ種別を切り替え、既定モデル・思考レベル・ベース URL を更新する。
     pub fn select_provider(&mut self, kind: AiProviderKind) {
         kind.preferred_default_model()
@@ -164,6 +204,11 @@ impl AiChatState {
             .clone_into(&mut self.custom_base_url);
         self.selected_provider = kind;
         self.last_error = None;
+    }
+
+    /// モデルを選択し、対応していれば `Medium` を標準選択（非対応時はモデル既定）とする。
+    pub fn select_model_default_medium(&mut self, model_id: &str) {
+        self.select_model(model_id, AiThinkingLevel::Medium);
     }
 
     /// モデルと思考レベルを同時に選択し、そのモデルで無効なレベルは自動補正する。
@@ -434,19 +479,47 @@ impl AppController {
 
         let provider = self.ai_chat.build_provider();
         let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel_flag);
         std::thread::spawn(move || {
             let mut forward = |evt: AiStreamEvent| {
-                let _ = tx.send(evt);
+                if !worker_cancel.load(Ordering::Acquire) {
+                    let _ = tx.send(evt);
+                }
             };
-            if let Err(err) = provider.send_streaming(&req, &mut forward) {
+            if let Err(err) = provider.send_streaming(&req, &mut forward)
+                && !worker_cancel.load(Ordering::Acquire)
+            {
                 let _ = tx.send(AiStreamEvent::Failed(format_ai_error(&err)));
             }
         });
         self.ai_chat.running_job = Some(AiChatJobHandle {
             rx,
             prompt: trimmed,
+            cancelled: cancel_flag,
         });
         Ok(())
+    }
+
+    /// 実行中の AI リクエストを中断し、再送信できる状態へ戻す（中断時 `true`）。
+    pub fn cancel_ai_prompt(&mut self) -> bool {
+        let Some(handle) = self.ai_chat.running_job.take() else {
+            return false;
+        };
+        handle.cancelled.store(true, Ordering::Release);
+        drop(handle);
+
+        let partial = self.ai_chat.streaming_preview.trim().to_owned();
+        self.ai_chat.streaming_preview.clear();
+        if !partial.is_empty() {
+            self.ai_chat.turns.push(AiChatTurn {
+                role: AiRole::Assistant,
+                text: format!("[停止済み]\n{partial}"),
+            });
+        }
+        "AI 生成を停止しました".clone_into(&mut self.ai_chat.status_banner);
+        "AI 生成を停止しました".clone_into(&mut self.status_message);
+        true
     }
 
     /// 非同期 AI チャット受信キューをポーリングし、UI 更新が必要なら `true` を返す。
@@ -457,14 +530,26 @@ impl AppController {
         let mut changed = false;
         let mut completed = None;
         let mut failed = None;
+        let mut disconnected = false;
 
-        while let Ok(evt) = handle.rx.try_recv() {
-            changed = true;
-            match evt {
-                AiStreamEvent::Status(msg) => self.ai_chat.status_banner = msg,
-                AiStreamEvent::DeltaText(delta) => self.ai_chat.streaming_preview.push_str(&delta),
-                AiStreamEvent::Completed(resp) => completed = Some(resp),
-                AiStreamEvent::Failed(err) => failed = Some(err),
+        loop {
+            match handle.rx.try_recv() {
+                Ok(evt) => {
+                    changed = true;
+                    match evt {
+                        AiStreamEvent::Status(msg) => self.ai_chat.status_banner = msg,
+                        AiStreamEvent::DeltaText(delta) => {
+                            self.ai_chat.streaming_preview.push_str(&delta);
+                        }
+                        AiStreamEvent::Completed(resp) => completed = Some(resp),
+                        AiStreamEvent::Failed(err) => failed = Some(err),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
 
@@ -475,6 +560,12 @@ impl AppController {
         if let Some(err_msg) = failed {
             self.ai_chat.last_error = Some(err_msg.clone());
             self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
+            return true;
+        }
+        if disconnected {
+            let err_msg = "AI プロバイダが応答を返さず終了しました".to_owned();
+            self.ai_chat.last_error = Some(err_msg.clone());
+            self.ai_chat.status_banner = err_msg;
             return true;
         }
 
@@ -493,19 +584,41 @@ impl AppController {
             .pending_proposal
             .take()
             .ok_or_else(|| "承認待ちの AI 提案はありません".to_owned())?;
-        if let Err(err) = self.dispatch_command(&proposal.plan.command) {
+        self.apply_ai_plan(&proposal.plan, false)
+    }
+
+    fn apply_ai_plan(&mut self, plan: &AiEditPlan, is_autopilot: bool) -> Result<(), String> {
+        if let Err(err) = self.dispatch_command(&plan.command) {
             let msg = format!("提案の適用に失敗しました: {err}");
             self.ai_chat.last_error = Some(msg.clone());
+            self.ai_chat.turns.push(AiChatTurn {
+                role: AiRole::Assistant,
+                text: msg.clone(),
+            });
+            self.ai_chat.status_banner.clone_from(&msg);
             return Err(msg);
         }
+        self.inspector.invalidate_sync();
         self.ai_chat.can_one_click_undo = true;
         self.ai_chat.streaming_preview.clear();
-        "AI 提案をタイムラインに適用しました（1クリック Undo 可能）"
-            .clone_into(&mut self.ai_chat.status_banner);
-        "AI 編集プランを適用しました".clone_into(&mut self.status_message);
+        let (banner, status, prefix) = if is_autopilot {
+            (
+                "Autopilot: AI 提案を自動適用しました（1クリック Undo 可能）",
+                "AI 編集プランを自動適用しました",
+                "[Autopilot 適用済み]",
+            )
+        } else {
+            (
+                "AI 提案をタイムラインに適用しました（1クリック Undo 可能）",
+                "AI 編集プランを適用しました",
+                "[適用済み]",
+            )
+        };
+        banner.clone_into(&mut self.ai_chat.status_banner);
+        status.clone_into(&mut self.status_message);
         self.ai_chat.turns.push(AiChatTurn {
             role: AiRole::Assistant,
-            text: format!("[適用済み] {}", proposal.plan.summary_lines.join(" / ")),
+            text: format!("{prefix} {}", plan.summary_lines.join(" / ")),
         });
         Ok(())
     }
@@ -526,6 +639,7 @@ impl AppController {
         if !self.undo()? {
             return Err("Undo できる履歴がありません".to_owned());
         }
+        self.inspector.invalidate_sync();
         self.ai_chat.can_one_click_undo = false;
         "直前の AI 編集を取り消しました（Undo）".clone_into(&mut self.ai_chat.status_banner);
         Ok(())
@@ -554,8 +668,12 @@ impl AppController {
                 Ok(())
             }
             Ok(plan) => {
-                let summary_preview = plan.summary_lines.join("\n");
                 self.ai_chat.last_error = None;
+                if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
+                    self.ai_chat.pending_proposal = None;
+                    return self.apply_ai_plan(&plan, true);
+                }
+                let summary_preview = plan.summary_lines.join("\n");
                 self.ai_chat.turns.push(AiChatTurn {
                     role: AiRole::Assistant,
                     text: summary_preview,
@@ -627,7 +745,7 @@ impl AiProvider for FailedPluginProvider {
 pub fn render_ai_chat_panel(
     controller: &AppController,
     ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
-    ai_chat_input: &Entity<InputState>,
+    ai_chat_input: &Entity<TextareaState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let chat = &controller.ai_chat;
@@ -890,6 +1008,8 @@ fn format_model_menu_label(
     if !preset.thinking_levels.is_empty() {
         let displayed_level = if is_selected {
             current_thinking
+        } else if preset.thinking_levels.contains(&AiThinkingLevel::Medium) {
+            AiThinkingLevel::Medium
         } else {
             preset.default_thinking
         };
@@ -915,63 +1035,29 @@ fn render_model_menu_button(
         .ghost()
         .xsmall()
         .label(trigger_label)
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, cx| {
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
             let mut popup = menu
                 .min_w(px(230.))
                 .max_h(px(340.))
                 .scrollable(true)
                 .check_side(Side::Right)
-                .label("Model");
+                .label("Model (クリックで Medium 標準選択)");
 
             for preset in catalog {
                 let is_selected = preset.id == current_model;
                 let row_label = format_model_menu_label(preset, is_selected, current_thinking);
                 let model_id = preset.id;
-
-                if preset.thinking_levels.is_empty() {
-                    let weak_item = weak.clone();
-                    let default_thinking = preset.default_thinking;
-                    popup =
-                        popup.item(PopupMenuItem::new(row_label).checked(is_selected).on_click(
-                            move |_, _, cx| {
-                                let _ = weak_item.update(cx, |view, cx| {
-                                    view.controller
-                                        .ai_chat
-                                        .select_model(model_id, default_thinking);
-                                    cx.notify();
-                                });
-                            },
-                        ));
-                } else {
-                    let weak_sub = weak.clone();
-                    let levels = preset.thinking_levels;
-                    popup = popup.submenu_with_icon(
-                        None,
-                        row_label,
-                        window,
-                        cx,
-                        move |sub, _window, _cx| {
-                            let mut sub_menu = sub.min_w(px(136.)).check_side(Side::Right);
-                            for &level in levels {
-                                let weak_level = weak_sub.clone();
-                                let checked = is_selected && current_thinking == level;
-                                sub_menu = sub_menu.item(
-                                    PopupMenuItem::new(level.display_label())
-                                        .checked(checked)
-                                        .on_click(move |_, _, cx| {
-                                            let _ = weak_level.update(cx, |view, cx| {
-                                                view.controller
-                                                    .ai_chat
-                                                    .select_model(model_id, level);
-                                                cx.notify();
-                                            });
-                                        }),
-                                );
-                            }
-                            sub_menu
-                        },
-                    );
-                }
+                let weak_item = weak.clone();
+                popup = popup.item(PopupMenuItem::new(row_label).checked(is_selected).on_click(
+                    move |_, _, cx| {
+                        let _ = weak_item.update(cx, |view, cx| {
+                            view.controller
+                                .ai_chat
+                                .select_model_default_medium(model_id);
+                            cx.notify();
+                        });
+                    },
+                ));
             }
             popup
         })
@@ -1017,17 +1103,46 @@ fn render_thinking_menu_button(
     )
 }
 
+fn render_approval_mode_menu_button(
+    chat: &AiChatState,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let weak = cx.weak_entity();
+    let current = chat.approval_mode;
+    let label = format!("{} ▾", current.display_label());
+
+    let btn = Button::new("ai-approval-mode-picker")
+        .ghost()
+        .xsmall()
+        .label(label);
+    btn.dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
+        let mut popup = menu
+            .min_w(px(210.))
+            .check_side(Side::Right)
+            .label("適用モード");
+        for mode in [AiApprovalMode::Manual, AiApprovalMode::Autopilot] {
+            let weak_item = weak.clone();
+            popup = popup.item(
+                PopupMenuItem::new(mode.menu_label())
+                    .checked(mode == current)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_item.update(cx, |view, cx| {
+                            view.controller.ai_chat.set_approval_mode(mode);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+        popup
+    })
+}
+
 fn render_prompt_composer(
     chat: &AiChatState,
-    ai_chat_input: &Entity<InputState>,
+    ai_chat_input: &Entity<TextareaState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let send_label = if chat.is_busy() {
-        "送信中..."
-    } else {
-        "送信"
-    };
 
     let mut selectors = h_flex()
         .items_center()
@@ -1039,6 +1154,27 @@ fn render_prompt_composer(
     if let Some(thinking_btn) = render_thinking_menu_button(chat, cx) {
         selectors = selectors.child(thinking_btn);
     }
+    selectors = selectors.child(render_approval_mode_menu_button(chat, cx));
+
+    let action_btn = if chat.is_busy() {
+        Button::new("ai-stop-btn")
+            .danger()
+            .xsmall()
+            .label("停止")
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.controller.cancel_ai_prompt() {
+                    cx.notify();
+                }
+            }))
+    } else {
+        Button::new("ai-send-btn")
+            .primary()
+            .xsmall()
+            .label("送信")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.submit_ai_chat_input(window, cx);
+            }))
+    };
 
     div().w_full().px_2().pb_2().pt_1().flex_shrink_0().child(
         v_flex()
@@ -1048,23 +1184,14 @@ fn render_prompt_composer(
             .border_1()
             .border_color(theme.border)
             .bg(theme.secondary)
-            .child(Input::new(ai_chat_input).appearance(false).small())
+            .child(Textarea::new(ai_chat_input).appearance(false).small())
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .gap_1()
                     .child(selectors)
-                    .child(
-                        Button::new("ai-send-btn")
-                            .primary()
-                            .xsmall()
-                            .disabled(chat.is_busy())
-                            .label(send_label)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_ai_chat_input(window, cx);
-                            })),
-                    ),
+                    .child(action_btn),
             ),
     )
 }
@@ -1072,10 +1199,12 @@ fn render_prompt_composer(
 #[cfg(test)]
 mod tests {
     use super::{
-        AiChatState, build_provider_select_items, format_model_menu_label, provider_safety_notice,
-        provider_select_index,
+        AiApprovalMode, AiChatState, build_provider_select_items, format_model_menu_label,
+        provider_safety_notice, provider_select_index,
     };
     use crate::ai::provider::{AiProviderKind, AiThinkingLevel};
+    use crate::ai::providers::mock::MockAiProvider;
+    use crate::ui::app_controller::AppController;
 
     #[test]
     fn antigravity_provider_exposes_safety_notice() {
@@ -1159,5 +1288,89 @@ mod tests {
         assert_eq!(chat.selected_provider, agy);
         assert_eq!(chat.model_name, "gemini-4-hydrogen");
         assert_eq!(chat.thinking_level, AiThinkingLevel::Extra);
+    }
+
+    #[test]
+    fn model_click_defaults_to_medium_when_supported() -> Result<(), Box<dyn std::error::Error>> {
+        let mut chat = AiChatState::default();
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        chat.select_provider(agy.clone());
+        chat.select_model_default_medium("gemini-4-hydrogen");
+        assert_eq!(chat.model_name, "gemini-4-hydrogen");
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Medium);
+
+        let hydrogen = agy
+            .model_preset("gemini-4-hydrogen")
+            .ok_or("hydrogen preset missing")?;
+        let unselected_label = format_model_menu_label(hydrogen, false, AiThinkingLevel::Extra);
+        assert!(unselected_label.contains("Medium"));
+
+        chat.select_model_default_medium("gemini-pro-orchestrator-g1-pro");
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
+        Ok(())
+    }
+
+    #[test]
+    fn autopilot_mode_applies_plan_automatically_and_supports_one_click_undo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut controller = AppController::new();
+        assert_eq!(controller.ai_chat.approval_mode, AiApprovalMode::Manual);
+        controller
+            .ai_chat
+            .set_approval_mode(AiApprovalMode::Autopilot);
+
+        let provider =
+            MockAiProvider::with_responses([r#"{"type":"add_layer","name":"AI Layer"}"#]);
+        controller.submit_ai_prompt_with_provider("新しいトラックを追加", &provider)?;
+
+        assert_eq!(controller.document.layers.len(), 1);
+        assert_eq!(controller.document.layers[0].name, "AI Layer");
+        assert!(controller.ai_chat.pending_proposal.is_none());
+        assert!(controller.ai_chat.can_one_click_undo);
+        assert!(
+            controller
+                .ai_chat
+                .turns
+                .last()
+                .is_some_and(|t| t.text.contains("[Autopilot 適用済み]"))
+        );
+
+        controller.undo_last_ai_plan()?;
+        assert_eq!(controller.document.layers.len(), 0);
+        assert!(!controller.ai_chat.can_one_click_undo);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_ai_prompt_clears_busy_state_and_records_partial_output() {
+        let mut controller = AppController::new();
+        assert!(!controller.cancel_ai_prompt());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        controller.ai_chat.running_job = Some(super::AiChatJobHandle {
+            rx,
+            prompt: "テスト指示".to_owned(),
+            cancelled: std::sync::Arc::clone(&cancelled),
+        });
+        controller.ai_chat.streaming_preview = "{\"type\":\"batch\"".to_owned();
+        assert!(controller.ai_chat.is_busy());
+
+        assert!(controller.cancel_ai_prompt());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!controller.ai_chat.is_busy());
+        assert_eq!(controller.ai_chat.streaming_preview, "");
+        assert_eq!(controller.ai_chat.status_banner, "AI 生成を停止しました");
+        assert!(
+            controller
+                .ai_chat
+                .turns
+                .last()
+                .is_some_and(|t| t.text.contains("[停止済み]"))
+        );
+        assert!(!controller.cancel_ai_prompt());
+        drop(tx);
     }
 }

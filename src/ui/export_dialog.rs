@@ -11,7 +11,7 @@ use gpui_kit::{
     ParentElement as _, Styled as _, Window, div, px, relative, rgba,
 };
 
-use crate::export::manifest::{ExportOptionField, ExportOptionKind, PresetSchema};
+use crate::export::manifest::{ExportOptionField, ExportOptionKind, OptionChoice, PresetSchema};
 use crate::export::registry::{DiscoveredPlugin, PluginRegistry};
 use crate::export::runner::{ExportJobHandle, ExportOutcome, ExportProgress};
 use crate::timeline::document::ProjectDocument;
@@ -71,6 +71,8 @@ pub struct ExportDialogState {
     pub output_path: String,
     /// プラグイン固有オプション上書き値マップ。
     pub option_overrides: serde_json::Map<String, serde_json::Value>,
+    /// 設定済みの有効な外部 `ffmpeg` パス（未設定／未検出時は `None`）。
+    pub configured_ffmpeg_path: Option<String>,
     /// 最後に受信した進捗状態。
     pub last_progress: Option<ExportProgress>,
     /// 直近のエラー表示。
@@ -92,16 +94,174 @@ impl Default for ExportResolutionPresetChoice {
 }
 
 impl ExportDialogState {
+    /// 設定済みの有効な外部 `ffmpeg` パスが存在し、外部 `ffmpeg` 機能を表示できるかどうか。
+    #[must_use]
+    pub const fn is_ffmpeg_enabled(&self) -> bool {
+        self.configured_ffmpeg_path.is_some()
+    }
+
+    /// プリセットが現在のツール設定下で表示可能かどうかを判定する。
+    #[must_use]
+    pub fn is_preset_visible(preset: &PresetSchema, ffmpeg_enabled: bool) -> bool {
+        if ffmpeg_enabled {
+            return true;
+        }
+        let is_ffmpeg_preset = preset.id.contains("external_ffmpeg")
+            || preset
+                .default_options
+                .get("backend_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("external_ffmpeg");
+        !is_ffmpeg_preset
+    }
+
+    /// プラグインが現在のツール設定下で表示可能かどうかを判定する。
+    #[must_use]
+    pub fn is_plugin_visible(plugin: &DiscoveredPlugin, ffmpeg_enabled: bool) -> bool {
+        if !ffmpeg_enabled && plugin.manifest.license.requires_external_binary {
+            return false;
+        }
+        plugin
+            .manifest
+            .presets
+            .iter()
+            .any(|preset| Self::is_preset_visible(preset, ffmpeg_enabled))
+    }
+
+    /// 詳細オプション項目が現在のツール設定下で表示可能かどうかを判定する。
+    #[must_use]
+    pub fn is_option_field_visible(field: &ExportOptionField, ffmpeg_enabled: bool) -> bool {
+        ffmpeg_enabled || field.key != "ffmpeg_path"
+    }
+
+    /// `Select` オプションから現在のツール設定下で利用可能な選択肢一覧を抽出する。
+    #[must_use]
+    pub fn filter_select_choices(
+        field: &ExportOptionField,
+        choices: &[OptionChoice],
+        ffmpeg_enabled: bool,
+    ) -> Vec<OptionChoice> {
+        choices
+            .iter()
+            .filter(|choice| {
+                ffmpeg_enabled || field.key != "backend_mode" || choice.value != "external_ffmpeg"
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// UI 表示用のプラグイン名称（未設定時は外部 ffmpeg 表記を除く）を返す。
+    #[must_use]
+    pub fn visible_plugin_display_name(plugin: &DiscoveredPlugin, ffmpeg_enabled: bool) -> String {
+        if ffmpeg_enabled {
+            plugin.manifest.name.clone()
+        } else {
+            plugin.manifest.name.replace(" / 外部 ffmpeg", "")
+        }
+    }
+
     /// 指定レジストリを読み込んでダイアログを開き、既定プリセット・出力名を同期する。
     pub fn open_with_registry(&mut self, registry: PluginRegistry, base_dir: Option<&Path>) {
+        self.open_with_registry_and_ffmpeg(registry, base_dir, None);
+    }
+
+    /// 指定レジストリと外部 `ffmpeg` 設定状態を読み込んでダイアログを開く。
+    pub fn open_with_registry_and_ffmpeg(
+        &mut self,
+        registry: PluginRegistry,
+        base_dir: Option<&Path>,
+        configured_ffmpeg_path: Option<String>,
+    ) {
         self.registry = registry;
+        self.configured_ffmpeg_path = configured_ffmpeg_path
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         self.is_open = true;
         self.last_error = None;
         self.last_completed = None;
-        if self.selected_plugin_idx >= self.registry.plugins().len() {
-            self.selected_plugin_idx = 0;
-        }
         self.selected_preset_idx = 0;
+        self.ensure_valid_visible_selection(base_dir);
+    }
+
+    /// 外部ツール設定ダイアログの変更を現在の書き出しダイアログ状態へ即時反映する。
+    pub fn apply_external_ffmpeg_path(
+        &mut self,
+        configured_ffmpeg_path: Option<String>,
+        base_dir: Option<&Path>,
+    ) {
+        self.configured_ffmpeg_path = configured_ffmpeg_path
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if self.running_job.is_some() {
+            return;
+        }
+        let was_external_selected = self
+            .option_overrides
+            .get("backend_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("external_ffmpeg");
+        let preset_hidden = self
+            .selected_preset()
+            .is_some_and(|p| !Self::is_preset_visible(p, self.is_ffmpeg_enabled()));
+        let plugin_hidden = self
+            .selected_plugin()
+            .is_some_and(|p| !Self::is_plugin_visible(p, self.is_ffmpeg_enabled()));
+
+        if plugin_hidden || preset_hidden || (!self.is_ffmpeg_enabled() && was_external_selected) {
+            self.ensure_valid_visible_selection(base_dir);
+        } else if let Some(path) = self.configured_ffmpeg_path.clone() {
+            if self.selected_plugin().is_some_and(|p| {
+                p.manifest
+                    .option_fields
+                    .iter()
+                    .any(|f| f.key == "ffmpeg_path")
+            }) {
+                self.option_overrides
+                    .insert("ffmpeg_path".to_owned(), serde_json::Value::String(path));
+            }
+        } else {
+            self.option_overrides.remove("ffmpeg_path");
+        }
+    }
+
+    fn first_visible_plugin_index(&self) -> Option<usize> {
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
+        self.registry
+            .plugins()
+            .iter()
+            .position(|p| Self::is_plugin_visible(p, ffmpeg_enabled))
+    }
+
+    fn first_visible_preset_index(&self, plugin_idx: usize) -> Option<usize> {
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
+        self.registry
+            .plugins()
+            .get(plugin_idx)?
+            .manifest
+            .presets
+            .iter()
+            .position(|preset| Self::is_preset_visible(preset, ffmpeg_enabled))
+    }
+
+    fn ensure_valid_visible_selection(&mut self, base_dir: Option<&Path>) {
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
+        let current_plugin_ok = self
+            .registry
+            .plugins()
+            .get(self.selected_plugin_idx)
+            .is_some_and(|p| Self::is_plugin_visible(p, ffmpeg_enabled));
+        if !current_plugin_ok {
+            self.selected_plugin_idx = self.first_visible_plugin_index().unwrap_or(0);
+        }
+
+        let current_preset_ok = self
+            .selected_preset()
+            .is_some_and(|p| Self::is_preset_visible(p, ffmpeg_enabled));
+        if !current_preset_ok {
+            self.selected_preset_idx = self
+                .first_visible_preset_index(self.selected_plugin_idx)
+                .unwrap_or(0);
+        }
         self.reset_options_from_preset();
         self.refresh_output_path_extension(base_dir);
     }
@@ -113,11 +273,15 @@ impl ExportDialogState {
         }
     }
 
-    /// プラグイン選択を変更し、先頭プリセットと出力拡張子を切り替える。
+    /// プラグイン選択を変更し、先頭の表示可能プリセットと出力拡張子を切り替える。
     pub fn select_plugin(&mut self, index: usize, base_dir: Option<&Path>) {
-        if index < self.registry.plugins().len() && self.running_job.is_none() {
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
+        if let Some(plugin) = self.registry.plugins().get(index)
+            && Self::is_plugin_visible(plugin, ffmpeg_enabled)
+            && self.running_job.is_none()
+        {
             self.selected_plugin_idx = index;
-            self.selected_preset_idx = 0;
+            self.selected_preset_idx = self.first_visible_preset_index(index).unwrap_or(0);
             self.reset_options_from_preset();
             self.refresh_output_path_extension(base_dir);
         }
@@ -125,8 +289,10 @@ impl ExportDialogState {
 
     /// プリセット選択を変更し、オプション初期値と出力拡張子を更新する。
     pub fn select_preset(&mut self, index: usize, base_dir: Option<&Path>) {
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
         if let Some(plugin) = self.selected_plugin()
-            && index < plugin.manifest.presets.len()
+            && let Some(preset) = plugin.manifest.presets.get(index)
+            && Self::is_preset_visible(preset, ffmpeg_enabled)
             && self.running_job.is_none()
         {
             self.selected_preset_idx = index;
@@ -235,8 +401,16 @@ impl ExportDialogState {
 
     fn reset_options_from_preset(&mut self) {
         self.option_overrides.clear();
+        let ffmpeg_enabled = self.is_ffmpeg_enabled();
+        let mut has_ffmpeg_field = false;
         if let Some(plugin) = self.selected_plugin().cloned() {
             for field in &plugin.manifest.option_fields {
+                if field.key == "ffmpeg_path" {
+                    has_ffmpeg_field = true;
+                }
+                if !Self::is_option_field_visible(field, ffmpeg_enabled) {
+                    continue;
+                }
                 if !field.default_value.is_null() {
                     self.option_overrides
                         .insert(field.key.clone(), field.default_value.clone());
@@ -249,8 +423,15 @@ impl ExportDialogState {
             .cloned()
         {
             for (k, v) in defaults {
+                if !ffmpeg_enabled && k == "ffmpeg_path" {
+                    continue;
+                }
                 self.option_overrides.insert(k, v);
             }
+        }
+        if has_ffmpeg_field && let Some(path) = self.configured_ffmpeg_path.clone() {
+            self.option_overrides
+                .insert("ffmpeg_path".to_owned(), serde_json::Value::String(path));
         }
     }
 
@@ -407,8 +588,24 @@ fn render_plugin_selector(
     cx: &mut Context<SeaEditorWindow>,
 ) -> Div {
     let theme = cx.theme().clone();
-    let plugins = state.registry.plugins();
-    if plugins.is_empty() {
+    let ffmpeg_enabled = state.is_ffmpeg_enabled();
+    let items: Vec<(usize, String)> = state
+        .registry
+        .plugins()
+        .iter()
+        .enumerate()
+        .filter(|(_, plugin)| ExportDialogState::is_plugin_visible(plugin, ffmpeg_enabled))
+        .map(|(idx, plugin)| {
+            let base_name = ExportDialogState::visible_plugin_display_name(plugin, ffmpeg_enabled);
+            let suffix = if plugin.executable_path.is_some() {
+                ""
+            } else {
+                " [未ビルド]"
+            };
+            (idx, format!("{base_name}{suffix}"))
+        })
+        .collect();
+    if items.is_empty() {
         return v_flex()
             .gap_1()
             .child(
@@ -430,25 +627,14 @@ fn render_plugin_selector(
     let current_label = state.selected_plugin().map_or_else(
         || "プラグインを選択...".to_owned(),
         |p| {
+            let base_name = ExportDialogState::visible_plugin_display_name(p, ffmpeg_enabled);
             if p.executable_path.is_some() {
-                p.manifest.name.clone()
+                base_name
             } else {
-                format!("{} [未ビルド]", p.manifest.name)
+                format!("{base_name} [未ビルド]")
             }
         },
     );
-    let items: Vec<(usize, String)> = plugins
-        .iter()
-        .enumerate()
-        .map(|(idx, plugin)| {
-            let suffix = if plugin.executable_path.is_some() {
-                ""
-            } else {
-                " [未ビルド]"
-            };
-            (idx, format!("{}{}", plugin.manifest.name, suffix))
-        })
-        .collect();
     let selected_idx = state.selected_plugin_idx;
     let weak = cx.weak_entity();
 
@@ -548,6 +734,7 @@ fn render_preset_selector(
         return div();
     };
     let theme = cx.theme().clone();
+    let ffmpeg_enabled = state.is_ffmpeg_enabled();
     let current_label = state.selected_preset().map_or_else(
         || "プリセットを選択...".to_owned(),
         |p| format!("{} (.{})", p.label, p.container_ext),
@@ -557,6 +744,7 @@ fn render_preset_selector(
         .presets
         .iter()
         .enumerate()
+        .filter(|(_, preset)| ExportDialogState::is_preset_visible(preset, ffmpeg_enabled))
         .map(|(idx, preset)| (idx, format!("{} (.{})", preset.label, preset.container_ext)))
         .collect();
     let selected_idx = state.selected_preset_idx;
@@ -806,7 +994,15 @@ fn render_option_fields(
     let Some(plugin) = state.selected_plugin() else {
         return div();
     };
-    if plugin.manifest.option_fields.is_empty() {
+    let ffmpeg_enabled = state.is_ffmpeg_enabled();
+    let visible_fields: Vec<(usize, &ExportOptionField)> = plugin
+        .manifest
+        .option_fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| ExportDialogState::is_option_field_visible(field, ffmpeg_enabled))
+        .collect();
+    if visible_fields.is_empty() && ffmpeg_enabled {
         return div();
     }
     let theme = cx.theme().clone();
@@ -818,14 +1014,40 @@ fn render_option_fields(
             .child("詳細オプション"),
     );
     let plugin_idx = state.selected_plugin_idx;
-    for (idx, field) in plugin.manifest.option_fields.iter().enumerate() {
+    for (idx, field) in visible_fields {
         box_div = box_div.child(render_single_option_field(
             plugin_idx * 64 + idx,
             field,
             merged.get(&field.key),
+            ffmpeg_enabled,
             is_busy,
             cx,
         ));
+    }
+    if !ffmpeg_enabled {
+        box_div = box_div.child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .pt_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("外部 ffmpeg CLI を使う書き出しは未設定のため非表示"),
+                )
+                .child(
+                    Button::new("exp-open-ext-tools-btn")
+                        .ghost()
+                        .xsmall()
+                        .disabled(is_busy)
+                        .label("外部 ffmpeg を設定...")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_external_tools_modal(window, cx);
+                        })),
+                ),
+        );
     }
     box_div
 }
@@ -834,6 +1056,7 @@ fn render_single_option_field(
     idx: usize,
     field: &ExportOptionField,
     current_val: Option<&serde_json::Value>,
+    ffmpeg_enabled: bool,
     is_busy: bool,
     cx: &mut Context<SeaEditorWindow>,
 ) -> Div {
@@ -843,19 +1066,51 @@ fn render_single_option_field(
             render_int_option(idx, field, (*min, *max), current_val, is_busy, cx)
         }
         ExportOptionKind::Select { choices } => {
-            render_select_option(idx, field, choices, current_val, is_busy, cx)
+            let filtered = ExportDialogState::filter_select_choices(field, choices, ffmpeg_enabled);
+            render_select_option(idx, field, &filtered, current_val, is_busy, cx)
         }
-        ExportOptionKind::String => {
-            let cur_str = current_val
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            h_flex()
-                .items_center()
-                .justify_between()
-                .child(div().text_xs().child(field.label.clone()))
-                .child(div().text_xs().child(cur_str.to_owned()))
-        }
+        ExportOptionKind::String => render_string_option(idx, field, current_val, is_busy, cx),
     }
+}
+
+fn render_string_option(
+    idx: usize,
+    field: &ExportOptionField,
+    current_val: Option<&serde_json::Value>,
+    is_busy: bool,
+    cx: &mut Context<SeaEditorWindow>,
+) -> Div {
+    let cur_str = current_val
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut row = h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(div().text_xs().flex_shrink_0().child(field.label.clone()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_middle()
+                .text_xs()
+                .child(cur_str.to_owned()),
+        );
+    if field.key == "ffmpeg_path" {
+        row = row.child(
+            Button::new(("exp-edit-ffmpeg-btn", idx))
+                .ghost()
+                .xsmall()
+                .disabled(is_busy)
+                .label("変更...")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_external_tools_modal(window, cx);
+                })),
+        );
+    }
+    row
 }
 
 fn render_bool_option(
@@ -1248,5 +1503,104 @@ mod tests {
         assert_eq!(compute_export_modal_bounds(1280.0, 720.0), (560.0, 620.0));
         assert_eq!(compute_export_modal_bounds(400.0, 400.0), (368.0, 352.0));
         assert_eq!(compute_export_modal_bounds(200.0, 200.0), (320.0, 240.0));
+    }
+
+    #[test]
+    fn external_ffmpeg_options_stay_hidden_until_configured_then_appear()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/export");
+        let registry = PluginRegistry::discover_in_dirs(&[export_dir]);
+        let h264_idx = registry
+            .plugins()
+            .iter()
+            .position(|p| p.manifest.id == "sea.export.h264")
+            .ok_or("h264 plugin missing")?;
+
+        let mut dialog = ExportDialogState::default();
+        dialog.open_with_registry_and_ffmpeg(registry, None, None);
+        assert!(!dialog.is_ffmpeg_enabled());
+
+        dialog.select_plugin(h264_idx, None);
+        let h264 = dialog
+            .selected_plugin()
+            .cloned()
+            .ok_or("h264 not selected")?;
+        assert!(!ExportDialogState::visible_plugin_display_name(&h264, false).contains("ffmpeg"));
+        let ext_preset_idx = h264
+            .manifest
+            .presets
+            .iter()
+            .position(|p| p.id == "h264_external_ffmpeg")
+            .ok_or("h264_external_ffmpeg preset missing")?;
+        assert!(!ExportDialogState::is_preset_visible(
+            &h264.manifest.presets[ext_preset_idx],
+            false
+        ));
+        // 無効状態では external_ffmpeg プリセットへの切替は無視される
+        dialog.select_preset(ext_preset_idx, None);
+        assert_ne!(
+            dialog.selected_preset().map(|p| p.id.as_str()),
+            Some("h264_external_ffmpeg")
+        );
+        assert!(dialog.merged_options().get("ffmpeg_path").is_none());
+
+        let backend_field = h264
+            .manifest
+            .option_fields
+            .iter()
+            .find(|f| f.key == "backend_mode")
+            .ok_or("backend_mode missing")?;
+        let ExportOptionKind::Select { choices } = &backend_field.kind else {
+            return Err("backend_mode is not Select".into());
+        };
+        assert!(
+            ExportDialogState::filter_select_choices(backend_field, choices, false)
+                .iter()
+                .all(|c| c.value != "external_ffmpeg")
+        );
+        let ffmpeg_field = h264
+            .manifest
+            .option_fields
+            .iter()
+            .find(|f| f.key == "ffmpeg_path")
+            .ok_or("ffmpeg_path field missing")?;
+        assert!(!ExportDialogState::is_option_field_visible(
+            ffmpeg_field,
+            false
+        ));
+
+        // ffmpeg 設定後は外部プリセット・選択肢・ffmpeg_path が解放される
+        dialog.apply_external_ffmpeg_path(Some("C:\\tools\\ffmpeg.exe".to_owned()), None);
+        assert!(dialog.is_ffmpeg_enabled());
+        assert!(ExportDialogState::is_option_field_visible(
+            ffmpeg_field,
+            true
+        ));
+        assert!(
+            ExportDialogState::filter_select_choices(backend_field, choices, true)
+                .iter()
+                .any(|c| c.value == "external_ffmpeg")
+        );
+        dialog.select_preset(ext_preset_idx, None);
+        assert_eq!(
+            dialog.selected_preset().map(|p| p.id.as_str()),
+            Some("h264_external_ffmpeg")
+        );
+        assert_eq!(
+            dialog
+                .merged_options()
+                .get("ffmpeg_path")
+                .and_then(serde_json::Value::as_str),
+            Some("C:\\tools\\ffmpeg.exe")
+        );
+
+        // 設定クリアで再び OS Media Foundation 側へ安全にフォールバックする
+        dialog.apply_external_ffmpeg_path(None, None);
+        assert!(!dialog.is_ffmpeg_enabled());
+        assert_ne!(
+            dialog.selected_preset().map(|p| p.id.as_str()),
+            Some("h264_external_ffmpeg")
+        );
+        Ok(())
     }
 }

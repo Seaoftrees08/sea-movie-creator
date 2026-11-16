@@ -66,6 +66,8 @@ actions!(
         ToggleFollowSelectedOnSeekAction,
         /// ショートカット設定モーダルを開く。
         OpenKeyConfigAction,
+        /// 外部ツール (`ffmpeg`) 設定モーダルを開く。
+        OpenExternalToolsAction,
         /// プレビュー枠・アンカー・ハンドル表示を切り替える。
         TogglePreviewGuidesAction,
         /// プレビューグリッド表示を切り替える。
@@ -378,6 +380,7 @@ fn build_settings_menu(state: MenuCheckState) -> Menu {
             )
             .checked(state.follow_selected_on_seek),
             MenuItem::separator(),
+            MenuItem::action("外部ツール (ffmpeg) 設定...", OpenExternalToolsAction),
             MenuItem::action("ショートカットキー設定...", OpenKeyConfigAction),
         ],
         disabled: false,

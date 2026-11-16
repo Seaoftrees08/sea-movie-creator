@@ -4,6 +4,7 @@
 //! `plugin.json` に基づいて発見される別プロセスプラグインへ共有メモリ IPC 経由で委譲する。
 
 pub mod cpu_fallback;
+pub mod external_tools;
 pub mod manifest;
 pub mod protocol;
 pub mod registry;

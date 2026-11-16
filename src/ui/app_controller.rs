@@ -237,6 +237,13 @@ pub struct TimelineContextClick {
     pub midpoint_effect_frame: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DropLayerStrategy<'a> {
+    Explicit(&'a LayerId),
+    ExistingOrCreateDefault,
+    AlwaysNewTrack,
+}
+
 /// プロジェクト編集・デコード・再生状態を一元保持するヘッドレスコントローラ。
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppController {
@@ -296,6 +303,8 @@ pub struct AppController {
     pub trackbar_drag: Option<crate::ui::inspector_panel::ActiveTrackBarDrag>,
     /// 動画書き出し設定モーダルダイアログ状態。
     pub export_dialog: crate::ui::export_dialog::ExportDialogState,
+    /// 外部ツール（ユーザー導入 `ffmpeg` CLI 等）設定。
+    pub external_tools: crate::export::external_tools::ExternalToolsConfig,
     /// 画面下部の最新ステータスメッセージ。
     pub status_message: String,
     /// GPUI 用 BGRA ダブルバッファ転送ブリッジ。
@@ -416,6 +425,7 @@ impl AppController {
             inspector: crate::ui::inspector_panel::InspectorState::default(),
             trackbar_drag: None,
             export_dialog: crate::ui::export_dialog::ExportDialogState::default(),
+            external_tools: crate::export::external_tools::ExternalToolsConfig::load_or_default(),
             status_message: "準備完了".to_owned(),
             surface_bridge: RenderImageSurfaceBridge::new(),
             has_media_offline_at_playhead: false,
@@ -557,14 +567,18 @@ impl AppController {
     ///
     /// ファイルが存在しない・未対応形式・コマンド実行エラー時。
     pub fn import_media_file(&mut self, path: &Path) -> Result<AssetId, String> {
-        let mut ids = self.import_media_files_at_drop(&[path.to_path_buf()], None, None)?;
+        let mut ids = self.import_media_batch(
+            &[path.to_path_buf()],
+            DropLayerStrategy::ExistingOrCreateDefault,
+            None,
+        )?;
         ids.pop()
             .ok_or_else(|| "取り込みアセット ID が生成されませんでした".to_owned())
     }
 
     /// タイムラインへのドラッグ＆ドロップで複数メディアファイルを取り込み、指定トラック・開始位置へ配置する。
     ///
-    /// - `target_layer_id` が `None` の場合は選択中または先頭レイヤーへ配置し、レイヤーが空なら `Track 1` を同時生成します。
+    /// - `target_layer_id` が `None` の場合は常に新しいトラック（`Track 1`, `Track 2`, ...）を生成して配置します。
     /// - `requested_start` が `None` の場合は対象レイヤー末尾へ追加し、`Some(frame)` の場合はスナップ判定のうえ
     ///   既存クリップと衝突しない最初の空き区間へ順に配置します。
     /// - 成功した全ファイルは 1 つの `EditCommand::Batch` として実行されるため、1 回の Undo で取り消せます。
@@ -578,12 +592,25 @@ impl AppController {
         target_layer_id: Option<&LayerId>,
         requested_start: Option<FrameIndex>,
     ) -> Result<Vec<AssetId>, String> {
+        let strategy = match target_layer_id {
+            Some(lid) => DropLayerStrategy::Explicit(lid),
+            None => DropLayerStrategy::AlwaysNewTrack,
+        };
+        self.import_media_batch(paths, strategy, requested_start)
+    }
+
+    fn import_media_batch(
+        &mut self,
+        paths: &[PathBuf],
+        strategy: DropLayerStrategy<'_>,
+        requested_start: Option<FrameIndex>,
+    ) -> Result<Vec<AssetId>, String> {
         if paths.is_empty() {
             return Err("ドロップされたファイルがありません".to_owned());
         }
 
         let (prepared, skipped_errors) = self.prepare_media_import_batch(paths)?;
-        let (layer_id, new_layer_cmd) = self.resolve_drop_target_layer(target_layer_id)?;
+        let (layer_id, new_layer_cmd) = self.resolve_drop_target_layer(strategy)?;
         let cursor_frame = self.resolve_drop_start_frame(&layer_id, requested_start);
         let (cmd, planned_assets) =
             self.build_drop_import_batch(&layer_id, new_layer_cmd, cursor_frame, &prepared)?;
@@ -1062,13 +1089,12 @@ impl AppController {
     ///
     /// コマンド実行失敗時。
     pub fn add_empty_layer(&mut self) -> Result<LayerId, String> {
-        let new_id =
-            LayerId::new(format!("layer-{}", self.next_seq())).map_err(|e| e.to_string())?;
-        let idx = self.document.layers.len() + 1;
+        let new_id = self.allocate_layer_id()?;
+        let name = self.next_unique_track_name();
         let cmd = EditCommand::AddLayer {
             temp_id: None,
             id: Some(new_id.clone()),
-            name: format!("Track {idx}"),
+            name,
             insert_index: None,
         };
         let _ = self.dispatch_command(&cmd)?;
@@ -2347,36 +2373,57 @@ impl AppController {
         }
     }
 
+    fn next_unique_track_name(&self) -> String {
+        let mut idx = self.document.layers.len().saturating_add(1);
+        loop {
+            let candidate = format!("Track {idx}");
+            if !self.document.layers.iter().any(|l| l.name == candidate) {
+                return candidate;
+            }
+            idx = idx.saturating_add(1);
+        }
+    }
+
     fn resolve_drop_target_layer(
         &mut self,
-        requested: Option<&LayerId>,
+        strategy: DropLayerStrategy<'_>,
     ) -> Result<(LayerId, Option<EditCommand>), String> {
-        if let Some(lid) = requested {
-            let layer = self
-                .document
-                .find_layer(lid)
-                .ok_or_else(|| format!("指定レイヤー `{lid}` が見つかりません"))?;
-            if layer.locked {
-                return Err(format!("トラック `{}` はロックされています", layer.name));
+        match strategy {
+            DropLayerStrategy::Explicit(lid) => {
+                let layer = self
+                    .document
+                    .find_layer(lid)
+                    .ok_or_else(|| format!("指定レイヤー `{lid}` が見つかりません"))?;
+                if layer.locked {
+                    return Err(format!("トラック `{}` はロックされています", layer.name));
+                }
+                Ok((lid.clone(), None))
             }
-            return Ok((lid.clone(), None));
+            DropLayerStrategy::ExistingOrCreateDefault => {
+                if let Some(lid) = &self.selected_layer_id
+                    && self.document.find_layer(lid).is_some_and(|l| !l.locked)
+                {
+                    return Ok((lid.clone(), None));
+                }
+                if let Some(unlocked) = self.document.layers.iter().find(|l| !l.locked) {
+                    return Ok((unlocked.id.clone(), None));
+                }
+                if let Some(first) = self.document.layers.first() {
+                    return Err(format!("トラック `{}` はロックされています", first.name));
+                }
+                self.build_new_drop_layer()
+            }
+            DropLayerStrategy::AlwaysNewTrack => self.build_new_drop_layer(),
         }
-        if let Some(lid) = &self.selected_layer_id
-            && self.document.find_layer(lid).is_some_and(|l| !l.locked)
-        {
-            return Ok((lid.clone(), None));
-        }
-        if let Some(unlocked) = self.document.layers.iter().find(|l| !l.locked) {
-            return Ok((unlocked.id.clone(), None));
-        }
-        if let Some(first) = self.document.layers.first() {
-            return Err(format!("トラック `{}` はロックされています", first.name));
-        }
+    }
+
+    fn build_new_drop_layer(&mut self) -> Result<(LayerId, Option<EditCommand>), String> {
         let new_id = self.allocate_layer_id()?;
+        let name = self.next_unique_track_name();
         let add_layer = EditCommand::AddLayer {
             temp_id: None,
             id: Some(new_id.clone()),
-            name: "Track 1".to_owned(),
+            name,
             insert_index: None,
         };
         Ok((new_id, Some(add_layer)))
@@ -2742,15 +2789,19 @@ impl AppController {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        self.export_dialog
-            .open_with_registry(registry, base_dir.as_deref());
+        let ffmpeg_path = self.external_tools.resolved_ffmpeg_path_string();
+        self.export_dialog.open_with_registry_and_ffmpeg(
+            registry,
+            base_dir.as_deref(),
+            ffmpeg_path,
+        );
     }
 
     /// 現在のダイアログ設定と `export_selection_only` に基づき [`crate::export::runner::ExportJobRequest`] を構築する。
     ///
     /// # Errors
     ///
-    /// プラグイン／プリセット未選択時。
+    /// プラグイン／プリセット未選択、または未設定の外部 `ffmpeg` が選択された場合。
     pub fn build_export_request(&self) -> Result<crate::export::runner::ExportJobRequest, String> {
         let plugin_id = self
             .export_dialog
@@ -2764,6 +2815,17 @@ impl AppController {
             .ok_or_else(|| "書き出しプリセットが選択されていません".to_owned())?;
         let (width, height) = self.export_dialog.resolution.0.dimensions(&self.document);
         let options = self.export_dialog.merged_options();
+        if options
+            .get("backend_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("external_ffmpeg")
+            && self.external_tools.resolved_ffmpeg_path().is_none()
+        {
+            return Err(
+                "外部 ffmpeg CLI が未設定です。「設定 → 外部ツール (ffmpeg) 設定...」で設定してください。"
+                    .to_owned(),
+            );
+        }
         let out_path = PathBuf::from(self.export_dialog.output_path.trim());
         let mut request = crate::export::runner::ExportJobRequest::for_document_range(
             &self.document,
@@ -3932,6 +3994,35 @@ mod tests {
         let uhd_h = std::num::NonZeroU32::new(2160).ok_or("non-zero")?;
         doc.resolution = crate::timeline::document::ProjectResolution::new(uhd_w, uhd_h);
         assert_eq!(preview_dimensions(&doc), (1920, 1080));
+        Ok(())
+    }
+
+    #[test]
+    fn drop_import_without_target_creates_new_track_when_tracks_exist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("dnd_new_track")?;
+        let img1 = temp.path().join("clip_a.png");
+        let img2 = temp.path().join("clip_b.png");
+        write_test_png(&img1)?;
+        write_test_png(&img2)?;
+
+        let mut controller = AppController::new();
+        controller.import_media_files_at_drop(&[img1], None, Some(FrameIndex::ZERO))?;
+        assert_eq!(controller.document.layers.len(), 1);
+        assert_eq!(controller.document.layers[0].name, "Track 1");
+
+        controller.import_media_files_at_drop(&[img2], None, Some(FrameIndex::new(45)))?;
+        assert_eq!(controller.document.layers.len(), 2);
+        assert_eq!(controller.document.layers[1].name, "Track 2");
+        assert_eq!(controller.document.layers[0].clips.len(), 1);
+        assert_eq!(controller.document.layers[1].clips.len(), 1);
+        assert_eq!(
+            controller.document.layers[1].clips[0].timeline_start,
+            FrameIndex::new(45)
+        );
+
+        assert!(controller.undo()?);
+        assert_eq!(controller.document.layers.len(), 1);
         Ok(())
     }
 }

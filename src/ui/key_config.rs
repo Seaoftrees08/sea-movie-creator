@@ -423,33 +423,7 @@ impl KeyConfig {
     /// 既定の設定保存パス (`%APPDATA%\sea-movie-creator\key_config.json` 等) を返す。
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        if let Ok(appdata) = std::env::var("APPDATA")
-            && !appdata.trim().is_empty()
-        {
-            return Some(
-                PathBuf::from(appdata)
-                    .join("sea-movie-creator")
-                    .join(KEY_CONFIG_FILE_NAME),
-            );
-        }
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-            && !xdg.trim().is_empty()
-        {
-            return Some(
-                PathBuf::from(xdg)
-                    .join("sea-movie-creator")
-                    .join(KEY_CONFIG_FILE_NAME),
-            );
-        }
-        std::env::var("HOME")
-            .ok()
-            .filter(|h| !h.trim().is_empty())
-            .map(|home| {
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("sea-movie-creator")
-                    .join(KEY_CONFIG_FILE_NAME)
-            })
+        crate::core::user_config_file_path(KEY_CONFIG_FILE_NAME)
     }
 
     /// 指定 JSON ファイルから設定を読み込み、未定義アクションは既定値で補完する。

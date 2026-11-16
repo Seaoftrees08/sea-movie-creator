@@ -312,7 +312,6 @@ fn render_track_lane(
     } else {
         rgba(0x1b1e_24ff)
     };
-    let drop_layer_id = layer.id.clone();
     let lane_lid_rc = layer.id.clone();
 
     let mut lane = div()
@@ -329,7 +328,7 @@ fn render_track_lane(
                 .border_color(rgba(0x38bd_f899))
         })
         .on_drop::<ExternalPaths>(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-            super::handle_timeline_file_drop(this, paths, Some(&drop_layer_id), window, cx);
+            super::handle_timeline_file_drop(this, paths, None, window, cx);
         }))
         .on_mouse_down(
             MouseButton::Left,

@@ -2,7 +2,7 @@
 
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
@@ -22,7 +22,7 @@ pub struct RightPanelWidgets<'a> {
     /// AI プロバイダ選択コンボボックス状態。
     pub ai_provider_select: &'a Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット入力ボックス状態。
-    pub ai_chat_input: &'a Entity<InputState>,
+    pub ai_chat_input: &'a Entity<TextareaState>,
 }
 
 /// 4 タブ（クリップ設定 / AI / レイヤー / プロジェクト情報）を切り替える右側パネルを構築する。

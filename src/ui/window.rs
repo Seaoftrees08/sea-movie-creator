@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::select::{SelectEvent, SelectState};
@@ -28,6 +28,9 @@ use crate::ui::app_controller::{
     AppController, PreviewZoomMode, RightPanelTab, clamp_right_panel_width,
 };
 use crate::ui::export_dialog::render_export_dialog_overlay;
+use crate::ui::external_tools_modal::{
+    ExternalToolsModalState, render_external_tools_modal_overlay,
+};
 use crate::ui::inspector_panel::InspectorWidgetBank;
 use crate::ui::key_config::{
     KeyConfig, KeyConfigModalState, keystroke_from_gpui_event, render_key_config_modal_overlay,
@@ -36,8 +39,8 @@ use crate::ui::menu_bar::{
     AddMidpointAction, AddSubtitleAction, ClearSelectionRange, CopyClip, CutClip, CycleClipAction,
     DeleteClip, DuplicateClip, ExportSelectionDialogAction, ImportMedia, MenuCheckState,
     NewProject, NextBoundaryAction, NudgeDownAction, NudgeLeftAction, NudgeRightAction,
-    NudgeUpAction, OpenExportDialog, OpenKeyConfigAction, OpenProject, PasteClip,
-    PrevBoundaryAction, PreviewOverlayChecks, PreviewZoom50Action, PreviewZoom100Action,
+    NudgeUpAction, OpenExportDialog, OpenExternalToolsAction, OpenKeyConfigAction, OpenProject,
+    PasteClip, PrevBoundaryAction, PreviewOverlayChecks, PreviewZoom50Action, PreviewZoom100Action,
     PreviewZoom200Action, PreviewZoomFitAction, QuitApp, RedoAction, RemoveMidpointAction,
     RotateLeftAction, RotateRightAction, SaveProject, SaveProjectAs, SeekEnd, SeekStart,
     SelectAllClips, SetSelectionEndAction, SetSelectionStartAction, SetTimelineLengthAction,
@@ -92,7 +95,7 @@ pub struct SeaEditorWindow {
     /// AI API / プロバイダ切り替えコンボボックス状態。
     pub(crate) ai_provider_select: Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄のテキスト入力状態。
-    pub(crate) ai_chat_input: Entity<InputState>,
+    pub(crate) ai_chat_input: Entity<TextareaState>,
     pub(crate) timeline_scroll: VirtualListScrollHandle,
     /// インライン名前変更中の対象レイヤー ID。
     pub(crate) layer_rename_target: Option<LayerId>,
@@ -100,6 +103,8 @@ pub struct SeaEditorWindow {
     pub(crate) layer_rename_input: Option<Entity<InputState>>,
     /// タイムライン長変更モーダルの状態（`None` なら閉）。
     pub(crate) timeline_length_modal: Option<TimelineLengthModalState>,
+    /// 外部ツール (`ffmpeg`) 設定モーダルの状態（`None` なら閉）。
+    pub(crate) external_tools_modal: Option<ExternalToolsModalState>,
     /// ショートカット設定モーダルの状態（`None` なら閉）。
     pub(crate) key_config_modal: Option<KeyConfigModalState>,
     /// 非テキスト編集領域（プレビュー・タイムライン等）用の既定フォーカスハンドル。
@@ -107,7 +112,8 @@ pub struct SeaEditorWindow {
     /// プレビュー領域ポインタ・パン修飾入力モード。
     pub(crate) preview_pointer_mode: PreviewPointerInputMode,
     #[allow(dead_code)]
-    dynamic_input_sub: Option<Subscription>,
+    pub(crate) dynamic_input_sub: Option<Subscription>,
+    pub(crate) modal_focus_subs: Vec<Subscription>,
     sliders_dirty: bool,
     pub(crate) syncing_widgets: bool,
     _subscriptions: Vec<Subscription>,
@@ -145,8 +151,12 @@ impl SeaEditorWindow {
                 cx,
             )
         });
-        let ai_chat_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("編集指示を入力 (Enter で送信)"));
+        let ai_chat_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 5)
+                .submit_on_enter(true)
+                .placeholder("編集指示を入力 (Enter で送信 / Shift+Enter で改行)")
+        });
 
         let mut subscriptions = vec![
             cx.subscribe_in(&scrub_slider, window, Self::on_scrub_slider),
@@ -184,10 +194,12 @@ impl SeaEditorWindow {
             layer_rename_target: None,
             layer_rename_input: None,
             timeline_length_modal: None,
+            external_tools_modal: None,
             key_config_modal: None,
             workspace_focus,
             preview_pointer_mode: PreviewPointerInputMode::Idle,
             dynamic_input_sub: None,
+            modal_focus_subs: Vec::new(),
             sliders_dirty: true,
             syncing_widgets: false,
             _subscriptions: subscriptions,
@@ -419,7 +431,7 @@ impl SeaEditorWindow {
 
     fn on_ai_chat_input_event(
         &mut self,
-        _: &Entity<InputState>,
+        _: &Entity<TextareaState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -579,6 +591,10 @@ impl SeaEditorWindow {
                 .timeline_length_modal
                 .as_ref()
                 .is_some_and(|m| m.input.read(cx).focus_handle(cx).is_focused(window))
+            || self
+                .external_tools_modal
+                .as_ref()
+                .is_some_and(|m| m.input.read(cx).focus_handle(cx).is_focused(window))
             || self.inspector_widgets.is_any_input_focused(window, cx)
     }
 
@@ -586,6 +602,7 @@ impl SeaEditorWindow {
     fn allow_editor_shortcut(&self, window: &Window, cx: &App) -> bool {
         !self.is_any_text_input_focused(window, cx)
             && self.key_config_modal.is_none()
+            && self.external_tools_modal.is_none()
             && !self.controller.export_dialog.is_open
             && self.timeline_length_modal.is_none()
     }
@@ -640,6 +657,9 @@ impl SeaEditorWindow {
             } else {
                 self.key_config_modal = None;
             }
+        } else if self.external_tools_modal.is_some() {
+            self.close_external_tools_modal();
+            window.focus(&self.workspace_focus, cx);
         } else if self.controller.export_dialog.is_open {
             self.controller.export_dialog.is_open = false;
         } else if self.timeline_length_modal.is_some() {
@@ -958,6 +978,11 @@ impl SeaEditorWindow {
             this.key_config_modal = Some(KeyConfigModalState::open(&this.controller.key_config));
             cx.notify();
         }))
+        .on_action(
+            cx.listener(|this, _: &OpenExternalToolsAction, window, cx| {
+                this.open_external_tools_modal(window, cx);
+            }),
+        )
         .on_action(cx.listener(|this, _: &TogglePreviewGuidesAction, _, cx| {
             this.controller.show_preview_guides = !this.controller.show_preview_guides;
             this.reload_app_menus(cx);
@@ -1259,6 +1284,13 @@ impl Render for SeaEditorWindow {
         if self.sliders_dirty {
             self.sync_sliders_now(window, cx);
         }
+        if let Some(modal) = &mut self.external_tools_modal
+            && let Some(val) = modal.pending_value.take()
+        {
+            modal
+                .input
+                .update(cx, |input, cx| input.set_value(&val, window, cx));
+        }
 
         let theme = cx.theme().clone();
         let key_ctx = if self.is_any_text_input_focused(window, cx) {
@@ -1299,7 +1331,9 @@ impl Render for SeaEditorWindow {
                     .child(workspace),
             );
 
-        if let Some(modal) = &self.key_config_modal {
+        if let Some(modal) = &self.external_tools_modal {
+            root.child(render_external_tools_modal_overlay(modal, cx))
+        } else if let Some(modal) = &self.key_config_modal {
             root.child(render_key_config_modal_overlay(modal, cx))
         } else if self.controller.export_dialog.is_open {
             root.child(render_export_dialog_overlay(
