@@ -386,16 +386,16 @@ fn summarize_other_command(
             if let Some(t) = temp_id {
                 targets.push(t.clone());
             }
-            summary_lines.push(format!("  + レイヤー追加 `{name}`"));
+            summary_lines.push(format!("  + トラック追加 `{name}`"));
         }
         EditCommand::RemoveLayer { layer_id } => {
             targets.push(layer_id.as_str().to_owned());
-            summary_lines.push(format!("  - レイヤー削除 {}", layer_id.as_str()));
+            summary_lines.push(format!("  - トラック削除 {}", layer_id.as_str()));
         }
         EditCommand::SetLayerFlags { layer_id, .. } => {
             let lbl = format_layer_ref(layer_id);
             targets.push(lbl.clone());
-            summary_lines.push(format!("  * レイヤー設定変更 {lbl}"));
+            summary_lines.push(format!("  * トラック設定変更 {lbl}"));
         }
         EditCommand::RemoveClip { clip_id } => {
             let lbl = format_clip_ref(clip_id);

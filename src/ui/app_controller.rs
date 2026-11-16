@@ -53,7 +53,7 @@ pub const MIN_RIGHT_PANEL_WIDTH: f32 = 240.0;
 pub const MIN_TIMELINE_PX_PER_FRAME: f32 = 0.2;
 /// タイムライン拡大率の最大値 (px / frame)。
 pub const MAX_TIMELINE_PX_PER_FRAME: f32 = 32.0;
-const DEFAULT_RIGHT_PANEL_RATIO: f32 = 0.2;
+const DEFAULT_RIGHT_PANEL_RATIO: f32 = 0.24;
 const MAX_RIGHT_PANEL_RATIO: f32 = 0.5;
 const MIN_TIMELINE_HEIGHT: f32 = 140.0;
 const DEFAULT_TIMELINE_RATIO: f32 = 0.3;
@@ -200,7 +200,7 @@ pub enum RightPanelTab {
     ProjectInfo,
 }
 
-/// ウィンドウ幅から右パネルの有効幅（初期値 1/5・クランプ済み）を計算する。
+/// ウィンドウ幅から右パネルの有効幅（初期値 約 1/4 = 24%・クランプ済み）を計算する。
 #[must_use]
 pub fn clamp_right_panel_width(window_width: f32, requested: Option<f32>) -> f32 {
     let safe_win = window_width.max(MIN_RIGHT_PANEL_WIDTH * 2.0);
@@ -277,6 +277,10 @@ pub struct AppController {
     pub timeline_scroll_y_px: f32,
     /// プレイヘッド移動時に再生位置上のクリップを選択追従させるか。
     pub follow_selected_on_seek: bool,
+    /// 再生停止・一時停止時に再生開始位置のフレームへ再生バーを戻すか。
+    pub return_playhead_to_start_on_stop: bool,
+    /// 直近の再生開始時に記録されたタイムラインフレーム位置。
+    playback_start_frame: Option<FrameIndex>,
     /// プレビュー選択枠・ハンドルを表示するか。
     pub show_preview_guides: bool,
     /// プレビュー中央補助グリッドを表示するか。
@@ -412,6 +416,8 @@ impl AppController {
             timeline_row_density: TimelineRowDensity::Medium,
             timeline_scroll_y_px: 0.0,
             follow_selected_on_seek: false,
+            return_playhead_to_start_on_stop: false,
+            playback_start_frame: None,
             show_preview_guides: true,
             show_preview_grid: false,
             show_preview_waveform: true,
@@ -1023,7 +1029,7 @@ impl AppController {
             .document
             .layers
             .get(target_layer_idx)
-            .ok_or_else(|| format!("レイヤーインデックス {target_layer_idx} が範囲外です"))?
+            .ok_or_else(|| format!("トラックインデックス {target_layer_idx} が範囲外です"))?
             .id
             .clone();
         let snap = crate::timeline::snap::snap_clip_move(
@@ -1160,7 +1166,7 @@ impl AppController {
         let current = self
             .document
             .find_layer(layer_id)
-            .ok_or_else(|| format!("レイヤー `{layer_id}` が見つかりません"))?
+            .ok_or_else(|| format!("トラック `{layer_id}` が見つかりません"))?
             .muted;
         let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
             layer_id: LayerRef::Id(layer_id.clone()),
@@ -1170,6 +1176,16 @@ impl AppController {
             locked: None,
         })?;
         Ok(())
+    }
+
+    /// 再生開始時のフレーム位置へ停止・一時停止時に戻るオプションを切り替える。
+    pub fn toggle_return_playhead_to_start_on_stop(&mut self) {
+        self.return_playhead_to_start_on_stop = !self.return_playhead_to_start_on_stop;
+        self.status_message = if self.return_playhead_to_start_on_stop {
+            "再生停止時に開始位置へ戻る: ON".to_owned()
+        } else {
+            "再生停止時に開始位置へ戻る: OFF".to_owned()
+        };
     }
 
     /// 再生を開始する。末尾にいる場合は先頭へ戻してから再生する。
@@ -1182,14 +1198,21 @@ impl AppController {
         if total > 0 && self.clock.current_frame().get() >= total {
             self.clock.seek_to_frame(FrameIndex::ZERO);
         }
+        self.playback_start_frame = Some(self.clock.current_frame());
         self.clock.set_playing(true);
         self.playback_state = PlaybackState::Playing;
         self.schedule_playback_prefetch(self.clock.current_frame());
     }
 
-    /// 現在位置で一時停止する。
+    /// 現在位置で一時停止する（開始位置へ戻る設定が有効な場合は開始フレームへ戻す）。
     pub fn pause(&mut self) {
         self.clock.set_playing(false);
+        if self.return_playhead_to_start_on_stop
+            && let Some(start) = self.playback_start_frame.take()
+        {
+            self.restore_playhead_to_frame(start, false);
+            return;
+        }
         self.playback_state = PlaybackState::Paused;
     }
 
@@ -1201,11 +1224,30 @@ impl AppController {
         }
     }
 
-    /// 再生を停止して先頭フレーム (`0`) へ戻す。
+    /// 再生を停止して先頭フレーム (`0`) へ戻す（開始位置へ戻る設定が有効かつ記録済みなら開始フレームへ戻す）。
     pub fn stop(&mut self) {
         self.clock.set_playing(false);
-        self.clock.seek_to_frame(FrameIndex::ZERO);
-        self.playback_state = PlaybackState::Stopped;
+        let target = if self.return_playhead_to_start_on_stop {
+            self.playback_start_frame.take().unwrap_or(FrameIndex::ZERO)
+        } else {
+            self.playback_start_frame = None;
+            FrameIndex::ZERO
+        };
+        self.restore_playhead_to_frame(target, true);
+    }
+
+    fn restore_playhead_to_frame(&mut self, frame: FrameIndex, stopped_state: bool) {
+        self.clock
+            .update_timeline_metrics(self.document.fps, self.document.total_duration_frames());
+        let max_frame = self.document.seek_upper_bound_frames();
+        let clamped = FrameIndex::new(frame.get().min(max_frame));
+        self.clock.seek_to_frame(clamped);
+        self.playback_state = if stopped_state || clamped.get() == 0 {
+            PlaybackState::Stopped
+        } else {
+            PlaybackState::Paused
+        };
+        self.apply_follow_selected_on_seek();
         self.video_prefetcher.invalidate_generation(false);
         self.rendered_frame_was_stale = false;
         self.dirty_preview = true;
@@ -1219,6 +1261,9 @@ impl AppController {
         let max_frame = self.document.seek_upper_bound_frames();
         let clamped = FrameIndex::new(frame.get().min(max_frame));
         let was_playing = self.playback_state == PlaybackState::Playing;
+        if !was_playing {
+            self.playback_start_frame = None;
+        }
         self.playback_state = PlaybackState::Seeking;
         self.video_prefetcher.invalidate_generation(false);
         self.rendered_frame_was_stale = false;
@@ -1882,9 +1927,9 @@ impl AppController {
             let layer = self
                 .document
                 .find_layer(lid)
-                .ok_or_else(|| format!("レイヤー `{lid}` が見つかりません"))?;
+                .ok_or_else(|| format!("トラック `{lid}` が見つかりません"))?;
             if layer.locked {
-                return Err(format!("レイヤー `{}` はロックされています", layer.name));
+                return Err(format!("トラック `{}` はロックされています", layer.name));
             }
             let occupied = layer.clips.iter().any(|c| {
                 let s = c.timeline_start.get();
@@ -2123,7 +2168,7 @@ impl AppController {
         let cur = self
             .document
             .find_layer(layer_id)
-            .ok_or_else(|| format!("レイヤー `{layer_id}` が見つかりません"))?
+            .ok_or_else(|| format!("トラック `{layer_id}` が見つかりません"))?
             .visible;
         let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
             layer_id: crate::core::ids::LayerRef::Id(layer_id.clone()),
@@ -2135,16 +2180,16 @@ impl AppController {
         Ok(())
     }
 
-    /// 指定レイヤーのロックフラグ (`locked`) を反転する。
+    /// 指定トラックのロックフラグ (`locked`) を反転する。
     ///
     /// # Errors
     ///
-    /// レイヤーが存在しない場合。
+    /// トラックが存在しない場合。
     pub fn toggle_layer_locked(&mut self, layer_id: &LayerId) -> Result<(), String> {
         let cur = self
             .document
             .find_layer(layer_id)
-            .ok_or_else(|| format!("レイヤー `{layer_id}` が見つかりません"))?
+            .ok_or_else(|| format!("トラック `{layer_id}` が見つかりません"))?
             .locked;
         let _ = self.dispatch_command(&EditCommand::SetLayerFlags {
             layer_id: crate::core::ids::LayerRef::Id(layer_id.clone()),
@@ -2393,7 +2438,7 @@ impl AppController {
                 let layer = self
                     .document
                     .find_layer(lid)
-                    .ok_or_else(|| format!("指定レイヤー `{lid}` が見つかりません"))?;
+                    .ok_or_else(|| format!("指定トラック `{lid}` が見つかりません"))?;
                 if layer.locked {
                     return Err(format!("トラック `{}` はロックされています", layer.name));
                 }
@@ -3714,10 +3759,10 @@ mod tests {
     }
 
     #[test]
-    fn right_panel_width_uses_one_fifth_default_and_clamps_bounds() {
-        // 1280px ウィンドウでの初期幅 = 1280 * 0.2 = 256px
+    fn right_panel_width_uses_quarter_minus_default_and_clamps_bounds() {
+        // 1280px ウィンドウでの初期幅 = 1280 * 0.24 = 307.2px（画面の 1/4 より少し小さい幅）
         let default_w = clamp_right_panel_width(1280.0, None);
-        assert!((default_w - 256.0).abs() < 1e-4);
+        assert!((default_w - 307.2).abs() < 1e-4);
 
         // 下限 240px・上限 50% (640px) でクランプ
         assert!((clamp_right_panel_width(1280.0, Some(50.0)) - 240.0).abs() < 1e-4);
@@ -4023,6 +4068,41 @@ mod tests {
 
         assert!(controller.undo()?);
         assert_eq!(controller.document.layers.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn return_playhead_to_start_on_stop_restores_start_position_on_pause_and_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("return_start_stop")?;
+        let img = temp.path().join("frame.png");
+        write_test_png(&img)?;
+
+        let mut controller = AppController::new();
+        controller.import_media_file(&img)?;
+
+        controller.seek_to_frame(FrameIndex::new(45));
+        assert!(!controller.return_playhead_to_start_on_stop);
+        controller.play();
+        controller.tick_playback(0.5); // +30f -> 75f
+        assert_eq!(controller.clock.current_frame(), FrameIndex::new(75));
+        controller.pause();
+        assert_eq!(controller.clock.current_frame(), FrameIndex::new(75));
+
+        controller.toggle_return_playhead_to_start_on_stop();
+        assert!(controller.return_playhead_to_start_on_stop);
+        controller.play();
+        controller.tick_playback(0.5); // 75f -> 105f
+        assert_eq!(controller.clock.current_frame(), FrameIndex::new(105));
+        controller.pause();
+        assert_eq!(controller.clock.current_frame(), FrameIndex::new(75));
+
+        controller.seek_to_frame(FrameIndex::new(30));
+        controller.play();
+        controller.tick_playback(0.5); // 30f -> 60f
+        controller.stop();
+        assert_eq!(controller.clock.current_frame(), FrameIndex::new(30));
+        assert_eq!(controller.playback_state, PlaybackState::Stopped);
         Ok(())
     }
 }

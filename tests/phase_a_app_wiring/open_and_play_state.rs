@@ -298,8 +298,8 @@ fn reopen_after_deleting_asset_marks_missing_and_toggles_media_offline_flag()
     reopened.seek_to_frame(FrameIndex::new(valid_start.get() + 10));
     assert!(!reopened.has_media_offline_at_playhead);
 
-    // 1/5 右パネル幅とタイムライン高さのレイアウトクランプ境界も確認
-    assert!((clamp_right_panel_width(1920.0, None) - 384.0).abs() < 1e-4);
+    // 右パネル初期幅（約 1/4 = 24%）とタイムライン高さのレイアウトクランプ境界も確認
+    assert!((clamp_right_panel_width(1920.0, None) - 460.8).abs() < 1e-4);
     let timeline_h = clamp_timeline_height(1000.0, None);
     assert!((140.0..=650.0).contains(&timeline_h));
     Ok(())

@@ -48,8 +48,9 @@ use crate::ui::menu_bar::{
     ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction,
     StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction,
     TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause,
-    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction, UndoAction,
-    apply_key_config_bindings, setup_menus, update_app_menus,
+    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction,
+    ToggleReturnToStartOnStopAction, UndoAction, apply_key_config_bindings, setup_menus,
+    update_app_menus,
 };
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
@@ -244,7 +245,7 @@ impl SeaEditorWindow {
             if !trimmed.is_empty()
                 && let Err(err) = self.controller.rename_layer(&layer_id, trimmed)
             {
-                self.controller.status_message = format!("レイヤー名変更失敗: {err}");
+                self.controller.status_message = format!("トラック名変更失敗: {err}");
             }
         }
         self.layer_rename_input = None;
@@ -436,8 +437,14 @@ impl SeaEditorWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-            self.submit_ai_chat_input(window, cx);
+        match event {
+            InputEvent::PressEnter { shift: false, .. } => {
+                self.submit_ai_chat_input(window, cx);
+            }
+            InputEvent::Change => {
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -616,6 +623,7 @@ impl SeaEditorWindow {
                 waveform: self.controller.show_preview_waveform,
             },
             follow_selected_on_seek: self.controller.follow_selected_on_seek,
+            return_to_start_on_stop: self.controller.return_playhead_to_start_on_stop,
             preview_zoom: self.controller.preview_zoom,
             right_tab: self.controller.right_tab,
         };
@@ -974,6 +982,13 @@ impl SeaEditorWindow {
                 cx.notify();
             }),
         )
+        .on_action(
+            cx.listener(|this, _: &ToggleReturnToStartOnStopAction, _, cx| {
+                this.controller.toggle_return_playhead_to_start_on_stop();
+                this.reload_app_menus(cx);
+                cx.notify();
+            }),
+        )
         .on_action(cx.listener(|this, _: &OpenKeyConfigAction, _, cx| {
             this.key_config_modal = Some(KeyConfigModalState::open(&this.controller.key_config));
             cx.notify();
@@ -1053,88 +1068,95 @@ impl SeaEditorWindow {
     }
 
     fn bind_playback_and_canvas_actions(root: Div, cx: &mut Context<Self>) -> Div {
-        root.on_action(cx.listener(|this, _: &TogglePlayPause, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.toggle_play_pause();
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &StopPlaybackAction, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.stop();
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &SeekStart, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.seek_to_frame(FrameIndex::ZERO);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &SeekEnd, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.seek_to_end();
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &StepBackOneFrame, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.step_frames(-1);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &StepForwardOneFrame, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.step_frames(1);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &StepBackHalfSecAction, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.step_half_second(false);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(
-            cx.listener(|this, _: &StepForwardHalfSecAction, window, cx| {
+        let bound = root
+            .on_action(cx.listener(|this, _: &TogglePlayPause, window, cx| {
                 if !this.allow_editor_shortcut(window, cx) {
                     return;
                 }
-                this.controller.step_half_second(true);
+                this.controller.toggle_play_pause();
+                this.mark_sliders_dirty();
                 this.sync_sliders_now(window, cx);
                 cx.notify();
-            }),
-        )
-        .on_action(cx.listener(|this, _: &PrevBoundaryAction, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.jump_to_adjacent_boundary_or_midpoint(false);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &NextBoundaryAction, window, cx| {
-            if !this.allow_editor_shortcut(window, cx) {
-                return;
-            }
-            this.controller.jump_to_adjacent_boundary_or_midpoint(true);
-            this.sync_sliders_now(window, cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &NudgeLeftAction, window, cx| {
+            }))
+            .on_action(cx.listener(|this, _: &StopPlaybackAction, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.stop();
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SeekStart, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.seek_to_frame(FrameIndex::ZERO);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SeekEnd, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.seek_to_end();
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &StepBackOneFrame, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.step_frames(-1);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &StepForwardOneFrame, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.step_frames(1);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &StepBackHalfSecAction, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.step_half_second(false);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &StepForwardHalfSecAction, window, cx| {
+                    if !this.allow_editor_shortcut(window, cx) {
+                        return;
+                    }
+                    this.controller.step_half_second(true);
+                    this.sync_sliders_now(window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(|this, _: &PrevBoundaryAction, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.jump_to_adjacent_boundary_or_midpoint(false);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NextBoundaryAction, window, cx| {
+                if !this.allow_editor_shortcut(window, cx) {
+                    return;
+                }
+                this.controller.jump_to_adjacent_boundary_or_midpoint(true);
+                this.sync_sliders_now(window, cx);
+                cx.notify();
+            }));
+        Self::bind_canvas_nudge_actions(bound, cx)
+    }
+
+    fn bind_canvas_nudge_actions(root: Div, cx: &mut Context<Self>) -> Div {
+        root.on_action(cx.listener(|this, _: &NudgeLeftAction, window, cx| {
             Self::dispatch_nudge_xy(this, -1.0, 0.0, window, cx);
         }))
         .on_action(cx.listener(|this, _: &NudgeRightAction, window, cx| {

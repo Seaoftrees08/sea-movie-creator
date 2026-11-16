@@ -42,7 +42,7 @@ pub fn render_right_panel(
     let tabs = [
         (clip_tab_label.as_str(), RightPanelTab::ClipInspector),
         ("AIチャット", RightPanelTab::AiChat),
-        ("レイヤー", RightPanelTab::LayerList),
+        ("トラック", RightPanelTab::LayerList),
         ("プロジェクト", RightPanelTab::ProjectInfo),
     ];
 
@@ -160,7 +160,7 @@ fn render_layers_tab(
                         .ghost()
                         .small()
                         .label(format!(
-                            "L{} {} ({})",
+                            "T{} {} ({})",
                             idx + 1,
                             layer.name,
                             layer.clips.len()
@@ -246,7 +246,7 @@ fn render_project_tab(
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(format!(
-                    "レイヤー: {} / 素材: {} / 総尺: {length_desc}",
+                    "トラック: {} / 素材: {} / 総尺: {length_desc}",
                     doc.layers.len(),
                     doc.assets.len(),
                 )),

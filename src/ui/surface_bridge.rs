@@ -421,8 +421,10 @@ fn blit_scaled_layer(
 
     let drawn_w = (f64::from(src.width) * fit_scale * visual.scale_x.abs()).max(1.0);
     let drawn_h = (f64::from(src.height) * fit_scale * visual.scale_y.abs()).max(1.0);
-    let center_x = f64::from(dst.width) * 0.5 + visual.x * scale_canvas_x;
-    let center_y = f64::from(dst.height) * 0.5 + visual.y * scale_canvas_y;
+    let center_x =
+        f64::from(dst.width) * 0.5 + (visual.x - visual.scale_x * visual.anchor_x) * scale_canvas_x;
+    let center_y = f64::from(dst.height) * 0.5
+        + (visual.y - visual.scale_y * visual.anchor_y) * scale_canvas_y;
 
     let min_x = (center_x - drawn_w * 0.5).floor().max(0.0) as u32;
     let max_x = (center_x + drawn_w * 0.5).ceil().min(f64::from(dst.width)) as u32;

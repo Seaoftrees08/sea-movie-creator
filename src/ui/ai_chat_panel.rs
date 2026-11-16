@@ -11,10 +11,11 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
+    Anchor, Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
+    div, px,
 };
 
-use crate::ai::context_builder::build_ai_request;
+use crate::ai::context_builder::{AiSelectionContext, build_ai_request_with_attachments};
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::plugin_host::AiPluginRegistry;
 use crate::ai::provider::{
@@ -26,6 +27,8 @@ use crate::ai::providers::credentials::resolve_api_key;
 use crate::ai::providers::gemini::{GeminiConfig, GeminiProvider};
 use crate::ai::providers::mock::MockAiProvider;
 use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::core::ids::ClipId;
+use crate::timeline::document::ProjectDocument;
 use crate::ui::app_controller::AppController;
 use crate::ui::window::SeaEditorWindow;
 
@@ -151,6 +154,8 @@ pub struct AiChatState {
     pub can_one_click_undo: bool,
     /// 提案の適用方法 (`Manual` / `Autopilot`)。
     pub approval_mode: AiApprovalMode,
+    /// コンポーザへ添付されたタイムラインクリップ ID 一覧。
+    pub attached_clip_ids: Vec<ClipId>,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
 }
@@ -183,6 +188,7 @@ impl Default for AiChatState {
             last_error: None,
             can_one_click_undo: false,
             approval_mode: AiApprovalMode::Manual,
+            attached_clip_ids: Vec::new(),
             runtime_api_key: None,
             running_job: None,
         }
@@ -190,6 +196,28 @@ impl Default for AiChatState {
 }
 
 impl AiChatState {
+    /// タイムラインクリップを添付一覧へ追加する（重複は無視）。
+    pub fn attach_clip(&mut self, clip_id: ClipId) {
+        if !self.attached_clip_ids.contains(&clip_id) {
+            self.attached_clip_ids.push(clip_id);
+        }
+    }
+
+    /// 添付済みのクリップを一覧から外す。
+    pub fn detach_clip(&mut self, clip_id: &ClipId) {
+        self.attached_clip_ids.retain(|id| id != clip_id);
+    }
+
+    /// 添付クリップ一覧をすべて解除する。
+    pub fn clear_attachments(&mut self) {
+        self.attached_clip_ids.clear();
+    }
+
+    /// 現在ドキュメント上に存在しない添付クリップ ID を整理する。
+    pub fn prune_attachments(&mut self, doc: &ProjectDocument) {
+        self.attached_clip_ids
+            .retain(|cid| doc.find_clip(cid).is_some());
+    }
     /// 編集プランの承認モード (`Manual` / `Autopilot`) を切り替える。
     pub const fn set_approval_mode(&mut self, mode: AiApprovalMode) {
         self.approval_mode = mode;
@@ -302,6 +330,7 @@ impl AiChatState {
         self.pending_proposal = None;
         self.last_error = None;
         self.can_one_click_undo = false;
+        self.attached_clip_ids.clear();
         "自然言語で編集指示を入力してください（適用前に差分を確認できます）"
             .clone_into(&mut self.status_banner);
     }
@@ -386,6 +415,51 @@ impl AiChatState {
 }
 
 impl AppController {
+    fn prepare_ai_request_and_turn(&mut self, trimmed: &str) -> Result<AiRequest, String> {
+        self.ai_chat.prune_attachments(&self.document);
+        let attached_ids = self.ai_chat.attached_clip_ids.clone();
+        let attached_labels: Vec<String> = attached_ids
+            .iter()
+            .filter_map(|cid| {
+                self.document.find_clip(cid).map(|(_, clip)| {
+                    let s = clip.timeline_start.get();
+                    let e = s.saturating_add(clip.duration.get());
+                    format!("{} ({s}..{e}f)", clip.name)
+                })
+            })
+            .collect();
+
+        let history = self.ai_chat.recent_history();
+        let req = build_ai_request_with_attachments(
+            &self.document,
+            self.clock.current_frame(),
+            AiSelectionContext {
+                selected_clip: self.selected_clip_id.as_ref(),
+                selected_layer: self.selected_layer_id.as_ref(),
+                attached_clips: &attached_ids,
+            },
+            &history,
+            trimmed,
+        )
+        .map_err(|err| err.to_string())?;
+
+        let display_turn = if attached_labels.is_empty() {
+            trimmed.to_owned()
+        } else {
+            format!("[添付: {}]\n{trimmed}", attached_labels.join(", "))
+        };
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::User,
+            text: display_turn,
+        });
+        self.ai_chat.attached_clip_ids.clear();
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.last_error = None;
+        self.ai_chat.pending_proposal = None;
+        self.ai_chat.can_one_click_undo = false;
+        Ok(req)
+    }
+
     /// 指定 [`AiProvider`] を使って同期的に AI 編集案を取得し、ドライラン検証済み提案カードとして保持する。
     ///
     /// # Errors
@@ -400,26 +474,7 @@ impl AppController {
         if trimmed.is_empty() {
             return Err("AI への指示文が空です".to_owned());
         }
-
-        let history = self.ai_chat.recent_history();
-        let req = build_ai_request(
-            &self.document,
-            self.clock.current_frame(),
-            self.selected_clip_id.as_ref(),
-            self.selected_layer_id.as_ref(),
-            &history,
-            trimmed,
-        )
-        .map_err(|err| err.to_string())?;
-
-        self.ai_chat.turns.push(AiChatTurn {
-            role: AiRole::User,
-            text: trimmed.to_owned(),
-        });
-        self.ai_chat.streaming_preview.clear();
-        self.ai_chat.last_error = None;
-        self.ai_chat.pending_proposal = None;
-        self.ai_chat.can_one_click_undo = false;
+        let req = self.prepare_ai_request_and_turn(trimmed)?;
 
         let mut streamed_buf = String::new();
         let mut status_buf = String::new();
@@ -456,25 +511,7 @@ impl AppController {
         if trimmed.is_empty() {
             return Err("AI への指示文が空です".to_owned());
         }
-        let history = self.ai_chat.recent_history();
-        let req = build_ai_request(
-            &self.document,
-            self.clock.current_frame(),
-            self.selected_clip_id.as_ref(),
-            self.selected_layer_id.as_ref(),
-            &history,
-            &trimmed,
-        )
-        .map_err(|err| err.to_string())?;
-
-        self.ai_chat.turns.push(AiChatTurn {
-            role: AiRole::User,
-            text: trimmed.clone(),
-        });
-        self.ai_chat.streaming_preview.clear();
-        self.ai_chat.last_error = None;
-        self.ai_chat.pending_proposal = None;
-        self.ai_chat.can_one_click_undo = false;
+        let req = self.prepare_ai_request_and_turn(&trimmed)?;
         "AI へ送信中...".clone_into(&mut self.ai_chat.status_banner);
 
         let provider = self.ai_chat.build_provider();
@@ -756,7 +793,7 @@ pub fn render_ai_chat_panel(
         .text_xs()
         .child(render_compact_header(chat, ai_provider_select, cx))
         .child(render_chat_body(chat, cx))
-        .child(render_prompt_composer(chat, ai_chat_input, cx))
+        .child(render_prompt_composer(controller, ai_chat_input, cx))
 }
 
 fn format_cred_label(chat: &AiChatState) -> String {
@@ -1137,12 +1174,316 @@ fn render_approval_mode_menu_button(
     })
 }
 
-fn render_prompt_composer(
-    chat: &AiChatState,
+/// ファイル名・クリップ名を `@<名前> ` 形式のメンション文字列へ整形する。
+#[must_use]
+pub fn format_at_mention_token(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.contains(char::is_whitespace) {
+        format!("@\"{trimmed}\" ")
+    } else {
+        format!("@{trimmed} ")
+    }
+}
+
+/// 入力末尾に補完中の `@<検索語>` トークンがあれば `(開始バイト位置, 検索語)` を返す。
+#[must_use]
+pub fn find_trailing_at_query(input: &str) -> Option<(usize, String)> {
+    let at_pos = input.rfind('@')?;
+    if at_pos > 0 {
+        let prev = input[..at_pos].chars().next_back()?;
+        if prev.is_alphanumeric() {
+            return None;
+        }
+    }
+    let after = &input[at_pos + 1..];
+    let query = after.strip_prefix('"').unwrap_or(after);
+    if after.starts_with('"') {
+        if query.contains('"') || query.contains('\n') {
+            return None;
+        }
+        return Some((at_pos, query.to_owned()));
+    }
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((at_pos, query.to_owned()))
+}
+
+/// プロジェクト内の全素材・クリップから補完候補名一覧（重複除去済み）を抽出する。
+#[must_use]
+pub fn matching_at_mention_names(doc: &ProjectDocument, query: &str) -> Vec<String> {
+    let q_lower = query.trim().to_ascii_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    for asset in &doc.assets {
+        if !asset.name.trim().is_empty() && !names.contains(&asset.name) {
+            names.push(asset.name.clone());
+        }
+    }
+    for layer in &doc.layers {
+        for clip in &layer.clips {
+            if !clip.name.trim().is_empty() && !names.contains(&clip.name) {
+                names.push(clip.name.clone());
+            }
+        }
+    }
+    names
+        .into_iter()
+        .filter(|n| q_lower.is_empty() || n.to_ascii_lowercase().contains(&q_lower))
+        .collect()
+}
+
+/// 末尾の `@<検索語>` を選択された候補文字列 `@<対象> ` へ置換する。
+#[must_use]
+pub fn apply_at_completion(current_text: &str, at_byte_start: usize, target_name: &str) -> String {
+    let prefix = current_text.get(..at_byte_start).unwrap_or(current_text);
+    format!("{prefix}{}", format_at_mention_token(target_name))
+}
+
+fn insert_at_mention_into_input(
+    ai_chat_input: &Entity<TextareaState>,
+    target_name: &str,
+    window: &mut Window,
+    cx: &mut Context<SeaEditorWindow>,
+) {
+    let token = format_at_mention_token(target_name);
+    ai_chat_input.update(cx, |state, cx| {
+        let cur = state.value().to_string();
+        let next = if let Some((at_pos, _)) = find_trailing_at_query(&cur) {
+            apply_at_completion(&cur, at_pos, target_name)
+        } else if cur.is_empty() || cur.ends_with(char::is_whitespace) {
+            format!("{cur}{token}")
+        } else {
+            format!("{cur} {token}")
+        };
+        state.set_value(&next, window, cx);
+        state.focus(window, cx);
+    });
+    cx.notify();
+}
+
+fn render_attach_context_button(
+    controller: &AppController,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let weak = cx.weak_entity();
+    let selected_ids = controller.effective_selected_clip_ids();
+    let selected_items: Vec<(ClipId, String)> = selected_ids
+        .iter()
+        .filter_map(|cid| {
+            controller
+                .document
+                .find_clip(cid)
+                .map(|(_, c)| (cid.clone(), c.name.clone()))
+        })
+        .collect();
+    let attached_set = controller.ai_chat.attached_clip_ids.clone();
+    let all_clips: Vec<(ClipId, String, String, u64, u64)> = controller
+        .document
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            layer.clips.iter().map(move |clip| {
+                let s = clip.timeline_start.get();
+                let e = s.saturating_add(clip.duration.get());
+                (clip.id.clone(), clip.name.clone(), layer.name.clone(), s, e)
+            })
+        })
+        .collect();
+
+    Button::new("ai-attach-context-btn")
+        .ghost()
+        .xsmall()
+        .label("📎 添付 ▾")
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+            let mut popup = menu
+                .min_w(px(230.))
+                .max_h(px(300.))
+                .scrollable(true)
+                .check_side(Side::Right);
+
+            if !selected_items.is_empty() {
+                let names: String = selected_items
+                    .iter()
+                    .map(|(_, n)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sel_cids: Vec<ClipId> =
+                    selected_items.iter().map(|(id, _)| id.clone()).collect();
+                let weak_sel = weak.clone();
+                popup = popup
+                    .label("選択中オブジェクト")
+                    .item(
+                        PopupMenuItem::new(format!("選択クリップを添付: {names}")).on_click(
+                            move |_, _, cx| {
+                                let _ = weak_sel.update(cx, |view, cx| {
+                                    for cid in &sel_cids {
+                                        view.controller.ai_chat.attach_clip(cid.clone());
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    )
+                    .separator();
+            }
+
+            popup = popup.label("タイムラインのクリップを添付");
+            if all_clips.is_empty() {
+                popup = popup.label("（クリップなし）");
+            } else {
+                for (cid, cname, lname, s, e) in &all_clips {
+                    let weak_clip = weak.clone();
+                    let is_attached = attached_set.contains(cid);
+                    let target_cid = cid.clone();
+                    popup = popup.item(
+                        PopupMenuItem::new(format!("{cname} · {lname} ({s}..{e}f)"))
+                            .checked(is_attached)
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_clip.update(cx, |view, cx| {
+                                    if is_attached {
+                                        view.controller.ai_chat.detach_clip(&target_cid);
+                                    } else {
+                                        view.controller.ai_chat.attach_clip(target_cid.clone());
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+            }
+            popup
+        })
+}
+
+fn render_at_mention_button(
+    controller: &AppController,
+    ai_chat_input: &Entity<TextareaState>,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let weak = cx.weak_entity();
+    let input_entity = ai_chat_input.clone();
+    let names = matching_at_mention_names(&controller.document, "");
+
+    Button::new("ai-at-mention-btn")
+        .ghost()
+        .xsmall()
+        .label("@ ファイル ▾")
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+            let mut popup = menu
+                .min_w(px(210.))
+                .max_h(px(280.))
+                .scrollable(true)
+                .label("@<ファイル名> を挿入");
+            if names.is_empty() {
+                popup = popup.label("（素材・クリップなし）");
+            } else {
+                for name in &names {
+                    let weak_item = weak.clone();
+                    let input_item = input_entity.clone();
+                    let name_owned = name.clone();
+                    popup = popup.item(PopupMenuItem::new(format!("@{name}")).on_click(
+                        move |_, window, cx| {
+                            let _ = weak_item.update(cx, |_, cx| {
+                                insert_at_mention_into_input(&input_item, &name_owned, window, cx);
+                            });
+                        },
+                    ));
+                }
+            }
+            popup
+        })
+}
+
+fn render_composer_context_strip(
+    controller: &AppController,
     ai_chat_input: &Entity<TextareaState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .gap_1()
+        .flex_wrap()
+        .child(render_attach_context_button(controller, cx))
+        .child(render_at_mention_button(controller, ai_chat_input, cx));
+
+    for (idx, cid) in controller.ai_chat.attached_clip_ids.iter().enumerate() {
+        let Some((_, clip)) = controller.document.find_clip(cid) else {
+            continue;
+        };
+        let detach_id = cid.clone();
+        row = row.child(
+            Button::new(("ai-attached-chip", idx))
+                .outline()
+                .xsmall()
+                .label(format!("📎 {} ×", clip.name))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.controller.ai_chat.detach_clip(&detach_id);
+                    cx.notify();
+                })),
+        );
+    }
+
+    div()
+        .w_full()
+        .pb_0p5()
+        .border_color(theme.border)
+        .child(row)
+}
+
+fn render_at_autocomplete_bar(
+    controller: &AppController,
+    ai_chat_input: &Entity<TextareaState>,
+    cx: &mut Context<SeaEditorWindow>,
+) -> Option<impl IntoElement> {
+    let raw = ai_chat_input.read(cx).value().to_string();
+    let (at_pos, query) = find_trailing_at_query(&raw)?;
+    let matches = matching_at_mention_names(&controller.document, &query);
+    if matches.is_empty() {
+        return None;
+    }
+
+    let theme = cx.theme().clone();
+    let input_entity = ai_chat_input.clone();
+    let mut bar = h_flex()
+        .w_full()
+        .gap_1()
+        .p_1()
+        .mb_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .flex_wrap();
+    for (idx, name) in matches.into_iter().take(6).enumerate() {
+        let inp = input_entity.clone();
+        let cur = raw.clone();
+        bar = bar.child(
+            Button::new(("ai-at-suggest", idx))
+                .ghost()
+                .xsmall()
+                .label(format!("@{name}"))
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    let next = apply_at_completion(&cur, at_pos, &name);
+                    inp.update(cx, |state, cx| {
+                        state.set_value(&next, window, cx);
+                        state.focus(window, cx);
+                    });
+                    cx.notify();
+                })),
+        );
+    }
+    Some(bar)
+}
+
+fn render_prompt_composer(
+    controller: &AppController,
+    ai_chat_input: &Entity<TextareaState>,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let chat = &controller.ai_chat;
 
     let mut selectors = h_flex()
         .items_center()
@@ -1176,34 +1517,41 @@ fn render_prompt_composer(
             }))
     };
 
-    div().w_full().px_2().pb_2().pt_1().flex_shrink_0().child(
-        v_flex()
-            .gap_1p5()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
-            .child(Textarea::new(ai_chat_input).appearance(false).small())
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_1()
-                    .child(selectors)
-                    .child(action_btn),
-            ),
-    )
+    let card = v_flex()
+        .gap_1p5()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .child(render_composer_context_strip(controller, ai_chat_input, cx))
+        .child(Textarea::new(ai_chat_input).appearance(false).small())
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(selectors)
+                .child(action_btn),
+        );
+
+    let mut outer = v_flex().w_full().px_2().pb_2().pt_1().flex_shrink_0();
+    if let Some(ac_bar) = render_at_autocomplete_bar(controller, ai_chat_input, cx) {
+        outer = outer.child(ac_bar);
+    }
+    outer.child(card)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AiApprovalMode, AiChatState, build_provider_select_items, format_model_menu_label,
-        provider_safety_notice, provider_select_index,
+        AiApprovalMode, AiChatState, apply_at_completion, build_provider_select_items,
+        find_trailing_at_query, format_at_mention_token, format_model_menu_label,
+        matching_at_mention_names, provider_safety_notice, provider_select_index,
     };
     use crate::ai::provider::{AiProviderKind, AiThinkingLevel};
     use crate::ai::providers::mock::MockAiProvider;
+    use crate::core::ids::ClipId;
     use crate::ui::app_controller::AppController;
 
     #[test]
@@ -1372,5 +1720,40 @@ mod tests {
         );
         assert!(!controller.cancel_ai_prompt());
         drop(tx);
+    }
+
+    #[test]
+    fn at_mention_helpers_and_attachments_work_cleanly() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(format_at_mention_token("kaitosai.jpg"), "@kaitosai.jpg ");
+        assert_eq!(
+            format_at_mention_token("bgm track.wav"),
+            "@\"bgm track.wav\" "
+        );
+
+        assert_eq!(
+            find_trailing_at_query("移動して @kai"),
+            Some((13, "kai".to_owned()))
+        );
+        assert_eq!(find_trailing_at_query("@kaitosai.jpg "), None);
+        assert_eq!(find_trailing_at_query("foo@bar"), None);
+        assert_eq!(
+            apply_at_completion("移動 @kai", 7, "kaitosai.jpg"),
+            "移動 @kaitosai.jpg "
+        );
+
+        let mut controller = AppController::new();
+        let c1 = ClipId::new("c1")?;
+        let c2 = ClipId::new("c2")?;
+        controller.ai_chat.attach_clip(c1.clone());
+        controller.ai_chat.attach_clip(c1.clone());
+        controller.ai_chat.attach_clip(c2.clone());
+        assert_eq!(controller.ai_chat.attached_clip_ids.len(), 2);
+
+        controller.ai_chat.detach_clip(&c1);
+        assert_eq!(controller.ai_chat.attached_clip_ids, vec![c2]);
+
+        let names = matching_at_mention_names(&controller.document, "");
+        assert_eq!(names.len(), 0);
+        Ok(())
     }
 }

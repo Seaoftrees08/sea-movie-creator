@@ -859,6 +859,7 @@ fn render_transport_bar(
     let current = controller.clock.current_frame();
     let total = controller.document.total_duration_frames();
     let playing = controller.clock.is_playing();
+    let return_to_start = controller.return_playhead_to_start_on_stop;
     let has_sel_clip = !controller.effective_selected_clip_ids().is_empty();
     let tc = format!(
         "{} ({}f / {}f)",
@@ -922,6 +923,22 @@ fn render_transport_bar(
                 .children(sel_band)
                 .child(Slider::new(scrub_slider)),
         )
+        .child({
+            let mut btn = Button::new("transport-return-start-btn")
+                .xsmall()
+                .label("停止時↩");
+            btn = if return_to_start {
+                btn.primary()
+            } else {
+                btn.ghost()
+            };
+            btn.on_click(cx.listener(|this, _, window, cx| {
+                this.controller.toggle_return_playhead_to_start_on_stop();
+                this.reload_app_menus(cx);
+                window.focus(&this.workspace_focus, cx);
+                cx.notify();
+            }))
+        })
         .child(
             Button::new("transport-split-btn")
                 .xsmall()
@@ -976,6 +993,8 @@ fn add_transport_buttons(
             .label(if playing { "⏸" } else { "▶" })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.controller.toggle_play_pause();
+                this.mark_sliders_dirty();
+                this.sync_sliders_now(window, cx);
                 window.focus(&this.workspace_focus, cx);
                 cx.notify();
             })),

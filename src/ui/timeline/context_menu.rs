@@ -923,7 +923,7 @@ pub(crate) fn attach_track_header_context_menu<E: ContextMenuExt + 'static>(
         let w_del = win.clone();
 
         menu.item(
-            PopupMenuItem::new("レイヤー名を変更...").on_click(move |_, window, cx| {
+            PopupMenuItem::new("トラック名を変更...").on_click(move |_, window, cx| {
                 let initial = ren_name.clone();
                 w_ren.update(cx, |this, cx| {
                     this.begin_layer_rename(lid_ren.clone(), &initial, window, cx);

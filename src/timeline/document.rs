@@ -503,6 +503,38 @@ where
 }
 
 impl Clip {
+    /// いずれかの視覚・音声・字幕パラメータに時間依存（`Constant` 以外）の設定があるか返す。
+    #[must_use]
+    pub fn has_time_varying_animation(&self) -> bool {
+        let is_dyn = |p: &AnimatedParameter| !matches!(p, AnimatedParameter::Constant { .. });
+        let vis_dyn = |v: &VisualProperties| {
+            is_dyn(&v.x)
+                || is_dyn(&v.y)
+                || is_dyn(&v.scale_x)
+                || is_dyn(&v.scale_y)
+                || is_dyn(&v.rotation_deg)
+                || is_dyn(&v.anchor_x)
+                || is_dyn(&v.anchor_y)
+                || is_dyn(&v.opacity)
+                || is_dyn(&v.brightness)
+                || is_dyn(&v.contrast)
+                || is_dyn(&v.saturation)
+                || is_dyn(&v.hue_deg)
+                || is_dyn(&v.gamma)
+        };
+        let aud_dyn = |a: &AudioProperties| is_dyn(&a.gain_db) || is_dyn(&a.pan);
+        match &self.kind {
+            ClipKind::Video { visual, audio, .. } => {
+                vis_dyn(visual) || audio.as_ref().is_some_and(aud_dyn)
+            }
+            ClipKind::Image { visual, .. } => vis_dyn(visual),
+            ClipKind::Audio { audio, .. } => aud_dyn(audio),
+            ClipKind::Subtitle(sub) => is_dyn(&sub.font_size) || vis_dyn(&sub.visual),
+        }
+    }
+}
+
+impl Clip {
     /// タイムライン上の終了フレーム（排他的上端）を返す。
     ///
     /// # Errors

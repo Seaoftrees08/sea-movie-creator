@@ -826,10 +826,15 @@ fn trim_right(
     }
 
     let old_clip = doc.layers[layer_idx].clips[clip_idx].clone();
-    let preserved_effect_duration = old_clip.effective_effect_duration();
     let mut updated = old_clip.clone();
     updated.duration = old_clip.duration.checked_sub_signed(delta_frames)?;
-    updated.effect_duration_frames = Some(preserved_effect_duration);
+    if old_clip.effect_duration_frames.is_some()
+        || old_clip.effect_offset_frames != 0
+        || !old_clip.midpoints.is_empty()
+        || old_clip.has_time_varying_animation()
+    {
+        updated.effect_duration_frames = Some(old_clip.effective_effect_duration());
+    }
     doc.layers[layer_idx].clips[clip_idx] = updated;
     undo_patches.push(PatchStep::ReplaceClip {
         layer_id,
@@ -2261,6 +2266,128 @@ mod tests {
             ],
         );
         assert!(matches!(swap_cycle, Err(CommandError::Incompatible(_))));
+        Ok(())
+    }
+
+    fn setup_trim_right_test_doc(
+        c1: &ClipId,
+        c2: &ClipId,
+    ) -> Result<ProjectDocument, Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("TrimRightDuration");
+        let l1 = LayerId::new("l1")?;
+        let mut dispatcher = CommandDispatcher::new();
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::Batch {
+                commands: vec![
+                    EditCommand::AddLayer {
+                        temp_id: None,
+                        id: Some(l1.clone()),
+                        name: "Track 1".to_owned(),
+                        insert_index: None,
+                    },
+                    EditCommand::AddClip {
+                        temp_id: None,
+                        id: Some(c1.clone()),
+                        layer_id: LayerRef::Id(l1.clone()),
+                        clip: Box::new(NewClipSpec {
+                            name: "StaticImage".to_owned(),
+                            timeline_start: FrameIndex::ZERO,
+                            duration: FrameCount::new(300)?,
+                            effect_offset_frames: 0,
+                            effect_duration_frames: None,
+                            midpoints: Vec::new(),
+                            kind: NewClipKind::Subtitle(SubtitleProperties::new("Static")),
+                        }),
+                    },
+                    EditCommand::AddClip {
+                        temp_id: None,
+                        id: Some(c2.clone()),
+                        layer_id: LayerRef::Id(l1),
+                        clip: Box::new(NewClipSpec {
+                            name: "AnimImage".to_owned(),
+                            timeline_start: FrameIndex::new(300),
+                            duration: FrameCount::new(300)?,
+                            effect_offset_frames: 0,
+                            effect_duration_frames: None,
+                            midpoints: Vec::new(),
+                            kind: NewClipKind::Subtitle({
+                                let mut s = SubtitleProperties::new("Anim");
+                                s.visual.x = AnimatedParameter::Easing {
+                                    start_value: 500.0,
+                                    end_value: -500.0,
+                                    curve: EasingCurve::Linear,
+                                    extrapolation: ExtrapolationMode::Clamp,
+                                };
+                                s
+                            }),
+                        }),
+                    },
+                ],
+            },
+        )?;
+        Ok(doc)
+    }
+
+    #[test]
+    fn trim_right_constant_clip_adapts_future_easing_duration_while_animated_preserves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let c1 = ClipId::new("c1")?;
+        let c2 = ClipId::new("c2")?;
+        let mut doc = setup_trim_right_test_doc(&c1, &c2)?;
+        let mut dispatcher = CommandDispatcher::new();
+
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::Batch {
+                commands: vec![
+                    EditCommand::TrimRight {
+                        clip_id: ClipRef::Id(c1.clone()),
+                        delta_frames: 137,
+                    },
+                    EditCommand::TrimRight {
+                        clip_id: ClipRef::Id(c2.clone()),
+                        delta_frames: 137,
+                    },
+                ],
+            },
+        )?;
+
+        let (_, trimmed_static) = doc.find_clip(&c1).ok_or("missing c1")?;
+        assert_eq!(trimmed_static.duration.get(), 163);
+        assert_eq!(trimmed_static.effective_effect_duration().get(), 163);
+
+        // 静的クリップへ後から Easing を付けた場合、トリム後の終端 (162f) で 100% 到達する
+        dispatcher.dispatch(
+            &mut doc,
+            &EditCommand::SetParameter {
+                target: ParameterTarget::Clip {
+                    clip_id: ClipRef::Id(c1.clone()),
+                },
+                path: ParameterPath::X,
+                value: ParameterValue::Animated {
+                    param: AnimatedParameter::Easing {
+                        start_value: 500.0,
+                        end_value: -500.0,
+                        curve: EasingCurve::Linear,
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                },
+            },
+        )?;
+        let (_, animated_after_trim) = doc.find_clip(&c1).ok_or("missing c1 after set")?;
+        let ctx_end = animated_after_trim
+            .evaluation_context(FrameIndex::new(162), FrameRate::FPS_60)
+            .ok_or("missing eval ctx")?;
+        let x_end = match &animated_after_trim.kind {
+            ClipKind::Subtitle(s) => s.visual.x.evaluate(ctx_end)?,
+            _ => return Err("unexpected clip kind".into()),
+        };
+        assert!((x_end - (-500.0)).abs() < 1e-9);
+
+        // もともとアニメーション済みのクリップはトリム後も元のイージング尺 (300f) を維持する
+        let (_, trimmed_anim) = doc.find_clip(&c2).ok_or("missing c2")?;
+        assert_eq!(trimmed_anim.effective_effect_duration().get(), 300);
         Ok(())
     }
 }

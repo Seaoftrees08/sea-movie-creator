@@ -324,11 +324,10 @@ fn render_header_controls(
                 ))
                 .child(header_pill(
                     "tl-add-layer-btn",
-                    "+ レイヤー",
+                    "+ トラック",
                     false,
                     cx.listener(|this, _, _, cx| {
-                        let name = format!("T{}", this.controller.document.layers.len() + 1);
-                        if let Err(err) = this.controller.add_layer(name) {
+                        if let Err(err) = this.controller.add_empty_layer() {
                             this.controller.status_message = err;
                         }
                         cx.notify();
@@ -405,7 +404,7 @@ fn render_track_viewport(
             .justify_center()
             .text_size(px(12.))
             .text_color(rgba(0x9ca3_afff))
-            .child("タイムラインは空です。「+ レイヤー」またはドラッグ＆ドロップで追加できます。")
+            .child("タイムラインは空です。「+ トラック」またはドラッグ＆ドロップで追加できます。")
             .into_any_element();
     }
 

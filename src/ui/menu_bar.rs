@@ -98,6 +98,8 @@ actions!(
         TogglePlayPause,
         /// 再生を停止する。
         StopPlaybackAction,
+        /// 再生停止時に開始位置へ戻すオプションを切り替える。
+        ToggleReturnToStartOnStopAction,
         /// 先頭フレームへ移動する。
         SeekStart,
         /// 末尾フレームへ移動する。
@@ -161,6 +163,8 @@ pub struct MenuCheckState {
     pub preview_overlays: PreviewOverlayChecks,
     /// シーク追従チェック状態。
     pub follow_selected_on_seek: bool,
+    /// 再生停止時に開始位置へ戻すチェック状態。
+    pub return_to_start_on_stop: bool,
     /// 現在のプレビュー倍率モード。
     pub preview_zoom: PreviewZoomMode,
     /// 現在の右パネルタブ。
@@ -307,7 +311,7 @@ pub fn build_app_menus(state: MenuCheckState) -> Vec<Menu> {
         build_timeline_menu(),
         build_settings_menu(state),
         build_view_menu(state),
-        build_playback_menu(),
+        build_playback_menu(state),
         build_export_menu(),
     ]
 }
@@ -414,7 +418,7 @@ fn build_view_menu(state: MenuCheckState) -> Menu {
                 .checked(state.right_tab == RightPanelTab::ClipInspector),
             MenuItem::action("右パネル: AIチャット", ShowTabAiChatAction)
                 .checked(state.right_tab == RightPanelTab::AiChat),
-            MenuItem::action("右パネル: レイヤー", ShowTabLayerListAction)
+            MenuItem::action("右パネル: トラック", ShowTabLayerListAction)
                 .checked(state.right_tab == RightPanelTab::LayerList),
             MenuItem::action("右パネル: プロジェクト情報", ShowTabProjectInfoAction)
                 .checked(state.right_tab == RightPanelTab::ProjectInfo),
@@ -423,12 +427,17 @@ fn build_view_menu(state: MenuCheckState) -> Menu {
     }
 }
 
-fn build_playback_menu() -> Menu {
+fn build_playback_menu(state: MenuCheckState) -> Menu {
     Menu {
         name: "再生".into(),
         items: vec![
             MenuItem::action("再生 / 一時停止", TogglePlayPause),
             MenuItem::action("停止", StopPlaybackAction),
+            MenuItem::action(
+                "停止時に再生開始位置へ戻す",
+                ToggleReturnToStartOnStopAction,
+            )
+            .checked(state.return_to_start_on_stop),
             MenuItem::separator(),
             MenuItem::action("1 フレーム戻る", StepBackOneFrame),
             MenuItem::action("1 フレーム進む", StepForwardOneFrame),

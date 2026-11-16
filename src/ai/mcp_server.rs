@@ -261,7 +261,7 @@ fn tool_list_response() -> Value {
         "tools": [
             {
                 "name": "get_timeline_summary",
-                "description": "現在のタイムライン状態（レイヤー・クリップ・素材・再生ヘッド）のコンパクト要約を返します。",
+                "description": "現在のタイムライン状態（トラック・クリップ・素材・再生ヘッド）のコンパクト要約を返します。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

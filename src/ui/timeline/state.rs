@@ -782,7 +782,7 @@ impl TimelineDragState {
                 .layers
                 .get(item.target_layer_idx)
                 .map(|l| l.id.clone())
-                .ok_or_else(|| "移動先レイヤーの生成に失敗しました".to_owned())?;
+                .ok_or_else(|| "移動先トラックの生成に失敗しました".to_owned())?;
             plans.push(ClipMovePlan {
                 clip_id: item.clip_id.clone(),
                 target_layer_id,
@@ -824,7 +824,7 @@ impl TimelineDragState {
                 .layers
                 .get(item.target_layer_idx)
                 .map(|l| l.id.clone())
-                .ok_or_else(|| "複製先レイヤーが見つかりません".to_owned())?;
+                .ok_or_else(|| "複製先トラックが見つかりません".to_owned())?;
             let new_id = allocate_unique_clip_id(&controller.document, &new_ids, &mut seq)?;
             new_ids.push(new_id.clone());
             cmds.push(EditCommand::AddClip {
