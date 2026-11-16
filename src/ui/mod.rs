@@ -7,6 +7,7 @@ pub mod inspector;
 pub mod inspector_panel;
 pub mod key_config;
 pub mod menu_bar;
+pub mod preview;
 pub mod preview_panel;
 pub mod right_panel;
 pub mod surface_bridge;

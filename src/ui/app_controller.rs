@@ -1,7 +1,9 @@
 //! GUI 非依存のアプリ状態・メディア読込・再生状態機械・コマンド統括コントローラ。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::audio::mixer::AudioMixer;
@@ -29,6 +31,13 @@ use crate::timeline::document::{
 use crate::timeline::serialization::{
     build_asset_path, load_project_file, resolve_document_assets, resolve_existing_asset_path,
     save_project_file,
+};
+use crate::ui::preview::{
+    DragModifiers, MasterWaveformCache, PreviewClipDragSnapshot, PreviewDragMode, PreviewDragState,
+    PreviewLayerHitQuad, PreviewViewportTransform, UpdatedClipVisualParams,
+    build_preview_hit_quads, clip_source_dimensions, clip_visual_props, clip_visual_props_mut,
+    compute_drag_updated_clip, hit_test_preview_layers, hit_test_selection_handle,
+    shift_animated_param,
 };
 use crate::ui::surface_bridge::{
     PreviewSurfaceBridge, RenderImageSurfaceBridge, composite_with_gpu_or_fallback,
@@ -301,6 +310,20 @@ pub struct AppController {
     pub timeline_gesture: Option<crate::ui::timeline::state::TimelinePointerGesture>,
     /// タイムラインキャンバスの推定表示幅 (px)。
     pub timeline_viewport_canvas_width_px: f32,
+    /// ドキュメント音声状態が変わるたびに単調増加するリビジョン番号。
+    pub doc_audio_revision: u64,
+    /// プレビューキャンバス上の直接ドラッグ操作状態。
+    pub preview_drag: Option<PreviewDragState>,
+    /// プレビュー上に表示する非破壊の警告・案内バナー文言。
+    pub preview_notice: Option<String>,
+    /// マスター音声波形 LRU キャッシュ（4kHz / 10ms / 10s チャンク / 最大 16 チャンク）。
+    pub master_waveform: MasterWaveformCache,
+    /// 書き出し時に `selection_range` のみを対象とするか（デフォルト `false`）。
+    pub export_selection_only: bool,
+    /// 直近描画時のプレビューキャンバス領域座標 `(x, y, w, h)`（ウィンドウ空間 px）。
+    pub preview_viewport_bounds: Rc<Cell<(f32, f32, f32, f32)>>,
+    /// 直近描画時のマスター波形ストリップ座標 `(x, y, w, h)`（ウィンドウ空間 px）。
+    pub preview_waveform_bounds: Rc<Cell<(f32, f32, f32, f32)>>,
     /// 音声デバイス稼働状態と共有スナップショット。
     audio_shared: SharedPlaybackState,
     audio_handle: Option<AudioOutputHandle>,
@@ -362,7 +385,7 @@ impl AppController {
             preview_pan_offset_px: (0.0, 0.0),
             scale_aspect_locked: true,
             inspector_sections: default_inspector_sections(),
-            key_config: crate::ui::key_config::KeyConfig::with_defaults(),
+            key_config: crate::ui::key_config::KeyConfig::load_or_default(),
             right_tab: RightPanelTab::ClipInspector,
             right_panel_width: None,
             inspector: crate::ui::inspector_panel::InspectorState::default(),
@@ -383,6 +406,13 @@ impl AppController {
             timeline_drag: None,
             timeline_gesture: None,
             timeline_viewport_canvas_width_px: 900.0,
+            doc_audio_revision: 1,
+            preview_drag: None,
+            preview_notice: None,
+            master_waveform: MasterWaveformCache::new(),
+            export_selection_only: false,
+            preview_viewport_bounds: Rc::new(Cell::new((0.0, 0.0, 960.0, 540.0))),
+            preview_waveform_bounds: Rc::new(Cell::new((0.0, 0.0, 960.0, 34.0))),
             audio_shared,
             audio_handle: None,
             gpu_compositor: WgpuCompositor::try_new().ok(),
@@ -429,6 +459,7 @@ impl AppController {
         self.clear_clip_selection();
         self.timeline_gesture = None;
         self.timeline_scroll_y_px = 0.0;
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         "新規プロジェクトを作成しました".clone_into(&mut self.status_message);
         self.sync_shared_state();
         self.dirty_preview = true;
@@ -461,6 +492,7 @@ impl AppController {
         self.selected_layer_id = self.document.layers.first().map(|l| l.id.clone());
         self.timeline_scroll_y_px = 0.0;
         self.preload_available_media(project_dir);
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_shared_state();
         self.clock.seek_to_frame(FrameIndex::ZERO);
         self.dirty_preview = true;
@@ -701,6 +733,7 @@ impl AppController {
             .dispatcher
             .dispatch(&mut self.document, cmd)
             .map_err(|err| err.to_string())?;
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_selection_after_edit();
         self.sync_shared_state();
         self.dirty_preview = true;
@@ -722,6 +755,8 @@ impl AppController {
         if let Some(label) = undone {
             self.timeline_gesture = None;
             self.timeline_drag = None;
+            self.preview_drag = None;
+            self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
             self.sync_selection_after_edit();
             self.sync_shared_state();
             self.dirty_preview = true;
@@ -745,6 +780,8 @@ impl AppController {
         if let Some(label) = redone {
             self.timeline_gesture = None;
             self.timeline_drag = None;
+            self.preview_drag = None;
+            self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
             self.sync_selection_after_edit();
             self.sync_shared_state();
             self.dirty_preview = true;
@@ -782,13 +819,26 @@ impl AppController {
     ///
     /// クリップ未選択または削除失敗時。
     pub fn delete_selected_clip(&mut self) -> Result<(), String> {
-        let clip_id = self
-            .selected_clip_id
-            .take()
-            .ok_or_else(|| "削除するクリップが選択されていません".to_owned())?;
-        let _ = self.dispatch_command(&EditCommand::RemoveClip {
-            clip_id: ClipRef::Id(clip_id),
-        })?;
+        let ids = self.effective_selected_clip_ids();
+        if ids.is_empty() {
+            return Err("削除するクリップが選択されていません".to_owned());
+        }
+        let commands: Vec<EditCommand> = ids
+            .into_iter()
+            .map(|clip_id| EditCommand::RemoveClip {
+                clip_id: ClipRef::Id(clip_id),
+            })
+            .collect();
+        let cmd = if commands.len() == 1 {
+            commands
+                .into_iter()
+                .next()
+                .ok_or_else(|| "削除コマンドの生成に失敗しました".to_owned())?
+        } else {
+            EditCommand::Batch { commands }
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.clear_clip_selection();
         self.inspector.invalidate_sync();
         Ok(())
     }
@@ -799,11 +849,11 @@ impl AppController {
     ///
     /// クリップ未選択または存在しない ID の場合。
     pub fn copy_selected_clip(&mut self) -> Result<usize, String> {
-        let clip_id = self
-            .selected_clip_id
-            .clone()
-            .ok_or_else(|| "コピーするクリップが選択されていません".to_owned())?;
-        let cb = crate::timeline::clipboard::copy_clips(&self.document, &[clip_id])
+        let ids = self.effective_selected_clip_ids();
+        if ids.is_empty() {
+            return Err("コピーするクリップが選択されていません".to_owned());
+        }
+        let cb = crate::timeline::clipboard::copy_clips(&self.document, &ids)
             .map_err(|e| e.to_string())?;
         let count = cb.len();
         self.clipboard = Some(cb);
@@ -846,15 +896,13 @@ impl AppController {
     ///
     /// クリップ未選択または複製エラー時。
     pub fn duplicate_selected_clip(&mut self) -> Result<(), String> {
-        let clip_id = self
-            .selected_clip_id
-            .clone()
-            .ok_or_else(|| "複製するクリップが選択されていません".to_owned())?;
-        let cmd = crate::timeline::clipboard::build_duplicate_selection_command(
-            &self.document,
-            &[clip_id],
-        )
-        .map_err(|e| e.to_string())?;
+        let ids = self.effective_selected_clip_ids();
+        if ids.is_empty() {
+            return Err("複製するクリップが選択されていません".to_owned());
+        }
+        let cmd =
+            crate::timeline::clipboard::build_duplicate_selection_command(&self.document, &ids)
+                .map_err(|e| e.to_string())?;
         let _ = self.dispatch_command(&cmd)?;
         self.inspector.invalidate_sync();
         Ok(())
@@ -2272,6 +2320,624 @@ impl AppController {
             }
         }
         changed
+    }
+}
+
+/// Phase D-4: プレビュー直接操作・マスター音声波形・`AviUtl` ショートカット統括メソッド群。
+impl AppController {
+    /// マスター音声波形バックグラウンド結果を回収し、表示中なら必要チャンクをスケジュールする。
+    pub fn tick_master_waveform(&mut self) -> bool {
+        let updated = self.master_waveform.poll_completed();
+        if self.show_preview_waveform {
+            #[allow(clippy::cast_precision_loss)]
+            let playhead_sec =
+                (self.clock.current_frame().get() as f64) / self.document.fps.as_f64();
+            self.master_waveform.schedule_timeline_chunks(
+                self.doc_audio_revision,
+                &self.document,
+                &self.mixer,
+                playhead_sec,
+            );
+        }
+        updated
+    }
+
+    /// 相対フレーム数だけプレイヘッドを移動する（`Left`/`Right`/ステップ移動共通）。
+    pub fn step_frames(&mut self, delta: i64) {
+        let cur = i64::try_from(self.clock.current_frame().get()).unwrap_or(i64::MAX);
+        let max_frame = i64::try_from(self.document.seek_upper_bound_frames()).unwrap_or(i64::MAX);
+        let next = cur.saturating_add(delta).clamp(0, max_frame);
+        let next_u64 = u64::try_from(next).unwrap_or(0);
+        self.seek_to_frame(FrameIndex::new(next_u64));
+    }
+
+    /// 0.5 秒相当フレーム数だけ前後へステップ移動する。
+    pub fn step_half_second(&mut self, forward: bool) {
+        #[allow(clippy::cast_possible_truncation)]
+        let half_sec_frames = (self.document.fps.as_f64() * 0.5).round().max(1.0) as i64;
+        self.step_frames(if forward {
+            half_sec_frames
+        } else {
+            -half_sec_frames
+        });
+    }
+
+    /// タイムライン末尾フレーム（総尺）へ移動する。
+    pub fn seek_to_end(&mut self) {
+        let end = self.document.total_duration_frames();
+        self.seek_to_frame(FrameIndex::new(end));
+    }
+
+    /// マスター音声波形バー上の X 座標へプレイヘッドをシークする。
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn seek_by_waveform_x(&mut self, mouse_x: f32) {
+        let (rx, _, rw, _) = self.preview_waveform_bounds.get();
+        if rw <= 2.0 {
+            return;
+        }
+        let frac = ((mouse_x - rx) / rw).clamp(0.0, 1.0);
+        let total = self.document.total_duration_frames().max(1);
+        #[allow(clippy::cast_precision_loss)]
+        let target = ((total as f32) * frac).round() as u64;
+        self.seek_to_frame(FrameIndex::new(target));
+    }
+
+    /// 隣接するクリップ境界または中間点フレームへジャンプする（`Up`/`Down`）。
+    pub fn jump_to_adjacent_boundary_or_midpoint(&mut self, forward: bool) {
+        let cur = self.clock.current_frame().get();
+        let points = collect_timeline_boundaries(&self.document);
+        let target = if forward {
+            points.into_iter().find(|&p| p > cur)
+        } else {
+            points.into_iter().rfind(|&p| p < cur)
+        };
+        if let Some(frame) = target {
+            self.seek_to_frame(FrameIndex::new(frame));
+        }
+    }
+
+    /// 選択クリップをクリップボードへコピーしてからタイムライン上から切り取る。
+    ///
+    /// # Errors
+    ///
+    /// コピーまたは削除コマンドの実行に失敗した場合。
+    pub fn cut_selected_clips(&mut self) -> Result<(), String> {
+        self.copy_selected_clip()?;
+        self.delete_selected_clip()
+    }
+
+    /// 現在フレームに重なっている複数オブジェクトをトラック順に巡回選択する（2個以上重複時 `true`）。
+    pub fn cycle_clip_at_playhead(&mut self) -> bool {
+        let head = self.clock.current_frame().get();
+        let mut active: Vec<ClipId> = Vec::new();
+        for layer in &self.document.layers {
+            for clip in &layer.clips {
+                let start = clip.timeline_start.get();
+                let end = start.saturating_add(clip.duration.get());
+                if start <= head && head < end {
+                    active.push(clip.id.clone());
+                }
+            }
+        }
+        if active.len() < 2 {
+            return false;
+        }
+        let cur_idx = self
+            .selected_clip_id
+            .as_ref()
+            .and_then(|cid| active.iter().position(|id| id == cid));
+        let next_idx = cur_idx.map_or(0, |i| (i + 1) % active.len());
+        let next_id = active[next_idx].clone();
+        self.select_single_clip(Some(next_id));
+        self.inspector.invalidate_sync();
+        "重なったクリップを切り替えました".clone_into(&mut self.status_message);
+        true
+    }
+
+    /// 再生位置へ標準字幕クリップを追加する。
+    ///
+    /// # Errors
+    ///
+    /// レイヤーロック中または挿入先確保に失敗した場合。
+    pub fn add_subtitle_at_playhead(&mut self) -> Result<ClipId, String> {
+        let dur = FrameCount::new(90).unwrap_or(FrameCount::ONE);
+        self.add_subtitle_clip_at(None, self.clock.current_frame(), dur, "新規字幕")
+    }
+
+    /// 選択中（かつ未ロック）の全視覚クリップの `X`/`Y` を平行移動し、1 つの `Batch` Undo として記録する。
+    ///
+    /// # Errors
+    ///
+    /// 対象クリップ不在・ロック中・数式設定時、またはコマンド実行失敗時。
+    pub fn nudge_selected_clips_xy(&mut self, dx: f64, dy: f64) -> Result<(), String> {
+        let ids = self.effective_selected_clip_ids();
+        if ids.is_empty() {
+            return Err("クリップが選択されていません".to_owned());
+        }
+        let mut cmds = Vec::new();
+        for cid in &ids {
+            let Some((layer, clip)) = self.document.find_clip(cid) else {
+                continue;
+            };
+            if layer.locked {
+                continue;
+            }
+            let Some(vis) = clip_visual_props(clip) else {
+                continue;
+            };
+            if dx.abs() > 1e-9 {
+                let next_x = shift_animated_param(&vis.x, dx).map_err(|msg| {
+                    self.preview_notice = Some(msg.to_owned());
+                    msg.to_owned()
+                })?;
+                cmds.push(EditCommand::SetParameter {
+                    target: ParameterTarget::Clip {
+                        clip_id: ClipRef::Id(cid.clone()),
+                    },
+                    path: ParameterPath::X,
+                    value: ParameterValue::Animated { param: next_x },
+                });
+            }
+            if dy.abs() > 1e-9 {
+                let next_y = shift_animated_param(&vis.y, dy).map_err(|msg| {
+                    self.preview_notice = Some(msg.to_owned());
+                    msg.to_owned()
+                })?;
+                cmds.push(EditCommand::SetParameter {
+                    target: ParameterTarget::Clip {
+                        clip_id: ClipRef::Id(cid.clone()),
+                    },
+                    path: ParameterPath::Y,
+                    value: ParameterValue::Animated { param: next_y },
+                });
+            }
+        }
+        if cmds.is_empty() {
+            return Err("移動可能な未ロック視覚クリップがありません".to_owned());
+        }
+        self.preview_notice = None;
+        let _ = self.dispatch_command(&EditCommand::Batch { commands: cmds })?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 選択中（かつ未ロック）の全視覚クリップの `RotationDeg` を相対回転し、1 つの `Batch` Undo として記録する。
+    ///
+    /// # Errors
+    ///
+    /// 対象クリップ不在・ロック中・数式設定時、またはコマンド実行失敗時。
+    pub fn rotate_selected_clips_by(&mut self, delta_deg: f64) -> Result<(), String> {
+        let ids = self.effective_selected_clip_ids();
+        if ids.is_empty() {
+            return Err("クリップが選択されていません".to_owned());
+        }
+        let mut cmds = Vec::new();
+        for cid in &ids {
+            let Some((layer, clip)) = self.document.find_clip(cid) else {
+                continue;
+            };
+            if layer.locked {
+                continue;
+            }
+            let Some(vis) = clip_visual_props(clip) else {
+                continue;
+            };
+            let next_rot = shift_animated_param(&vis.rotation_deg, delta_deg).map_err(|msg| {
+                self.preview_notice = Some(msg.to_owned());
+                msg.to_owned()
+            })?;
+            cmds.push(EditCommand::SetParameter {
+                target: ParameterTarget::Clip {
+                    clip_id: ClipRef::Id(cid.clone()),
+                },
+                path: ParameterPath::RotationDeg,
+                value: ParameterValue::Animated { param: next_rot },
+            });
+        }
+        if cmds.is_empty() {
+            return Err("回転可能な未ロック視覚クリップがありません".to_owned());
+        }
+        self.preview_notice = None;
+        let _ = self.dispatch_command(&EditCommand::Batch { commands: cmds })?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// リンク切れ素材 (`AssetStatus::Missing`) を別ファイルパスへ再リンクし、プレビュー・音声を再読込する。
+    ///
+    /// # Errors
+    ///
+    /// 素材検証エラーまたはファイルプローブ・コマンド実行失敗時。
+    pub fn relink_asset(&mut self, asset_id: &AssetId, new_file: &Path) -> Result<(), String> {
+        if !new_file.exists() {
+            return Err(format!(
+                "指定されたファイルが見つかりません: {}",
+                new_file.display()
+            ));
+        }
+        let base_dir: Option<PathBuf> = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let new_path = build_asset_path(new_file, base_dir.as_deref());
+        let new_kind = probe_relink_kind(new_file, self.document.fps);
+        self.dispatch_command(&EditCommand::RelinkAsset {
+            asset_id: asset_id.clone(),
+            new_path,
+            new_kind,
+        })?;
+        self.video_decoders.remove(asset_id);
+        self.frame_cache.clear();
+        self.preload_available_media(base_dir.as_deref());
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
+        self.dirty_preview = true;
+        self.refresh_preview_now();
+        Ok(())
+    }
+
+    /// プレビューキャンバスのパン操作を開始する（中ドラッグ／Space+左ドラッグ）。
+    pub fn begin_preview_pan(&mut self, mouse_window: (f32, f32)) {
+        self.preview_drag = Some(PreviewDragState {
+            mode: PreviewDragMode::PanViewport,
+            primary_clip_id: None,
+            start_mouse_window: mouse_window,
+            start_pan_px: self.preview_pan_offset_px,
+            initial_clips: Vec::new(),
+            has_moved: false,
+        });
+    }
+
+    /// プレビューキャンバス左押下時のハンドル判定・Z順ヒット判定・ドラッグ開始を処理する。
+    pub fn handle_preview_left_mouse_down(
+        &mut self,
+        mouse_window: (f32, f32),
+        space_pan_held: bool,
+    ) {
+        if space_pan_held {
+            self.begin_preview_pan(mouse_window);
+            return;
+        }
+
+        let viewport = self.current_preview_viewport_transform();
+        let playhead = self.clock.current_frame();
+        let quads = build_preview_hit_quads(&self.document, playhead, &viewport);
+
+        if self.show_preview_guides
+            && let Some(primary_id) = self.selected_clip_id.clone()
+            && let Some(primary_quad) = quads.iter().find(|q| q.clip_id == primary_id)
+            && let Some(handle) =
+                hit_test_selection_handle(primary_quad, mouse_window.0, mouse_window.1)
+        {
+            let mode = match handle {
+                crate::ui::preview::PreviewHandleKind::Anchor => PreviewDragMode::MoveAnchor,
+                crate::ui::preview::PreviewHandleKind::Rotate => PreviewDragMode::RotateHandle,
+                crate::ui::preview::PreviewHandleKind::Move => PreviewDragMode::MoveObject,
+                scale_h => PreviewDragMode::ScaleHandle { handle: scale_h },
+            };
+            self.start_preview_clip_drag(mode, primary_id, vec![primary_quad], mouse_window);
+            return;
+        }
+
+        let Some(hit) = hit_test_preview_layers(&quads, mouse_window.0, mouse_window.1) else {
+            self.select_single_clip(None);
+            self.inspector.invalidate_sync();
+            return;
+        };
+
+        let hit_id = hit.clip_id.clone();
+        let current_selected = self.effective_selected_clip_ids();
+        if !current_selected.iter().any(|id| id == &hit_id) {
+            self.select_single_clip(Some(hit_id.clone()));
+            self.inspector.invalidate_sync();
+        }
+
+        let mut target_quads: Vec<&PreviewLayerHitQuad> = self
+            .effective_selected_clip_ids()
+            .into_iter()
+            .filter_map(|cid| quads.iter().find(|q| q.clip_id == cid && !q.is_locked))
+            .collect();
+        if target_quads.is_empty() {
+            target_quads.push(hit);
+        }
+        self.start_preview_clip_drag(
+            PreviewDragMode::MoveObject,
+            hit_id,
+            target_quads,
+            mouse_window,
+        );
+    }
+
+    /// プレビュードラッグのライブ更新をドキュメントへ一時反映し、プレビューを再合成する。
+    pub fn update_preview_drag(&mut self, mouse_window: (f32, f32), modifiers: DragModifiers) {
+        let Some(mut drag) = self.preview_drag.take() else {
+            return;
+        };
+        let pan_delta = (
+            mouse_window.0 - drag.start_mouse_window.0,
+            mouse_window.1 - drag.start_mouse_window.1,
+        );
+        if !drag.has_moved && pan_delta.0.hypot(pan_delta.1) >= 1.5 {
+            drag.has_moved = true;
+        }
+        if !drag.has_moved {
+            self.preview_drag = Some(drag);
+            return;
+        }
+
+        if drag.mode == PreviewDragMode::PanViewport {
+            self.preview_pan_offset_px = (
+                drag.start_pan_px.0 + pan_delta.0,
+                drag.start_pan_px.1 + pan_delta.1,
+            );
+            self.preview_drag = Some(drag);
+            return;
+        }
+
+        let viewport = self.current_preview_viewport_transform();
+        let mut latest_notice = None;
+        for snap in &drag.initial_clips {
+            let outcome = compute_drag_updated_clip(
+                &drag,
+                snap,
+                &viewport,
+                mouse_window,
+                modifiers,
+                self.scale_aspect_locked,
+            );
+            if let Some(notice) = outcome.notice {
+                latest_notice = Some(notice);
+            }
+            if let Some(updated) = outcome.updated {
+                self.apply_updated_visual_transient(&snap.clip_id, &updated);
+            }
+        }
+        self.preview_notice = latest_notice;
+        self.preview_drag = Some(drag);
+        self.inspector.invalidate_sync();
+        self.dirty_preview = true;
+        self.refresh_preview_now();
+    }
+
+    /// 進行中のプレビュードラッグを 1 つの [`EditCommand::Batch`] として確定・Undo 登録する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用がドキュメント検証に違反した場合。
+    pub fn finish_preview_drag(&mut self) -> Result<bool, String> {
+        let Some(drag) = self.preview_drag.take() else {
+            return Ok(false);
+        };
+        if drag.mode == PreviewDragMode::PanViewport || !drag.has_moved {
+            return Ok(false);
+        }
+
+        let mut cmds = Vec::new();
+        for snap in &drag.initial_clips {
+            collect_snapshot_diff_commands(&self.document, snap, &mut cmds);
+        }
+        for snap in &drag.initial_clips {
+            self.restore_snapshot_transient(snap);
+        }
+
+        if cmds.is_empty() {
+            return Ok(false);
+        }
+
+        let _ = self.dispatch_command(&EditCommand::Batch { commands: cmds })?;
+        self.inspector.invalidate_sync();
+        Ok(true)
+    }
+
+    /// 進行中のプレビュードラッグをキャンセルしてドラッグ開始前の状態へ戻す（Undo 履歴を汚さない）。
+    pub fn cancel_preview_drag(&mut self) {
+        let Some(drag) = self.preview_drag.take() else {
+            return;
+        };
+        if drag.mode == PreviewDragMode::PanViewport {
+            self.preview_pan_offset_px = drag.start_pan_px;
+            return;
+        }
+        for snap in &drag.initial_clips {
+            self.restore_snapshot_transient(snap);
+        }
+        self.preview_notice = None;
+        self.inspector.invalidate_sync();
+        self.dirty_preview = true;
+        self.refresh_preview_now();
+    }
+
+    fn current_preview_viewport_transform(&self) -> PreviewViewportTransform {
+        PreviewViewportTransform {
+            bounds: self.preview_viewport_bounds.get(),
+            proj_size: (
+                self.document.resolution.width.get().max(1),
+                self.document.resolution.height.get().max(1),
+            ),
+            zoom: self.preview_zoom,
+            pan_px: self.preview_pan_offset_px,
+        }
+    }
+
+    fn start_preview_clip_drag(
+        &mut self,
+        mode: PreviewDragMode,
+        primary_clip_id: ClipId,
+        quads: Vec<&PreviewLayerHitQuad>,
+        mouse_window: (f32, f32),
+    ) {
+        let mut snapshots = Vec::with_capacity(quads.len());
+        let playhead = self.clock.current_frame();
+        for q in quads {
+            let Some((_, clip)) = self.document.find_clip(&q.clip_id) else {
+                continue;
+            };
+            let Some(vis) = clip_visual_props(clip) else {
+                continue;
+            };
+            let source_size = clip
+                .evaluation_context(playhead, self.document.fps)
+                .and_then(|ctx| clip_source_dimensions(&self.document, clip, ctx))
+                .unwrap_or(q.source_size);
+            snapshots.push(PreviewClipDragSnapshot {
+                clip_id: clip.id.clone(),
+                x: vis.x.clone(),
+                y: vis.y.clone(),
+                scale_x: vis.scale_x.clone(),
+                scale_y: vis.scale_y.clone(),
+                rotation_deg: vis.rotation_deg.clone(),
+                anchor_x: vis.anchor_x.clone(),
+                anchor_y: vis.anchor_y.clone(),
+                eval: q.visual,
+                source_size,
+            });
+        }
+        if snapshots.is_empty() {
+            return;
+        }
+        self.preview_notice = None;
+        self.preview_drag = Some(PreviewDragState {
+            mode,
+            primary_clip_id: Some(primary_clip_id),
+            start_mouse_window: mouse_window,
+            start_pan_px: self.preview_pan_offset_px,
+            initial_clips: snapshots,
+            has_moved: false,
+        });
+    }
+
+    fn apply_updated_visual_transient(
+        &mut self,
+        clip_id: &ClipId,
+        updated: &UpdatedClipVisualParams,
+    ) {
+        for layer in &mut self.document.layers {
+            if let Some(clip) = layer.clips.iter_mut().find(|c| &c.id == clip_id)
+                && let Some(vis) = clip_visual_props_mut(clip)
+            {
+                vis.x.clone_from(&updated.x);
+                vis.y.clone_from(&updated.y);
+                vis.scale_x.clone_from(&updated.scale_x);
+                vis.scale_y.clone_from(&updated.scale_y);
+                vis.rotation_deg.clone_from(&updated.rotation_deg);
+                vis.anchor_x.clone_from(&updated.anchor_x);
+                vis.anchor_y.clone_from(&updated.anchor_y);
+                return;
+            }
+        }
+    }
+
+    fn restore_snapshot_transient(&mut self, snap: &PreviewClipDragSnapshot) {
+        for layer in &mut self.document.layers {
+            if let Some(clip) = layer.clips.iter_mut().find(|c| c.id == snap.clip_id)
+                && let Some(vis) = clip_visual_props_mut(clip)
+            {
+                vis.x.clone_from(&snap.x);
+                vis.y.clone_from(&snap.y);
+                vis.scale_x.clone_from(&snap.scale_x);
+                vis.scale_y.clone_from(&snap.scale_y);
+                vis.rotation_deg.clone_from(&snap.rotation_deg);
+                vis.anchor_x.clone_from(&snap.anchor_x);
+                vis.anchor_y.clone_from(&snap.anchor_y);
+                return;
+            }
+        }
+    }
+}
+
+fn collect_snapshot_diff_commands(
+    doc: &ProjectDocument,
+    snap: &PreviewClipDragSnapshot,
+    out: &mut Vec<EditCommand>,
+) {
+    let Some((_, clip)) = doc.find_clip(&snap.clip_id) else {
+        return;
+    };
+    let Some(curr) = clip_visual_props(clip) else {
+        return;
+    };
+    for (path, before, after) in [
+        (ParameterPath::X, &snap.x, &curr.x),
+        (ParameterPath::Y, &snap.y, &curr.y),
+        (ParameterPath::ScaleX, &snap.scale_x, &curr.scale_x),
+        (ParameterPath::ScaleY, &snap.scale_y, &curr.scale_y),
+        (
+            ParameterPath::RotationDeg,
+            &snap.rotation_deg,
+            &curr.rotation_deg,
+        ),
+        (ParameterPath::AnchorX, &snap.anchor_x, &curr.anchor_x),
+        (ParameterPath::AnchorY, &snap.anchor_y, &curr.anchor_y),
+    ] {
+        if before != after {
+            out.push(EditCommand::SetParameter {
+                target: ParameterTarget::Clip {
+                    clip_id: ClipRef::Id(snap.clip_id.clone()),
+                },
+                path,
+                value: ParameterValue::Animated {
+                    param: after.clone(),
+                },
+            });
+        }
+    }
+}
+
+fn collect_timeline_boundaries(doc: &ProjectDocument) -> Vec<u64> {
+    let mut frames = Vec::new();
+    frames.push(0);
+    for layer in &doc.layers {
+        for clip in &layer.clips {
+            let start = clip.timeline_start.get();
+            frames.push(start);
+            if let Ok(end) = clip.timeline_end() {
+                frames.push(end.get());
+            }
+            for mp in clip.visible_midpoints() {
+                let rel = mp - clip.effect_offset_frames;
+                if rel > 0 {
+                    frames.push(start.saturating_add(u64::try_from(rel).unwrap_or(0)));
+                }
+            }
+        }
+    }
+    frames.sort_unstable();
+    frames.dedup();
+    frames
+}
+
+fn probe_relink_kind(path: &Path, fps: FrameRate) -> Option<AssetKind> {
+    let info = probe_media(path, BackendPreference::Auto).ok()?;
+    match classify_extension(path) {
+        MediaExtensionKind::Image => Some(AssetKind::Image {
+            width: info.width.unwrap_or(1920).max(1),
+            height: info.height.unwrap_or(1080).max(1),
+        }),
+        MediaExtensionKind::Audio => {
+            let (source_duration, _) =
+                quantize_source_duration_and_frames(info.duration_seconds, 1.0, fps).ok()?;
+            Some(AssetKind::Audio {
+                sample_rate_hz: info.audio_sample_rate.unwrap_or(48_000).max(1),
+                channels: info.audio_channels.unwrap_or(2).clamp(1, 8),
+                source_duration,
+            })
+        }
+        MediaExtensionKind::Video => {
+            let (source_duration, frame_count) =
+                quantize_source_duration_and_frames(info.duration_seconds, 2.0, fps).ok()?;
+            let default_fps = info
+                .frame_rate_num
+                .zip(info.frame_rate_den)
+                .and_then(|(n, d)| FrameRate::new(n.max(1), d.max(1)).ok());
+            Some(AssetKind::Video {
+                has_audio: info.has_audio,
+                default_fps,
+                duration_frames: Some(frame_count),
+                width: info.width,
+                height: info.height,
+                source_duration,
+            })
+        }
     }
 }
 

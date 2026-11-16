@@ -113,6 +113,16 @@ impl AudioMixer {
         self.sources.get(asset_id)
     }
 
+    /// 登録済みデコード音声ソースの `Arc` 参照を共有する軽量ミキサ複製を返す（バックグラウンド波形生成用）。
+    #[must_use]
+    pub fn snapshot_sources(&self) -> Self {
+        let mut cloned = Self::new();
+        for (asset_id, pcm) in &self.sources {
+            cloned.register_pcm(asset_id.clone(), Arc::clone(pcm));
+        }
+        cloned
+    }
+
     /// 指定アセット・ビン幅の波形ピークキャッシュを取得または生成する。
     #[must_use]
     pub fn waveform_peaks(

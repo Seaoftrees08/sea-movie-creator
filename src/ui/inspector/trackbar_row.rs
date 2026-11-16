@@ -153,6 +153,34 @@ impl InspectorWidgetBank {
         self.track_inputs.get(&(slot, is_end))
     }
 
+    /// インスペクタ内の全単一行テキスト・数値入力欄をイテレートする。
+    pub fn all_text_inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
+        self.track_inputs
+            .values()
+            .chain(self.bezier_inputs.iter())
+            .chain([
+                &self.font_family_input,
+                &self.outline_width_input,
+                &self.expr_input,
+                &self.expr_offset_input,
+                &self.expr_scale_input,
+                &self.multi_dx_input,
+                &self.multi_dy_input,
+            ])
+    }
+
+    /// インスペクタ内のいずれかのテキスト・数値入力欄がフォーカス中かを判定する。
+    #[must_use]
+    pub fn is_any_input_focused(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.subtitle_textarea
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            || self
+                .all_text_inputs()
+                .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     /// フォーカス保護付きでコントローラ状態から全ウィジェット表示を同期する。
     pub fn sync_from_controller(
         &self,
