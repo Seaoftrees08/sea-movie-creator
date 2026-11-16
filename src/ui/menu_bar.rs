@@ -183,9 +183,31 @@ pub fn update_app_menus(cx: &mut App, state: MenuCheckState) {
     cx.set_menus(build_app_menus(state));
 }
 
+fn is_editor_main_binding(binding: &KeyBinding) -> bool {
+    matches!(
+        binding.predicate().as_deref(),
+        Some(KeyBindingContextPredicate::Identifier(name)) if name == "EditorMain"
+    )
+}
+
 /// [`KeyConfig`] の全割り当てを `"EditorMain"` コンテキストへ再登録する。
+///
+/// `gpui_kit::init(cx)` が登録した `"Input"`（`Backspace` / `Delete` / 矢印キー等）や
+/// 各標準ウィジェットのキーバインドを保持したまま、`"EditorMain"` コンテキスト分のみを更新する。
 pub fn apply_key_config_bindings(cx: &mut App, config: &KeyConfig) {
+    let preserved: Vec<KeyBinding> = {
+        let map_handle = cx.key_bindings();
+        let km = map_handle.borrow();
+        km.bindings()
+            .filter(|kb| !is_editor_main_binding(kb))
+            .cloned()
+            .collect()
+    };
     cx.clear_key_bindings();
+    if !preserved.is_empty() {
+        cx.bind_keys(preserved);
+    }
+
     let editor_ctx: Option<Rc<KeyBindingContextPredicate>> =
         KeyBindingContextPredicate::parse("EditorMain")
             .ok()
@@ -427,5 +449,24 @@ fn build_export_menu() -> Menu {
             MenuItem::action("選択範囲のみを書き出し...", ExportSelectionDialogAction),
         ],
         disabled: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::KeyBinding;
+    use gpui_kit::component::input::Backspace;
+
+    use super::{DeleteClip, is_editor_main_binding};
+
+    #[test]
+    fn key_config_preserve_filter_keeps_input_and_replaces_editor_main() {
+        let input_bs = KeyBinding::new("backspace", Backspace, Some("Input"));
+        let editor_bs = KeyBinding::new("backspace", DeleteClip, Some("EditorMain"));
+        let global_action = KeyBinding::new("backspace", DeleteClip, None);
+
+        assert!(!is_editor_main_binding(&input_bs));
+        assert!(is_editor_main_binding(&editor_bs));
+        assert!(!is_editor_main_binding(&global_action));
     }
 }

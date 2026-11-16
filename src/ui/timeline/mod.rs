@@ -11,8 +11,8 @@ use std::rc::Rc;
 use gpui_kit::component::{VirtualListScrollHandle, h_flex, v_flex, v_virtual_list};
 use gpui_kit::{
     AnyElement, Context, ExternalPaths, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, ScrollDelta, ScrollEvent,
-    Size, Styled as _, Window, div, point, px, rgba, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PinchEvent, ScrollDelta,
+    ScrollEvent, Size, Styled as _, Window, div, point, px, rgba, size,
 };
 
 use crate::core::time::FrameIndex;
@@ -25,8 +25,9 @@ use crate::ui::window::SeaEditorWindow;
 use self::ruler::{compute_ruler_ticks, render_timeline_ruler};
 use self::state::{
     H_SCROLLBAR_HEIGHT_PX, TIMELINE_HEADER_HEIGHT_PX, TRACK_HEADER_WIDTH, TimelinePointerGesture,
-    frame_at_canvas_local_x, frame_at_timeline_window_x, row_height_px,
-    set_timeline_zoom_ratio_anchored, zoom_ratio_from_px_per_frame, zoom_timeline_anchored,
+    compute_horizontal_scroll_frames, compute_wheel_zoom_factor, frame_at_canvas_local_x,
+    frame_at_timeline_window_x, row_height_px, set_timeline_zoom_ratio_anchored,
+    should_scroll_tracks_vertically, zoom_ratio_from_px_per_frame, zoom_timeline_anchored,
 };
 use self::track_view::render_track_row;
 
@@ -70,11 +71,18 @@ pub fn render_timeline_panel(
     );
 
     v_flex()
+        .id("timeline-panel-root")
         .size_full()
         .relative()
         .bg(rgba(0x181b_21ff))
         .border_t_1()
         .border_color(rgba(0x363c_49ff))
+        .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
+            handle_timeline_scroll_wheel(this, ev, cx);
+        }))
+        .on_pinch(cx.listener(|this, ev: &PinchEvent, _, cx| {
+            handle_timeline_pinch_zoom(this, ev, cx);
+        }))
         .drag_over::<ExternalPaths>(|style, _, _, _| {
             style
                 .bg(rgba(0x0f17_2a33))
@@ -408,9 +416,6 @@ fn render_track_viewport(
         .w_full()
         .relative()
         .overflow_hidden()
-        .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
-            handle_timeline_scroll_wheel(this, ev, cx);
-        }))
         .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
             handle_timeline_window_mouse_move(this, ev, window, cx);
         }))
@@ -550,7 +555,8 @@ fn render_h_scrollbar(
         )
 }
 
-/// タイムライン上のマウスホイール（`Ctrl`+ホイール=カーソル基準拡大縮小、`Shift`+ホイール=横スクロール、通常=縦スクロール）を処理する。
+/// タイムライン上のマウスホイール（`Ctrl`+ホイール=カーソル基準拡大縮小、通常=時間軸スクロール、
+/// 左トラックヘッダ上／`Alt`+ホイール=縦トラック一覧スクロール）を処理する。
 #[allow(clippy::cast_possible_truncation)]
 pub fn handle_timeline_scroll_wheel(
     this: &mut SeaEditorWindow,
@@ -561,37 +567,75 @@ pub fn handle_timeline_scroll_wheel(
         ScrollDelta::Pixels(pt) => (f32::from(pt.x), f32::from(pt.y)),
         ScrollDelta::Lines(pt) => (pt.x * 36.0, pt.y * 36.0),
     };
+    if dx.abs() < 1e-4 && dy.abs() < 1e-4 {
+        return;
+    }
+
     if ev.modifiers.control {
+        let Some(factor) = compute_wheel_zoom_factor(dx, dy) else {
+            return;
+        };
         let cursor_canvas_x =
             (f32::from(ev.position.x) - this.controller.timeline_canvas_origin_x()).max(0.0);
-        let factor = if dy >= 0.0 { 1.18 } else { 1.0 / 1.18 };
         zoom_timeline_anchored(&mut this.controller, factor, cursor_canvas_x);
+        this.timeline_scroll
+            .base_handle()
+            .set_offset(point(px(0.0), px(-this.controller.timeline_scroll_y_px)));
+        cx.stop_propagation();
         cx.notify();
         return;
     }
 
-    if ev.modifiers.shift || dx.abs() > dy.abs() {
-        let delta_px = if dx.abs() > dy.abs() { dx } else { dy };
-        let ppf = this
-            .controller
-            .timeline_px_per_frame
-            .max(MIN_TIMELINE_PX_PER_FRAME);
-        let delta_frames = (-delta_px / ppf).round() as i64;
-        let next =
-            i64::try_from(this.controller.timeline_scroll_x_frames).unwrap_or(0) + delta_frames;
-        this.controller.timeline_scroll_x_frames = u64::try_from(next.max(0)).unwrap_or(0);
+    if should_scroll_tracks_vertically(
+        f32::from(ev.position.x),
+        this.controller.timeline_canvas_origin_x(),
+        ev.modifiers.alt,
+        ev.modifiers.shift,
+        dx,
+        dy,
+    ) {
+        let row_h = row_height_px(this.controller.timeline_row_density);
+        #[allow(clippy::cast_precision_loss)]
+        let max_y = (this.controller.document.layers.len() as f32 * row_h).max(0.0);
+        let next_y = (-this.controller.timeline_scroll_y_px + dy).clamp(-max_y, 0.0);
+        this.timeline_scroll
+            .base_handle()
+            .set_offset(point(px(0.0), px(next_y)));
+        this.controller.timeline_scroll_y_px = (-next_y).max(0.0);
+        cx.stop_propagation();
         cx.notify();
         return;
     }
 
-    let base = this.timeline_scroll.base_handle();
-    let cur = base.offset();
-    let row_h = row_height_px(this.controller.timeline_row_density);
-    #[allow(clippy::cast_precision_loss)]
-    let max_y = (this.controller.document.layers.len() as f32 * row_h).max(0.0);
-    let next_y = (f32::from(cur.y) + dy).clamp(-max_y, 0.0);
-    base.set_offset(point(cur.x, px(next_y)));
-    this.controller.timeline_scroll_y_px = (-next_y).max(0.0);
+    if let Some(next_scroll) = compute_horizontal_scroll_frames(
+        this.controller.timeline_scroll_x_frames,
+        dx,
+        dy,
+        this.controller.timeline_px_per_frame,
+    ) {
+        this.controller.timeline_scroll_x_frames = next_scroll;
+    }
+    this.timeline_scroll
+        .base_handle()
+        .set_offset(point(px(0.0), px(-this.controller.timeline_scroll_y_px)));
+    cx.stop_propagation();
+    cx.notify();
+}
+
+/// タッチパッドのピンチジェスチャーでカーソル位置基準のタイムライン縮尺を変更する。
+pub fn handle_timeline_pinch_zoom(
+    this: &mut SeaEditorWindow,
+    ev: &PinchEvent,
+    cx: &mut Context<SeaEditorWindow>,
+) {
+    if ev.delta.abs() < 1e-4 {
+        return;
+    }
+    let factor = (1.0 + ev.delta).clamp(0.5, 2.0);
+    let cursor_canvas_x =
+        (f32::from(ev.position.x) - this.controller.timeline_canvas_origin_x()).max(0.0);
+    zoom_timeline_anchored(&mut this.controller, factor, cursor_canvas_x);
+    cx.stop_propagation();
     cx.notify();
 }
 

@@ -150,6 +150,58 @@ pub fn set_timeline_zoom_ratio_anchored(
     zoom_timeline_anchored(controller, factor, anchor_canvas_x);
 }
 
+/// ホイール増分 `(dx, dy)` から `Ctrl+スクロール` ズーム倍率を算出する。
+///
+/// デルタがほぼ `0`（トラックパッド終了イベント等）の場合は `None` を返す。
+#[must_use]
+pub fn compute_wheel_zoom_factor(dx: f32, dy: f32) -> Option<f32> {
+    let delta = if dy.abs() >= dx.abs() { dy } else { dx };
+    if delta.abs() < 1e-4 {
+        return None;
+    }
+    let steps = (delta / 108.0).clamp(-4.0, 4.0);
+    Some(1.22_f32.powf(steps))
+}
+
+/// マウススクロール増分 `(dx, dy)` から水平タイムラインスクロール後の先頭フレーム位置を算出する。
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn compute_horizontal_scroll_frames(
+    current_scroll_frames: u64,
+    dx: f32,
+    dy: f32,
+    px_per_frame: f32,
+) -> Option<u64> {
+    let delta_px = if dx.abs() > dy.abs() { dx } else { dy };
+    if delta_px.abs() < 1e-4 {
+        return None;
+    }
+    let safe_ppf = px_per_frame.max(MIN_TIMELINE_PX_PER_FRAME);
+    let mut delta_frames = (-delta_px / safe_ppf).round() as i64;
+    if delta_frames == 0 && delta_px.abs() >= 4.0 {
+        delta_frames = if delta_px < 0.0 { 1 } else { -1 };
+    }
+    let next = i64::try_from(current_scroll_frames).unwrap_or(0) + delta_frames;
+    Some(u64::try_from(next.max(0)).unwrap_or(0))
+}
+
+/// 左側トラックヘッダ上または `Alt` 併用時のみ縦トラック一覧スクロールとして扱うかを判定する。
+#[must_use]
+pub fn should_scroll_tracks_vertically(
+    cursor_x: f32,
+    canvas_origin_x: f32,
+    alt_held: bool,
+    shift_held: bool,
+    dx: f32,
+    dy: f32,
+) -> bool {
+    let vertical_dominant = dy.abs() >= dx.abs() && dy.abs() >= 1e-4;
+    if !vertical_dominant {
+        return false;
+    }
+    alt_held || (cursor_x < canvas_origin_x && !shift_held)
+}
+
 /// タイムライン長入力モーダルの文字列（例: `300`, `300f`, `10s`, `00:00:10:00`）をフレーム数へ変換する。
 ///
 /// # Errors
@@ -1235,4 +1287,64 @@ pub enum TimelinePointerGesture {
         /// 総コンテンツ幅（フレーム）。
         content_frames: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TRACK_HEADER_WIDTH, compute_horizontal_scroll_frames, compute_wheel_zoom_factor,
+        should_scroll_tracks_vertically,
+    };
+
+    #[test]
+    fn timeline_wheel_scroll_and_zoom_math_behave_as_expected() {
+        // 下回転 (dy < 0) で時間軸右方向へスクロールし、上回転 (dy > 0) で左へ戻る
+        assert_eq!(
+            compute_horizontal_scroll_frames(0, 0.0, -108.0, 3.0),
+            Some(36)
+        );
+        assert_eq!(
+            compute_horizontal_scroll_frames(36, 0.0, 108.0, 3.0),
+            Some(0)
+        );
+        // 高倍率時 (32px/frame) の微少スクロールでも最低 1 フレーム進む
+        assert_eq!(
+            compute_horizontal_scroll_frames(10, 0.0, -8.0, 32.0),
+            Some(11)
+        );
+        assert_eq!(compute_horizontal_scroll_frames(10, 0.0, 0.0, 3.0), None);
+
+        // Ctrl+スクロールは上回転で拡大 (>1.0)、下回転で縮小 (<1.0)、0 デルタは None
+        let zoom_in = compute_wheel_zoom_factor(0.0, 108.0).unwrap_or(0.0);
+        let zoom_out = compute_wheel_zoom_factor(0.0, -108.0).unwrap_or(0.0);
+        assert!(zoom_in > 1.2);
+        assert!(zoom_out < 0.85 && zoom_out > 0.5);
+        assert_eq!(compute_wheel_zoom_factor(0.0, 0.0), None);
+
+        // キャンバス上の通常ホイールは横スクロール、トラックヘッダ上または Alt+ホイールは縦スクロール
+        assert!(!should_scroll_tracks_vertically(
+            TRACK_HEADER_WIDTH + 120.0,
+            TRACK_HEADER_WIDTH,
+            false,
+            false,
+            0.0,
+            -108.0
+        ));
+        assert!(should_scroll_tracks_vertically(
+            40.0,
+            TRACK_HEADER_WIDTH,
+            false,
+            false,
+            0.0,
+            -108.0
+        ));
+        assert!(should_scroll_tracks_vertically(
+            TRACK_HEADER_WIDTH + 120.0,
+            TRACK_HEADER_WIDTH,
+            true,
+            false,
+            0.0,
+            -108.0
+        ));
+    }
 }
