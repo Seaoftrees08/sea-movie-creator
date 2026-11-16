@@ -1,8 +1,9 @@
 # [002-02] 拡張編集タイムライン UI/UX 詳細仕様
 
-- **ステータス**: Draft
+- **ステータス**: Implemented
 - **作成日**: 2026-11-16
 - **更新日**: 2026-11-16
+- **対応フェーズ**: Phase D-2 / D-5 実装完了
 - **関連ドキュメント**:
   - 概要設計書: [`README.md`](README.md)
   - データモデル＆コマンド仕様: [`01-data-model-and-commands.md`](01-data-model-and-commands.md)

@@ -1,8 +1,9 @@
 # [002-05] AviUtl 準拠 UI 段階的実装計画（Phase D-1 〜 D-6）
 
-- **ステータス**: Draft
+- **ステータス**: Implemented
 - **作成日**: 2026-11-16
 - **更新日**: 2026-11-16
+- **完了状況**: Phase D-1 〜 D-6 実装・自動テスト完了（セクション 7 は手動 GUI 確認チェックリスト）
 - **関連ドキュメント**:
   - 概要設計書: [`README.md`](README.md)
   - データモデル＆コマンド仕様: [`01-data-model-and-commands.md`](01-data-model-and-commands.md)

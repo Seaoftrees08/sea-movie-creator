@@ -1,8 +1,9 @@
 # [002] AviUtl 準拠 UI 大幅修正設計書（全体概要・レイアウト設計）
 
-- **ステータス**: Draft
+- **ステータス**: Implemented
 - **作成日**: 2026-11-16
 - **更新日**: 2026-11-16
+- **実装範囲**: Phase D-1 〜 D-6 完了
 - **関連ドキュメント**:
   - 全体基本設計書: [`../draft.md`](../draft.md)
   - 初期実装要件メモ: [`../completed/initial-implementation/draft.md`](../completed/initial-implementation/draft.md)
