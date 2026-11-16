@@ -36,6 +36,7 @@ cargo test --workspace --all-targets --all-features
 
 - `.github/` — AI アシスタント向けインストラクション、CI マトリックスワークフロー（`ci.yml`）
 - `src/` — アプリケーション本体（`ai` / `audio` / `core` / `export` / `media` / `timeline` / `ui`）
+- `lang/` — 多言語 UI カタログ定義（`ja.json`, `en.json` 等。`<code >.json` の追加だけで多言語対応可能）
 - `plugins/` — 書き出し（`export/`）・AI（`ai/`）プラグインのマニフェスト定義（`plugin.json` / `ai-plugin.json`）
 - `plugins_src/` — 別プロセスプラグインおよびプロトコルクレート（`sea-export-*` / `sea-ai-*` / `sea-audio-host` / `sea-export-protocol`）
 - `tests/` — 結合テスト・E2E テスト（`tests/<実装名>.rs` + `tests/<実装名>/`）
@@ -49,6 +50,7 @@ cargo test --workspace --all-targets --all-features
   - [はじめに（導入・ビルド・起動方法）](docs/getting-started.md)
   - [ユーザーガイド（画面構成・編集・書き出し）](docs/user-guide.md)
   - [AI 連携・MCP・音声プラグインガイド](docs/ai-and-plugins.md)
+  - [多言語ファイル (`lang/*.json`) 作成ガイド](docs/localization.md)
   - [トラブルシューティング・FAQ](docs/troubleshooting.md)
 - 開発設計ドキュメント: [dev-doc/README.md](dev-doc/README.md)
 - 全体基本設計書: [dev-doc/draft.md](dev-doc/draft.md)
