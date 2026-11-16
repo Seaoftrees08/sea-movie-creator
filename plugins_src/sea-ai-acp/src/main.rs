@@ -7,6 +7,17 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitCode, Stdio};
 
+fn apply_background_process_flags(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -199,7 +210,9 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
         "message": format!("ACP エージェント ({}) に接続中...", agent_bin.display()),
     }));
 
-    let mut child = Command::new(&agent_bin)
+    let mut cmd = Command::new(&agent_bin);
+    apply_background_process_flags(&mut cmd);
+    let mut child = cmd
         .args(&agent_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

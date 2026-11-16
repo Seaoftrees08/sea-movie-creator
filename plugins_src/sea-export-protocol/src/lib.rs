@@ -6,6 +6,19 @@ pub mod external_ffmpeg;
 
 use std::io::{BufRead, Write};
 use std::ops::Range;
+use std::process::Command;
+
+/// Windows 上で GUI プロセスから子プロセスを起動した際にコンソールウィンドウが一瞬開くのを防ぐ (`CREATE_NO_WINDOW`)。
+pub fn apply_background_process_flags(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -456,5 +469,12 @@ mod tests {
         let decoded_evt: PluginToHostMessage = read_json_line(&mut evt_cursor)?;
         assert_eq!(decoded_evt, evt);
         Ok(())
+    }
+
+    #[test]
+    fn background_process_flags_configure_command_cleanly() {
+        let mut cmd = Command::new("cmd");
+        apply_background_process_flags(&mut cmd);
+        assert_eq!(cmd.get_program(), "cmd");
     }
 }

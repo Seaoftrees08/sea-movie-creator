@@ -435,7 +435,9 @@ impl PluginChildSession {
         shm: ShmHostRegion,
         init_payload: ExportInitPayload,
     ) -> Result<Self, ExportError> {
-        let mut child = Command::new(exe_path)
+        let mut cmd = Command::new(exe_path);
+        sea_export_protocol::apply_background_process_flags(&mut cmd);
+        let mut child = cmd
             .args(extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

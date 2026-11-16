@@ -392,6 +392,7 @@ impl AiPluginProvider {
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
         let mut cmd = Command::new(&self.executable_path);
+        sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -478,6 +479,7 @@ impl AiPluginProvider {
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
         let mut cmd = Command::new(&self.executable_path);
+        sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

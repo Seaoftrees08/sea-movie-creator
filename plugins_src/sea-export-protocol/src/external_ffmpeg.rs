@@ -99,6 +99,7 @@ impl ExternalFfmpegSession {
         let temp_video_str = temp_video_path.to_string_lossy().into_owned();
 
         let mut cmd = Command::new(trimmed);
+        crate::apply_background_process_flags(&mut cmd);
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -263,7 +264,9 @@ impl ExternalFfmpegSession {
         let sr_arg = self.sample_rate.to_string();
         let ch_arg = self.audio_channels.to_string();
 
-        let output = Command::new(&self.ffmpeg_cmd)
+        let mut cmd = Command::new(&self.ffmpeg_cmd);
+        crate::apply_background_process_flags(&mut cmd);
+        let output = cmd
             .args([
                 "-hide_banner",
                 "-loglevel",

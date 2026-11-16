@@ -119,7 +119,9 @@ impl IsolatedAudioPluginHost {
             .map_err(|e| format!("failed to allocate audio SHM: {e}"))?;
         let shm_path_str = shm.path().to_string_lossy().into_owned();
 
-        let mut child = Command::new(&exe_path)
+        let mut cmd = Command::new(&exe_path);
+        sea_export_protocol::apply_background_process_flags(&mut cmd);
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -1,5 +1,7 @@
 //! `sea-movie-creator` のアプリケーションエントリポイント。
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
