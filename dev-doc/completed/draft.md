@@ -1,6 +1,6 @@
 # `sea-movie-creator` 基本設計書（Architecture & AI-Native Design Draft）
 
-- **ステータス**: Draft
+- **ステータス**: Implemented
 - **作成日**: 2026-11-15
 - **更新日**: 2026-11-16
 - **関連ドキュメント**:
