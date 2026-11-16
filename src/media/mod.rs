@@ -5,5 +5,6 @@ pub mod compositor;
 pub mod decoder;
 pub mod frame_cache;
 pub mod image_loader;
+pub mod prefetch;
 pub mod subtitle_renderer;
 pub mod visual_properties;

@@ -51,6 +51,7 @@ use crate::ui::menu_bar::{
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
 use crate::ui::right_panel::{RightPanelWidgets, render_right_panel};
+use crate::ui::surface_bridge::PreviewSurfaceBridge as _;
 use crate::ui::timeline_panel::{
     TRACK_HEADER_WIDTH, handle_timeline_window_mouse_move, handle_timeline_window_mouse_up,
     parse_timeline_length_input, render_timeline_length_modal_overlay, render_timeline_panel,
@@ -355,11 +356,15 @@ impl SeaEditorWindow {
 
                 let keep_going = this.update(cx, |view, cx| {
                     let prev_frame = view.controller.clock.current_frame().get();
+                    let prev_surface_id = view.controller.surface_bridge.current_frame_id();
+                    let prev_play_state = view.controller.playback_state;
                     view.controller.tick_playback(elapsed);
                     let export_changed = view.controller.poll_export_status();
                     let ai_changed = view.controller.poll_ai_chat();
                     let waveform_changed = view.controller.tick_master_waveform();
                     if view.controller.clock.current_frame().get() != prev_frame
+                        || view.controller.surface_bridge.current_frame_id() != prev_surface_id
+                        || view.controller.playback_state != prev_play_state
                         || export_changed
                         || ai_changed
                         || waveform_changed
@@ -1248,6 +1253,9 @@ impl SeaEditorWindow {
 
 impl Render for SeaEditorWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for stale_img in self.controller.surface_bridge.drain_pending_drops() {
+            let _ = window.drop_image(stale_img);
+        }
         let _ = self.controller.tick_master_waveform();
         if self.sliders_dirty {
             self.sync_sliders_now(window, cx);

@@ -1,7 +1,7 @@
 //! GUI 非依存のアプリ状態・メディア読込・再生状態機械・コマンド統括コントローラ。
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -17,9 +17,11 @@ use crate::core::time::{
 };
 use crate::media::compositor::WgpuCompositor;
 use crate::media::decoder::{
-    BackendPreference, VideoDecoder, open_audio_decoder, open_video_decoder, probe_media,
+    BackendPreference, VideoDecoder, VideoFrameBuffer, open_audio_decoder, open_video_decoder,
+    probe_media,
 };
 use crate::media::frame_cache::{FrameCache, FrameCacheKey};
+use crate::media::prefetch::{PrefetchRequest, VideoPrefetchWorker};
 use crate::timeline::command::{
     EditCommand, NewClipKind, NewClipSpec, ParameterPath, ParameterTarget, ParameterValue,
 };
@@ -39,13 +41,12 @@ use crate::ui::preview::{
     compute_drag_updated_clip, hit_test_preview_layers, hit_test_selection_handle,
     shift_animated_param,
 };
-use crate::ui::surface_bridge::{
-    PreviewSurfaceBridge, RenderImageSurfaceBridge, composite_with_gpu_or_fallback,
-};
+use crate::ui::surface_bridge::{RenderImageSurfaceBridge, submit_composite_preview_to_bridge};
 
-const DEFAULT_FRAME_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const PREVIEW_CANVAS_MAX_WIDTH: u32 = 480;
+const DEFAULT_FRAME_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const PREVIEW_CANVAS_MAX_WIDTH: u32 = 1920;
 const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
+const PLAYBACK_PREFETCH_LOOKAHEAD_FRAMES: u64 = 16;
 /// 右インスペクタパネルの最小許容幅 (px)。
 pub const MIN_RIGHT_PANEL_WIDTH: f32 = 240.0;
 /// タイムライン拡大率の最小値 (px / frame)。
@@ -307,6 +308,12 @@ pub struct AppController {
     dirty_preview: bool,
     /// アクティブな動画デコーダ（素材 ID ごと）。
     video_decoders: HashMap<AssetId, Box<dyn VideoDecoder>>,
+    /// 再生時の非同期映像先読みデコードワーカー。
+    video_prefetcher: VideoPrefetchWorker,
+    /// 直近表示できた映像アセットごとの直近フレーム（先読み待ち時の UI ブロック回避用）。
+    last_played_video_frames: HashMap<AssetId, Arc<VideoFrameBuffer>>,
+    /// 直近フレーム描画で先読み待ちの直前フレーム保持を使った場合 `true`。
+    rendered_frame_was_stale: bool,
     /// VS Code 風 AI チャットパネル状態・提案カード・履歴。
     pub ai_chat: crate::ui::ai_chat_panel::AiChatState,
     /// タイムライン 1 フレームあたりの横幅（px）。
@@ -344,6 +351,7 @@ pub struct AppController {
     /// 音声デバイス稼働状態と共有スナップショット。
     audio_shared: SharedPlaybackState,
     audio_handle: Option<AudioOutputHandle>,
+    audio_output_requested: bool,
     gpu_compositor: Option<WgpuCompositor>,
     next_id_seq: u64,
 }
@@ -414,6 +422,9 @@ impl AppController {
             last_rendered_frame: None,
             dirty_preview: true,
             video_decoders: HashMap::new(),
+            video_prefetcher: VideoPrefetchWorker::new(),
+            last_played_video_frames: HashMap::new(),
+            rendered_frame_was_stale: false,
             ai_chat: crate::ui::ai_chat_panel::AiChatState::default(),
             timeline_px_per_frame: 3.0,
             timeline_scroll_x_frames: 0,
@@ -433,6 +444,7 @@ impl AppController {
             preview_waveform_bounds: Rc::new(Cell::new((0.0, 0.0, 960.0, 34.0))),
             audio_shared,
             audio_handle: None,
+            audio_output_requested: false,
             gpu_compositor: WgpuCompositor::try_new().ok(),
             next_id_seq: 1,
         };
@@ -442,10 +454,12 @@ impl AppController {
 
     /// OS 既定オーディオデバイスの起動を試行する（未接続時はシステム時計フォールバックを維持）。
     pub fn try_start_audio_output(&mut self) {
+        self.audio_output_requested = true;
         if self.audio_handle.is_some() {
             return;
         }
         if let Ok(handle) = start_audio_output(&self.audio_shared) {
+            self.clock.set_sample_rate(handle.sample_rate());
             self.status_message = format!("Audio output active ({} Hz)", handle.sample_rate());
             self.audio_handle = Some(handle);
         }
@@ -473,6 +487,9 @@ impl AppController {
         self.frame_cache.clear();
         self.mixer = AudioMixer::new();
         self.video_decoders.clear();
+        self.video_prefetcher.invalidate_generation(true);
+        self.last_played_video_frames.clear();
+        self.rendered_frame_was_stale = false;
         self.selected_layer_id = None;
         self.clear_clip_selection();
         self.timeline_gesture = None;
@@ -500,6 +517,9 @@ impl AppController {
         self.frame_cache.clear();
         self.mixer = AudioMixer::new();
         self.video_decoders.clear();
+        self.video_prefetcher.invalidate_generation(true);
+        self.last_played_video_frames.clear();
+        self.rendered_frame_was_stale = false;
         let first_clip = self
             .document
             .layers
@@ -581,6 +601,7 @@ impl AppController {
             self.select_single_clip(Some(new_clip.clone()));
         }
         self.selected_layer_id = Some(layer_id);
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_shared_state();
         self.dirty_preview = true;
         self.refresh_preview_now();
@@ -735,6 +756,7 @@ impl AppController {
         }
         self.select_single_clip(Some(clip_id.clone()));
         self.selected_layer_id = Some(layer_id);
+        self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_shared_state();
         self.dirty_preview = true;
         self.refresh_preview_now();
@@ -1126,12 +1148,17 @@ impl AppController {
 
     /// 再生を開始する。末尾にいる場合は先頭へ戻してから再生する。
     pub fn play(&mut self) {
+        if self.audio_output_requested && self.audio_handle.is_none() {
+            self.try_start_audio_output();
+        }
         let total = self.document.total_duration_frames();
+        self.clock.update_timeline_metrics(self.document.fps, total);
         if total > 0 && self.clock.current_frame().get() >= total {
             self.clock.seek_to_frame(FrameIndex::ZERO);
         }
         self.clock.set_playing(true);
         self.playback_state = PlaybackState::Playing;
+        self.schedule_playback_prefetch(self.clock.current_frame());
     }
 
     /// 現在位置で一時停止する。
@@ -1153,6 +1180,8 @@ impl AppController {
         self.clock.set_playing(false);
         self.clock.seek_to_frame(FrameIndex::ZERO);
         self.playback_state = PlaybackState::Stopped;
+        self.video_prefetcher.invalidate_generation(false);
+        self.rendered_frame_was_stale = false;
         self.dirty_preview = true;
         self.refresh_preview_now();
     }
@@ -1165,11 +1194,14 @@ impl AppController {
         let clamped = FrameIndex::new(frame.get().min(max_frame));
         let was_playing = self.playback_state == PlaybackState::Playing;
         self.playback_state = PlaybackState::Seeking;
+        self.video_prefetcher.invalidate_generation(false);
+        self.rendered_frame_was_stale = false;
         self.clock.seek_to_frame(clamped);
         self.apply_follow_selected_on_seek();
         self.dirty_preview = true;
         self.refresh_preview_now();
         self.playback_state = if was_playing {
+            self.schedule_playback_prefetch(clamped);
             PlaybackState::Playing
         } else if clamped.get() == 0 {
             PlaybackState::Stopped
@@ -1182,6 +1214,7 @@ impl AppController {
     ///
     /// 実音声デバイスが稼働していない場合は `clock.advance_by_elapsed_seconds` で単調時計フォールバックを進める。
     pub fn tick_playback(&mut self, elapsed_seconds: f64) {
+        let arrived_frames = self.drain_prefetched_frames();
         if self.playback_state == PlaybackState::Playing {
             if self.audio_handle.is_none() {
                 self.clock.advance_by_elapsed_seconds(elapsed_seconds);
@@ -1194,9 +1227,16 @@ impl AppController {
                 self.dirty_preview = true;
             }
         }
-        let now_frame = self.clock.current_frame().get();
-        if self.dirty_preview || self.last_rendered_frame != Some(now_frame) {
-            if self.last_rendered_frame != Some(now_frame) {
+        let now_frame = self.clock.current_frame();
+        if self.playback_state == PlaybackState::Playing {
+            self.schedule_playback_prefetch(now_frame);
+        }
+        let needs_late_refresh = arrived_frames && self.rendered_frame_was_stale;
+        if self.dirty_preview
+            || self.last_rendered_frame != Some(now_frame.get())
+            || needs_late_refresh
+        {
+            if self.last_rendered_frame != Some(now_frame.get()) {
                 self.apply_follow_selected_on_seek();
             }
             self.refresh_preview_now();
@@ -1251,21 +1291,31 @@ impl AppController {
     /// 現在再生位置のプレビューを合成して `surface_bridge` へ転送する。
     pub fn refresh_preview_now(&mut self) {
         let playhead = self.clock.current_frame();
-        self.ensure_decoded_frames_for_playhead(playhead);
+        let fallback_assets = self.ensure_decoded_frames_for_playhead(playhead);
+        self.rendered_frame_was_stale = !fallback_assets.is_empty();
 
         let (pw, ph) = preview_dimensions(&self.document);
         let cache = &mut self.frame_cache;
-        let output = composite_with_gpu_or_fallback(
+        let last_frames = &self.last_played_video_frames;
+        let missing = submit_composite_preview_to_bridge(
             &self.document,
             playhead,
-            pw,
-            ph,
+            (pw, ph),
             self.gpu_compositor.as_mut(),
-            &mut |asset_id, src_idx| cache.get(&FrameCacheKey::new(asset_id.clone(), src_idx, 100)),
+            &mut self.surface_bridge,
+            &mut |asset_id, src_idx| {
+                cache
+                    .get(&FrameCacheKey::new(asset_id.clone(), src_idx, 100))
+                    .or_else(|| {
+                        fallback_assets
+                            .contains(asset_id)
+                            .then(|| last_frames.get(asset_id).cloned())
+                            .flatten()
+                    })
+            },
         );
 
-        self.has_media_offline_at_playhead = output.has_missing_media;
-        self.surface_bridge.submit_bgra_frame(&output.buffer);
+        self.has_media_offline_at_playhead = missing;
         self.last_rendered_frame = Some(playhead.get());
         self.dirty_preview = false;
     }
@@ -1278,6 +1328,9 @@ impl AppController {
             .and_then(Path::parent)
             .filter(|p| !p.as_os_str().is_empty());
         resolve_document_assets(&mut self.document, dir);
+        self.video_decoders.clear();
+        self.video_prefetcher.invalidate_generation(true);
+        self.last_played_video_frames.clear();
         self.dirty_preview = true;
         self.refresh_preview_now();
     }
@@ -2512,9 +2565,10 @@ impl AppController {
     }
 
     fn load_audio_into_mixer(&mut self, asset_id: &AssetId, path: &Path) {
+        let target_sr = self.clock.sample_rate().max(1);
         if let Ok(mut dec) = open_audio_decoder(path, BackendPreference::Auto)
             && let Ok(pcm) = dec.decode_all_interleaved()
-            && let Ok(resampled) = resample_interleaved_pcm(&pcm, OUTPUT_SAMPLE_RATE_HZ)
+            && let Ok(resampled) = resample_interleaved_pcm(&pcm, target_sr)
         {
             self.mixer
                 .register_pcm(asset_id.clone(), Arc::new(resampled));
@@ -2538,14 +2592,18 @@ impl AppController {
         }
     }
 
-    fn ensure_decoded_frames_for_playhead(&mut self, playhead: FrameIndex) {
-        let project_dir = self
-            .project_path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty());
+    fn drain_prefetched_frames(&mut self) -> bool {
+        let drained = self.video_prefetcher.drain_completed(&mut self.frame_cache);
+        let any = !drained.is_empty();
+        for (asset_id, _frame_idx, buf) in drained {
+            self.last_played_video_frames.insert(asset_id, buf);
+        }
+        any
+    }
 
-        let mut needed: Vec<(AssetId, u64)> = Vec::new();
+    fn visible_video_sources_at(&self, playhead: FrameIndex) -> Vec<(AssetId, u64)> {
+        let fps = self.document.fps.as_f64();
+        let mut needed = Vec::new();
         for layer in &self.document.layers {
             if !layer.visible {
                 continue;
@@ -2565,24 +2623,100 @@ impl AppController {
                 {
                     let local = playhead.get().saturating_sub(start);
                     #[allow(clippy::cast_precision_loss)]
-                    let local_sec = (local as f64) / self.document.fps.as_f64();
+                    let local_sec = (local as f64) / fps;
                     let media_sec = source_in.as_seconds_f64() + local_sec * playback_rate.as_f64();
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let src_idx = (media_sec * self.document.fps.as_f64()).max(0.0).round() as u64;
+                    let src_idx = (media_sec * fps).max(0.0).round() as u64;
                     needed.push((asset_id.clone(), src_idx));
                 }
             }
         }
+        needed
+    }
+
+    fn schedule_playback_prefetch(&mut self, from_frame: FrameIndex) {
+        let total = self.document.total_duration_frames();
+        let project_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        let fps = self.document.fps.as_f64();
+
+        let mut requests = Vec::new();
+        let mut seen = HashSet::new();
+        for offset in 0..=PLAYBACK_PREFETCH_LOOKAHEAD_FRAMES {
+            let f = from_frame.get().saturating_add(offset);
+            if total > 0 && f >= total {
+                break;
+            }
+            let sources = self.visible_video_sources_at(FrameIndex::new(f));
+            for (asset_id, src_idx) in sources {
+                let key = FrameCacheKey::new(asset_id.clone(), src_idx, 100);
+                if !seen.insert(key.clone()) || self.video_prefetcher.is_pending(&key) {
+                    continue;
+                }
+                if self.frame_cache.get(&key).is_some() {
+                    continue;
+                }
+                let Some(asset) = self.document.find_asset(&asset_id) else {
+                    continue;
+                };
+                if asset.status != AssetStatus::Available {
+                    continue;
+                }
+                let Some(real_path) =
+                    resolve_existing_asset_path(&asset.path, project_dir.as_deref())
+                else {
+                    continue;
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let target_seconds = (src_idx as f64) / fps;
+                requests.push(PrefetchRequest {
+                    key,
+                    path: real_path,
+                    target_seconds,
+                });
+            }
+        }
+
+        if !requests.is_empty() {
+            self.video_prefetcher.enqueue_batch(&requests);
+        }
+    }
+
+    fn ensure_decoded_frames_for_playhead(&mut self, playhead: FrameIndex) -> HashSet<AssetId> {
+        let _ = self.drain_prefetched_frames();
+        let project_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+
+        let needed = self.visible_video_sources_at(playhead);
+        let mut fallback_assets = HashSet::new();
+        let is_playing = self.playback_state == PlaybackState::Playing;
 
         for (asset_id, src_idx) in needed {
             let key = FrameCacheKey::new(asset_id.clone(), src_idx, 100);
-            if self.frame_cache.get(&key).is_some() {
+            if let Some(hit) = self.frame_cache.get(&key) {
+                self.last_played_video_frames.insert(asset_id, hit);
+                continue;
+            }
+            if is_playing
+                && self.last_played_video_frames.contains_key(&asset_id)
+                && self.video_prefetcher.is_pending(&key)
+            {
+                fallback_assets.insert(asset_id);
                 continue;
             }
             if !self.video_decoders.contains_key(&asset_id)
                 && let Some(asset) = self.document.find_asset(&asset_id)
                 && asset.status == AssetStatus::Available
-                && let Some(real_path) = resolve_existing_asset_path(&asset.path, project_dir)
+                && let Some(real_path) =
+                    resolve_existing_asset_path(&asset.path, project_dir.as_deref())
                 && let Ok(dec) = open_video_decoder(&real_path, BackendPreference::Auto)
             {
                 self.video_decoders.insert(asset_id.clone(), dec);
@@ -2591,10 +2725,13 @@ impl AppController {
                 #[allow(clippy::cast_precision_loss)]
                 let target_sec = (src_idx as f64) / self.document.fps.as_f64();
                 if let Ok(Some(decoded)) = decoder.decode_frame_at_seconds(target_sec) {
-                    self.frame_cache.insert(key, Arc::new(decoded.buffer));
+                    let buf = Arc::new(decoded.buffer);
+                    self.frame_cache.insert(key, Arc::clone(&buf));
+                    self.last_played_video_frames.insert(asset_id, buf);
                 }
             }
         }
+        fallback_assets
     }
 
     /// 書き出し設定ダイアログを開き、既定パスからプラグイン一覧を自動検出する。
@@ -3782,6 +3919,19 @@ mod tests {
 
         controller.undo()?;
         assert!(!controller.document.layers[0].locked);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_dimensions_keep_full_hd_sharpness() -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("FHD");
+        doc.resolution = crate::timeline::document::ProjectResolution::HD_1080P;
+        assert_eq!(preview_dimensions(&doc), (1920, 1080));
+
+        let uhd_w = std::num::NonZeroU32::new(3840).ok_or("non-zero")?;
+        let uhd_h = std::num::NonZeroU32::new(2160).ok_or("non-zero")?;
+        doc.resolution = crate::timeline::document::ProjectResolution::new(uhd_w, uhd_h);
+        assert_eq!(preview_dimensions(&doc), (1920, 1080));
         Ok(())
     }
 }

@@ -102,6 +102,22 @@ impl PlaybackClock {
         self.sample_rate.load(Ordering::Acquire)
     }
 
+    /// 出力デバイスの実サンプルレートへ変更し、現在時刻を保つようサンプル位置を換算する。
+    pub fn set_sample_rate(&self, sample_rate: u32) {
+        let next_sr = sample_rate.max(1);
+        let prev_sr = self.sample_rate.swap(next_sr, Ordering::AcqRel).max(1);
+        if prev_sr == next_sr {
+            return;
+        }
+        let prev_sample = self.current_sample.load(Ordering::Acquire);
+        let scaled = u128::from(prev_sample)
+            .saturating_mul(u128::from(next_sr))
+            .saturating_add(u128::from(prev_sr / 2))
+            / u128::from(prev_sr);
+        let next_sample = u64::try_from(scaled).unwrap_or(u64::MAX);
+        self.current_sample.store(next_sample, Ordering::Release);
+    }
+
     /// 現在の再生ヘッドに相当するタイムラインフレーム位置を返す。
     #[must_use]
     pub fn current_frame(&self) -> FrameIndex {
@@ -264,34 +280,14 @@ pub fn start_audio_output(state: &SharedPlaybackState) -> Result<AudioOutputHand
         buffer_size: BufferSize::Default,
     };
 
-    if default_cfg.sample_format() != SampleFormat::F32 {
-        return Err(AudioError::DeviceError(format!(
-            "Phase A expects f32 output stream, got {:?}",
-            default_cfg.sample_format()
-        )));
-    }
-
-    let state_clone = state.clone();
-    let mut scratch_stereo = Vec::<f32>::with_capacity(2048);
-
-    let stream = device
-        .build_output_stream(
-            stream_cfg,
-            move |data: &mut [f32], _| {
-                render_callback_f32(
-                    &state_clone,
-                    &mut scratch_stereo,
-                    data,
-                    channels,
-                    sample_rate,
-                );
-            },
-            |_err| {
-                // コールバックエラーはスレッドパニックさせずに無視する（デバイス切断耐性）。
-            },
-            None,
-        )
-        .map_err(|err| AudioError::DeviceError(err.to_string()))?;
+    let stream = build_output_stream_for_format(
+        &device,
+        stream_cfg,
+        default_cfg.sample_format(),
+        state,
+        channels,
+        sample_rate,
+    )?;
 
     stream
         .play()
@@ -303,53 +299,192 @@ pub fn start_audio_output(state: &SharedPlaybackState) -> Result<AudioOutputHand
     })
 }
 
-fn render_callback_f32(
+#[derive(Clone, Copy)]
+struct OutputFormatConv<T, F> {
+    channels: usize,
+    sample_rate: u32,
+    silence: T,
+    convert: F,
+}
+
+fn build_output_stream_for_format(
+    device: &cpal::Device,
+    stream_cfg: StreamConfig,
+    format: SampleFormat,
+    state: &SharedPlaybackState,
+    channels: usize,
+    sample_rate: u32,
+) -> Result<Stream, AudioError> {
+    match format {
+        SampleFormat::F32 => build_typed_stream(
+            device,
+            stream_cfg,
+            state,
+            OutputFormatConv {
+                channels,
+                sample_rate,
+                silence: 0.0_f32,
+                convert: |s: f32| s.clamp(-1.0, 1.0),
+            },
+        ),
+        SampleFormat::I16 => build_typed_stream(
+            device,
+            stream_cfg,
+            state,
+            OutputFormatConv {
+                channels,
+                sample_rate,
+                silence: 0_i16,
+                convert: f32_to_i16,
+            },
+        ),
+        SampleFormat::U16 => build_typed_stream(
+            device,
+            stream_cfg,
+            state,
+            OutputFormatConv {
+                channels,
+                sample_rate,
+                silence: 32_768_u16,
+                convert: f32_to_u16,
+            },
+        ),
+        SampleFormat::I32 => build_typed_stream(
+            device,
+            stream_cfg,
+            state,
+            OutputFormatConv {
+                channels,
+                sample_rate,
+                silence: 0_i32,
+                convert: f32_to_i32,
+            },
+        ),
+        other => Err(AudioError::DeviceError(format!(
+            "unsupported audio device sample format: {other:?}"
+        ))),
+    }
+}
+
+fn build_typed_stream<T, F>(
+    device: &cpal::Device,
+    stream_cfg: StreamConfig,
+    state: &SharedPlaybackState,
+    conv: OutputFormatConv<T, F>,
+) -> Result<Stream, AudioError>
+where
+    T: cpal::SizedSample + Copy + Send + 'static,
+    F: Fn(f32) -> T + Send + Copy + 'static,
+{
+    let state_clone = state.clone();
+    let mut scratch_stereo = Vec::<f32>::with_capacity(2048);
+
+    device
+        .build_output_stream(
+            stream_cfg,
+            move |data: &mut [T], _| {
+                render_callback_typed(&state_clone, &mut scratch_stereo, data, conv);
+            },
+            |_err| {
+                // コールバックエラーはスレッドパニックさせずに無視する（デバイス切断耐性）。
+            },
+            None,
+        )
+        .map_err(|err| AudioError::DeviceError(err.to_string()))
+}
+
+fn render_callback_typed<T: Copy, F: Fn(f32) -> T>(
     state: &SharedPlaybackState,
     scratch_stereo: &mut Vec<f32>,
-    output: &mut [f32],
-    device_channels: usize,
-    sample_rate: u32,
+    output: &mut [T],
+    conv: OutputFormatConv<T, F>,
 ) {
     if !state.clock.is_playing() {
-        output.fill(0.0);
+        output.fill(conv.silence);
         return;
     }
 
-    let frames = output.len() / device_channels.max(1);
+    let frames = output.len() / conv.channels.max(1);
     let start_sample = state.clock.current_sample();
 
     if let (Ok(doc), Ok(mixer)) = (state.document.try_lock(), state.mixer.try_lock()) {
-        mixer.mix_timeline_window(&doc, start_sample, frames, sample_rate, scratch_stereo);
-        write_stereo_to_device(scratch_stereo, output, device_channels, frames);
+        mixer.mix_timeline_window(&doc, start_sample, frames, conv.sample_rate, scratch_stereo);
+        write_stereo_converted(
+            scratch_stereo,
+            output,
+            conv.channels,
+            frames,
+            conv.silence,
+            conv.convert,
+        );
         drop(mixer);
         drop(doc);
     } else {
-        output.fill(0.0);
+        output.fill(conv.silence);
     }
 
     let _ = state.clock.advance_samples(frames as u64);
 }
 
-fn write_stereo_to_device(
+fn write_stereo_converted<T: Copy, F: Fn(f32) -> T>(
     stereo: &[f32],
-    output: &mut [f32],
+    output: &mut [T],
     device_channels: usize,
     frames: usize,
+    silence: T,
+    convert: F,
 ) {
     for f in 0..frames {
         let l = stereo.get(f * 2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
         let r = stereo.get(f * 2 + 1).copied().unwrap_or(l).clamp(-1.0, 1.0);
         let out_off = f * device_channels;
         if device_channels == 1 {
-            output[out_off] = f32::midpoint(l, r);
+            output[out_off] = convert(f32::midpoint(l, r));
         } else {
-            output[out_off] = l;
-            output[out_off + 1] = r;
+            output[out_off] = convert(l);
+            output[out_off + 1] = convert(r);
             for ch in 2..device_channels {
-                output[out_off + ch] = 0.0;
+                output[out_off + ch] = silence;
             }
         }
     }
+}
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn f32_to_i16(sample: f32) -> i16 {
+    let clamped = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    (clamped * 32_767.0).round() as i16
+}
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn f32_to_u16(sample: f32) -> u16 {
+    let clamped = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    ((clamped * 32_767.0) + 32_768.0)
+        .round()
+        .clamp(0.0, f32::from(u16::MAX)) as u16
+}
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn f32_to_i32(sample: f32) -> i32 {
+    let clamped = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = f64::from(clamped) * 2_147_483_647.0;
+    scaled.round() as i32
 }
 
 #[cfg(test)]
@@ -394,5 +529,33 @@ mod tests {
         let out_frames = out.frame_count();
         assert!((4750..=4850).contains(&out_frames));
         Ok(())
+    }
+
+    #[test]
+    fn clock_set_sample_rate_preserves_timeline_position() {
+        let clock = PlaybackClock::new(FrameRate::FPS_30, 48_000);
+        clock.update_timeline_metrics(FrameRate::FPS_30, 300);
+        clock.seek_to_frame(FrameIndex::new(30)); // 1.0s = 48,000 samples
+        assert_eq!(clock.current_sample(), 48_000);
+
+        clock.set_sample_rate(44_100);
+        assert_eq!(clock.sample_rate(), 44_100);
+        assert_eq!(clock.current_sample(), 44_100);
+        assert_eq!(clock.current_frame(), FrameIndex::new(30));
+    }
+
+    #[test]
+    fn sample_converters_clamp_and_map_endpoints() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(2.0), i16::MAX);
+        assert_eq!(f32_to_i16(-2.0), -i16::MAX);
+        assert_eq!(f32_to_i16(f32::NAN), 0);
+
+        assert_eq!(f32_to_u16(0.0), 32_768);
+        assert_eq!(f32_to_u16(1.0), 65_535);
+        assert_eq!(f32_to_u16(-1.0), 1);
+
+        assert_eq!(f32_to_i32(0.0), 0);
+        assert_eq!(f32_to_i32(1.0), i32::MAX);
     }
 }

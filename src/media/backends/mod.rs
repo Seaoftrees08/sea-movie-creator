@@ -156,11 +156,21 @@ pub fn open_audio_decoder(
     }
 
     match preference {
-        BackendPreference::OpenSoftware | BackendPreference::Auto => open_sw::open_audio(path),
-        BackendPreference::NativeHardware | BackendPreference::WindowsMediaFoundation => {
-            Err(MediaError::UnsupportedCodec(
-                "OS hardware audio decoder is not used directly; use OpenSoftware".to_owned(),
-            ))
+        BackendPreference::OpenSoftware => open_sw::open_audio(path),
+        BackendPreference::WindowsMediaFoundation => open_audio_windows_mf(path),
+        BackendPreference::NativeHardware => open_audio_native_os(path),
+        BackendPreference::Auto => {
+            if prefers_open_sw_first(path) {
+                match open_sw::open_audio(path) {
+                    Ok(dec) => Ok(dec),
+                    Err(sw_err) => open_audio_native_os(path).or(Err(sw_err)),
+                }
+            } else {
+                match open_audio_native_os(path) {
+                    Ok(dec) => Ok(dec),
+                    Err(_) => open_sw::open_audio(path),
+                }
+            }
         }
     }
 }
@@ -238,6 +248,35 @@ fn open_video_windows_mf(path: &Path) -> Result<Box<dyn VideoDecoder>, MediaErro
     #[cfg(target_os = "windows")]
     {
         windows_mf::open_video(path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err(MediaError::UnsupportedFormat(
+            "Windows Media Foundation is only available on Windows".to_owned(),
+        ))
+    }
+}
+
+fn open_audio_native_os(path: &Path) -> Result<Box<dyn AudioDecoderStream>, MediaError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_mf::open_audio(path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err(MediaError::UnsupportedFormat(
+            "native OS audio decoder is currently only implemented via Windows Media Foundation"
+                .to_owned(),
+        ))
+    }
+}
+
+fn open_audio_windows_mf(path: &Path) -> Result<Box<dyn AudioDecoderStream>, MediaError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_mf::open_audio(path)
     }
     #[cfg(not(target_os = "windows"))]
     {

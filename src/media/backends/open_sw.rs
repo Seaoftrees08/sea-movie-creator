@@ -112,6 +112,7 @@ pub fn open_video(path: &Path) -> Result<Box<dyn VideoDecoder>, MediaError> {
             source: VideoPacketSource::Ivf(source),
             worker,
             eof_reached: false,
+            tracker: crate::media::decoder::SequentialVideoTracker::new(),
         }));
     }
 
@@ -127,6 +128,7 @@ pub fn open_video(path: &Path) -> Result<Box<dyn VideoDecoder>, MediaError> {
         source: VideoPacketSource::Mkv(Box::new(source)),
         worker,
         eof_reached: false,
+        tracker: crate::media::decoder::SequentialVideoTracker::new(),
     }))
 }
 
@@ -211,20 +213,17 @@ struct OpenSwVideoDecoder {
     source: VideoPacketSource,
     worker: Rav1dWorkerHandle,
     eof_reached: bool,
+    tracker: crate::media::decoder::SequentialVideoTracker,
 }
 
-impl VideoDecoder for OpenSwVideoDecoder {
-    fn info(&self) -> &MediaStreamInfo {
-        &self.info
-    }
-
-    fn seek_seconds(&mut self, seconds: f64) -> Result<(), MediaError> {
+impl OpenSwVideoDecoder {
+    fn seek_internal(&mut self, seconds: f64) -> Result<(), MediaError> {
         self.eof_reached = false;
         self.source.seek_seconds(seconds)?;
         self.worker.flush()
     }
 
-    fn decode_next_frame(&mut self) -> Result<Option<DecodedVideoFrame>, MediaError> {
+    fn decode_next_raw(&mut self) -> Result<Option<DecodedVideoFrame>, MediaError> {
         loop {
             if let Some(frame) = self.worker.receive_picture()? {
                 return Ok(Some(frame));
@@ -241,6 +240,41 @@ impl VideoDecoder for OpenSwVideoDecoder {
                 }
             }
         }
+    }
+}
+
+impl VideoDecoder for OpenSwVideoDecoder {
+    fn info(&self) -> &MediaStreamInfo {
+        &self.info
+    }
+
+    fn seek_seconds(&mut self, seconds: f64) -> Result<(), MediaError> {
+        self.tracker.reset();
+        self.seek_internal(seconds)
+    }
+
+    fn decode_next_frame(&mut self) -> Result<Option<DecodedVideoFrame>, MediaError> {
+        if let Some(peeked) = self.tracker.take_peeked() {
+            return Ok(Some(peeked));
+        }
+        let frame = self.decode_next_raw()?;
+        if let Some(ref f) = frame {
+            self.tracker.record_decoded(f);
+        }
+        Ok(frame)
+    }
+
+    fn decode_frame_at_seconds(
+        &mut self,
+        target_seconds: f64,
+    ) -> Result<Option<DecodedVideoFrame>, MediaError> {
+        if let Some(seek_to) = self.tracker.prepare_seek(target_seconds) {
+            self.seek_internal(seek_to)?;
+        }
+        let mut tracker = std::mem::take(&mut self.tracker);
+        let result = tracker.complete_advance(target_seconds, || self.decode_next_raw());
+        self.tracker = tracker;
+        result
     }
 }
 

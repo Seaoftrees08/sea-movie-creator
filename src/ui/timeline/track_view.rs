@@ -495,6 +495,42 @@ fn append_lane_grid_and_boundaries(
     lane
 }
 
+/// トラック行の高さ (`row_h`) に対するクリップタイル高さ（上下 `2px` マージン除く）を返す。
+#[must_use]
+pub(crate) fn clip_block_height_px(row_h: f32) -> f32 {
+    (row_h - 4.0).max(8.0)
+}
+
+fn create_clip_outer_container(
+    clip_id: &ClipId,
+    rect: (f32, f32, f32),
+    colors: (u32, u32),
+    is_selected: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (left_px, width_px, clip_h) = rect;
+    let (fill_rgba, border_rgba) = colors;
+    let base = div()
+        .id(SharedString::from(format!(
+            "timeline-clip-block:{}",
+            clip_id.as_str()
+        )))
+        .absolute()
+        .top(px(2.))
+        .bottom(px(2.))
+        .left(px(left_px))
+        .w(px(width_px))
+        .h(px(clip_h))
+        .rounded(px(3.))
+        .bg(rgba(fill_rgba))
+        .border_color(rgba(border_rgba))
+        .overflow_hidden();
+    if is_selected {
+        base.border_2()
+    } else {
+        base.border_1()
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn render_clip_block(
     controller: &AppController,
@@ -505,6 +541,7 @@ fn render_clip_block(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let row_h = row_height_px(controller.timeline_row_density);
+    let clip_h = clip_block_height_px(row_h);
     let ppf = controller
         .timeline_px_per_frame
         .max(MIN_TIMELINE_PX_PER_FRAME);
@@ -517,46 +554,40 @@ fn render_clip_block(
     let dur_f = clip.duration.get();
     let left_px = canvas_x_from_frame(start_f, scroll_x, ppf);
     let width_px = canvas_width_for_duration(dur_f, ppf).max(6.0);
-
-    let border_color = if is_selected {
-        rgba(0xfde0_47ff)
+    let border_rgba = if is_selected {
+        0xfde0_47ff
     } else {
-        rgba(palette.border)
+        palette.border
     };
 
-    let mut box_el = div()
+    // 外側ボックスは `.absolute()` + 固定高でリボン外形を確定させ、ContextMenu の `.relative()` を内側へ隔離する。
+    let outer = create_clip_outer_container(
+        &clip.id,
+        (left_px, width_px, clip_h),
+        (palette.fill, border_rgba),
+        is_selected,
+    );
+
+    let mut inner = div()
         .id(SharedString::from(format!(
-            "timeline-clip-block:{}",
+            "timeline-clip-inner:{}",
             clip.id.as_str()
         )))
-        .absolute()
-        .top(px(2.))
-        .bottom(px(2.))
-        .left(px(left_px))
-        .w(px(width_px))
-        .rounded(px(3.))
-        .bg(rgba(palette.fill))
-        .border_color(border_color)
-        .overflow_hidden()
+        .size_full()
         .relative();
-    box_el = if is_selected {
-        box_el.border_2()
-    } else {
-        box_el.border_1()
-    };
 
-    if let ClipKind::Audio { .. } = &clip.kind {
+    if crate::ui::timeline::waveform_view::extract_clip_waveform_source(clip).is_some() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bar_cnt = (width_px / 3.0).clamp(4.0, 120.0) as usize;
         let bars =
             sample_clip_waveform_bars(&controller.mixer, &controller.document, clip, bar_cnt);
         if !bars.is_empty() {
-            box_el = box_el.child(render_audio_clip_waveform(&bars, row_h));
+            inner = inner.child(render_audio_clip_waveform(&bars, clip_h));
         }
     }
 
-    box_el = append_clip_segments(
-        box_el,
+    inner = append_clip_segments(
+        inner,
         clip,
         layer_idx,
         layer_locked,
@@ -567,8 +598,8 @@ fn render_clip_block(
             .flatten(),
         cx,
     );
-    box_el = append_clip_midpoints(box_el, controller, clip, layer_locked, width_px, cx);
-    box_el = append_clip_trim_handles(box_el, clip, layer_idx, layer_locked, cx);
+    inner = append_clip_midpoints(inner, controller, clip, layer_locked, width_px, cx);
+    inner = append_clip_trim_handles(inner, clip, layer_idx, layer_locked, cx);
 
     let label = match &clip.kind {
         ClipKind::Subtitle(sub) if !sub.text.is_empty() => format!("{} [{}]", clip.name, sub.text),
@@ -576,7 +607,7 @@ fn render_clip_block(
     };
     let clip_id_rc = clip.id.clone();
     let clip_id_menu = clip.id.clone();
-    let box_el = box_el
+    let inner = inner
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
@@ -600,7 +631,12 @@ fn render_clip_block(
                 .text_color(rgba(0xf8fa_fcff))
                 .child(label),
         );
-    crate::ui::timeline::context_menu::attach_clip_context_menu(box_el, clip_id_menu, cx.entity())
+    let menu_wrapped = crate::ui::timeline::context_menu::attach_clip_context_menu(
+        inner,
+        clip_id_menu,
+        cx.entity(),
+    );
+    outer.child(menu_wrapped)
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
@@ -1000,4 +1036,17 @@ fn append_lane_playhead_and_guides(
         );
     }
     lane
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_block_height_px;
+
+    #[test]
+    fn clip_block_height_fills_track_minus_vertical_margins() {
+        assert!((clip_block_height_px(30.0) - 26.0).abs() < 1e-6);
+        assert!((clip_block_height_px(22.0) - 18.0).abs() < 1e-6);
+        assert!((clip_block_height_px(42.0) - 38.0).abs() < 1e-6);
+        assert!((clip_block_height_px(6.0) - 8.0).abs() < 1e-6);
+    }
 }

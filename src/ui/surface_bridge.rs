@@ -8,9 +8,9 @@ use image::{Frame as ImageFrame, RgbaImage};
 use crate::core::animation::EvaluationContext;
 use crate::core::ids::AssetId;
 use crate::core::time::FrameIndex;
-use crate::media::compositor::{WgpuCompositor, build_render_scene};
+use crate::media::compositor::{RenderScene, WgpuCompositor, build_render_scene};
 use crate::media::decoder::{FramePixelFormat, VideoFrameBuffer};
-use crate::media::visual_properties::EvaluatedVisual;
+use crate::media::visual_properties::{BlendMode, EvaluatedVisual};
 use crate::timeline::document::{AssetStatus, Clip, ClipKind, ProjectDocument};
 
 /// GPU や OS 固有サーフェスへの差し替え余地を保ったプレビュー転送抽象トレイト。
@@ -54,6 +54,33 @@ impl RenderImageSurfaceBridge {
     pub fn drain_pending_drops(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.pending_drops)
     }
+
+    /// 所有権ムーブにより追加コピーなしで BGRA8 フレームをフロントバッファへ反映する。
+    pub fn submit_bgra_frame_owned(&mut self, frame: VideoFrameBuffer) {
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
+        let width = frame.width;
+        let height = frame.height;
+        let bgra = match frame.format {
+            FramePixelFormat::Bgra8 => frame.data,
+            FramePixelFormat::Rgba8 => frame.to_bgra8(),
+        };
+        self.push_bgra_vec(width, height, bgra);
+    }
+
+    fn push_bgra_vec(&mut self, width: u32, height: u32, bgra: Vec<u8>) {
+        let Some(rgba_container) = RgbaImage::from_raw(width, height, bgra) else {
+            return;
+        };
+        let image_frame = ImageFrame::new(rgba_container);
+        let next = Arc::new(RenderImage::new([image_frame]));
+        if let Some(previous) = self.front_image.replace(next) {
+            self.pending_drops.push(previous);
+        }
+        self.frame_id = self.frame_id.saturating_add(1);
+        self.dimensions = Some((width, height));
+    }
 }
 
 impl PreviewSurfaceBridge for RenderImageSurfaceBridge {
@@ -66,16 +93,7 @@ impl PreviewSurfaceBridge for RenderImageSurfaceBridge {
             FramePixelFormat::Bgra8 => frame.data.clone(),
             FramePixelFormat::Rgba8 => frame.to_bgra8(),
         };
-        let Some(rgba_container) = RgbaImage::from_raw(frame.width, frame.height, bgra) else {
-            return;
-        };
-        let image_frame = ImageFrame::new(rgba_container);
-        let next = Arc::new(RenderImage::new([image_frame]));
-        if let Some(previous) = self.front_image.replace(next) {
-            self.pending_drops.push(previous);
-        }
-        self.frame_id = self.frame_id.saturating_add(1);
-        self.dimensions = Some((frame.width, frame.height));
+        self.push_bgra_vec(frame.width, frame.height, bgra);
     }
 
     fn current_frame_id(&self) -> u64 {
@@ -147,6 +165,16 @@ pub fn composite_with_gpu_or_fallback(
 ) -> CompositePreviewOutput {
     if let Some(gpu) = gpu_compositor {
         let scene = build_render_scene(doc, playhead, lookup_asset_frame);
+        if scene.layers.is_empty() && !scene.has_missing_media {
+            return CompositePreviewOutput {
+                buffer: VideoFrameBuffer::solid_bgra8(
+                    preview_width.max(1),
+                    preview_height.max(1),
+                    scene.background_color,
+                ),
+                has_missing_media: false,
+            };
+        }
         if let Ok(buffer) = gpu.render_scene_to_bgra8(&scene, preview_width, preview_height) {
             return CompositePreviewOutput {
                 buffer,
@@ -161,6 +189,116 @@ pub fn composite_with_gpu_or_fallback(
         preview_height,
         lookup_asset_frame,
     )
+}
+
+/// プレビュー合成結果を `RenderImageSurfaceBridge` へ直接転送する（単一無編集動画等の GPU リードバック回避パス込み）。
+///
+/// 戻り値は現在フレームに `AssetStatus::Missing` 素材が含まれる場合 `true`。
+pub fn submit_composite_preview_to_bridge(
+    doc: &ProjectDocument,
+    playhead: FrameIndex,
+    preview_size: (u32, u32),
+    gpu_compositor: Option<&mut WgpuCompositor>,
+    bridge: &mut RenderImageSurfaceBridge,
+    lookup_asset_frame: &mut dyn FnMut(&AssetId, u64) -> Option<Arc<VideoFrameBuffer>>,
+) -> bool {
+    let (preview_width, preview_height) = preview_size;
+    let pw = preview_width.max(1);
+    let ph = preview_height.max(1);
+    let scene = build_render_scene(doc, playhead, lookup_asset_frame);
+
+    if scene.layers.is_empty() && !scene.has_missing_media {
+        bridge.submit_bgra_frame_owned(VideoFrameBuffer::solid_bgra8(
+            pw,
+            ph,
+            scene.background_color,
+        ));
+        return false;
+    }
+
+    if can_passthrough_single_video_layer(doc, playhead, &scene, pw, ph) {
+        bridge.submit_bgra_frame(&scene.layers[0].source_buffer);
+        return false;
+    }
+
+    let rendered = gpu_compositor
+        .and_then(|gpu| gpu.render_scene_to_bgra8(&scene, pw, ph).ok())
+        .map_or_else(
+            || composite_timeline_preview(doc, playhead, pw, ph, lookup_asset_frame),
+            |buffer| CompositePreviewOutput {
+                buffer,
+                has_missing_media: scene.has_missing_media,
+            },
+        );
+    let missing = rendered.has_missing_media;
+    bridge.submit_bgra_frame_owned(rendered.buffer);
+    missing
+}
+
+fn can_passthrough_single_video_layer(
+    doc: &ProjectDocument,
+    playhead: FrameIndex,
+    scene: &RenderScene,
+    preview_width: u32,
+    preview_height: u32,
+) -> bool {
+    if scene.has_missing_media || scene.layers.len() != 1 {
+        return false;
+    }
+    let layer = &scene.layers[0];
+    if layer.is_missing_placeholder {
+        return false;
+    }
+    let src = &layer.source_buffer;
+    if src.width != scene.project_width
+        || src.height != scene.project_height
+        || preview_width != scene.project_width
+        || preview_height != scene.project_height
+    {
+        return false;
+    }
+    if !is_identity_opaque_visual(&layer.visual) {
+        return false;
+    }
+    is_single_visible_video_clip_at_playhead(doc, playhead)
+}
+
+fn is_identity_opaque_visual(v: &EvaluatedVisual) -> bool {
+    v.x.abs() < 1e-3
+        && v.y.abs() < 1e-3
+        && (v.scale_x - 1.0).abs() < 1e-3
+        && (v.scale_y - 1.0).abs() < 1e-3
+        && v.rotation_deg.abs() < 1e-3
+        && v.anchor_x.abs() < 1e-3
+        && v.anchor_y.abs() < 1e-3
+        && (v.opacity - 1.0).abs() < 1e-4
+        && v.blend_mode == BlendMode::Normal
+        && v.brightness.abs() < 1e-4
+        && (v.contrast - 1.0).abs() < 1e-4
+        && (v.saturation - 1.0).abs() < 1e-4
+        && v.hue_deg.abs() < 1e-4
+        && (v.gamma - 1.0).abs() < 1e-4
+}
+
+fn is_single_visible_video_clip_at_playhead(doc: &ProjectDocument, playhead: FrameIndex) -> bool {
+    let mut visible_count = 0usize;
+    let mut is_video = false;
+    for layer in &doc.layers {
+        if !layer.visible {
+            continue;
+        }
+        for clip in &layer.clips {
+            if !clip_contains_frame(clip, playhead) {
+                continue;
+            }
+            if matches!(clip.kind, ClipKind::Audio { .. }) {
+                continue;
+            }
+            visible_count += 1;
+            is_video = matches!(clip.kind, ClipKind::Video { .. });
+        }
+    }
+    visible_count == 1 && is_video
 }
 
 const fn clip_contains_frame(clip: &Clip, frame: FrameIndex) -> bool {
@@ -300,22 +438,52 @@ fn blit_scaled_layer(
     let src_bytes = src_bgra_owned.as_deref().unwrap_or(&src.data);
 
     for py in min_y..max_y {
-        let src_v = ((f64::from(py) + 0.5 - top_edge) / drawn_h).clamp(0.0, 0.999_999)
-            * f64::from(src.height);
-        let sy = (src_v as usize).min(src.height as usize - 1);
+        let src_v = ((f64::from(py) + 0.5 - top_edge) / drawn_h) * f64::from(src.height) - 0.5;
         for px in min_x..max_x {
-            let src_u = ((f64::from(px) + 0.5 - left_edge) / drawn_w).clamp(0.0, 0.999_999)
-                * f64::from(src.width);
-            let sx = (src_u as usize).min(src.width as usize - 1);
-            let src_idx = (sy * (src.width as usize) + sx) * 4;
+            let src_u = ((f64::from(px) + 0.5 - left_edge) / drawn_w) * f64::from(src.width) - 0.5;
+            let sample = sample_bgra_bilinear(src_bytes, src.width, src.height, src_u, src_v);
             let dst_idx = ((py as usize) * (dst.width as usize) + (px as usize)) * 4;
-            blend_bgra_pixel(
-                &mut dst.data[dst_idx..dst_idx + 4],
-                &src_bytes[src_idx..src_idx + 4],
-                visual.opacity,
-            );
+            blend_bgra_pixel(&mut dst.data[dst_idx..dst_idx + 4], &sample, visual.opacity);
         }
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn sample_bgra_bilinear(src_bytes: &[u8], width: u32, height: u32, u: f64, v: f64) -> [u8; 4] {
+    let w_usize = width as usize;
+    let h_usize = height as usize;
+    let x_clamped = u.clamp(0.0, (w_usize.saturating_sub(1)) as f64);
+    let y_clamped = v.clamp(0.0, (h_usize.saturating_sub(1)) as f64);
+    let x0 = (x_clamped.floor() as usize).min(w_usize.saturating_sub(1));
+    let y0 = (y_clamped.floor() as usize).min(h_usize.saturating_sub(1));
+    let x1 = (x0 + 1).min(w_usize.saturating_sub(1));
+    let y1 = (y0 + 1).min(h_usize.saturating_sub(1));
+    let fx = x_clamped - (x0 as f64);
+    let fy = y_clamped - (y0 as f64);
+
+    let i00 = (y0 * w_usize + x0) * 4;
+    let i10 = (y0 * w_usize + x1) * 4;
+    let i01 = (y1 * w_usize + x0) * 4;
+    let i11 = (y1 * w_usize + x1) * 4;
+
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+
+    let mut out = [0_u8; 4];
+    for ch in 0..4 {
+        let val = f64::from(src_bytes[i00 + ch]) * w00
+            + f64::from(src_bytes[i10 + ch]) * w10
+            + f64::from(src_bytes[i01 + ch]) * w01
+            + f64::from(src_bytes[i11 + ch]) * w11;
+        out[ch] = val.clamp(0.0, 255.0).round() as u8;
+    }
+    out
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -453,5 +621,24 @@ mod tests {
             composite_timeline_preview(&doc, FrameIndex::new(35), 64, 64, &mut lookup);
         assert!(out_missing.has_missing_media);
         Ok(())
+    }
+
+    #[test]
+    fn owned_submit_and_bilinear_sampling_behave_cleanly() {
+        let mut bridge = RenderImageSurfaceBridge::new();
+        bridge.submit_bgra_frame_owned(VideoFrameBuffer::solid_bgra8(24, 16, RgbaColor::BLACK));
+        assert_eq!(bridge.current_frame_id(), 1);
+        assert_eq!(bridge.current_dimensions(), Some((24, 16)));
+        assert_eq!(bridge.drain_pending_drops().len(), 0);
+
+        bridge.submit_bgra_frame_owned(VideoFrameBuffer::solid_bgra8(24, 16, RgbaColor::WHITE));
+        assert_eq!(bridge.current_frame_id(), 2);
+        assert_eq!(bridge.drain_pending_drops().len(), 1);
+
+        // 2x1 [黒, 白] テクスチャの中点 u=0.5 は 128 付近へ補間される。
+        let two_px = [0, 0, 0, 255, 255, 255, 255, 255];
+        let mid = sample_bgra_bilinear(&two_px, 2, 1, 0.5, 0.0);
+        assert!((126..=129).contains(&mid[0]));
+        assert_eq!(mid[3], 255);
     }
 }

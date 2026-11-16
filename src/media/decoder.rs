@@ -229,6 +229,139 @@ pub enum BackendPreference {
     WindowsMediaFoundation,
 }
 
+const SEQUENTIAL_EPSILON_SEC: f64 = 0.008;
+const SEQUENTIAL_FORWARD_GAP_SEC: f64 = 2.5;
+
+/// 順方向連続再生時に毎フレームのキーフレームシークを省くためのフレーム追跡状態。
+#[derive(Debug, Default)]
+pub(crate) struct SequentialVideoTracker {
+    initialized: bool,
+    last_frame: Option<DecodedVideoFrame>,
+    peeked_frame: Option<DecodedVideoFrame>,
+    last_target_seconds: Option<f64>,
+}
+
+impl SequentialVideoTracker {
+    /// 空の追跡状態を初期化する。
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 外部からのシーク時に保持フレームを破棄する。
+    pub(crate) fn reset(&mut self) {
+        self.last_frame = None;
+        self.peeked_frame = None;
+        self.last_target_seconds = None;
+    }
+
+    /// 先読み済み次フレームを取り出し、`last_frame` を更新する（`decode_next_frame` 整合用）。
+    pub(crate) fn take_peeked(&mut self) -> Option<DecodedVideoFrame> {
+        let next = self.peeked_frame.take()?;
+        self.last_frame = Some(next.clone());
+        Some(next)
+    }
+
+    /// 直近フレームを更新する。
+    pub(crate) fn record_decoded(&mut self, frame: &DecodedVideoFrame) {
+        self.initialized = true;
+        self.last_frame = Some(frame.clone());
+        self.last_target_seconds = Some(frame.pts_seconds);
+    }
+
+    /// 順方向連続位置か判定し、シークが必要な場合のみ目標秒数を返す。
+    pub(crate) fn prepare_seek(&mut self, target_seconds: f64) -> Option<f64> {
+        let clamped = target_seconds.max(0.0);
+        if self.can_advance_sequentially(clamped) {
+            return None;
+        }
+        let needs_seek = self.initialized || clamped > SEQUENTIAL_EPSILON_SEC;
+        self.reset();
+        self.initialized = true;
+        needs_seek.then_some(clamped)
+    }
+
+    /// `prepare_seek` 後に `next_fn` のみを呼んで目標時刻のフレームへ前進する。
+    ///
+    /// # Errors
+    ///
+    /// `next_fn` がエラーを返した場合。
+    pub(crate) fn complete_advance<N>(
+        &mut self,
+        target_seconds: f64,
+        mut next_fn: N,
+    ) -> Result<Option<DecodedVideoFrame>, MediaError>
+    where
+        N: FnMut() -> Result<Option<DecodedVideoFrame>, MediaError>,
+    {
+        let clamped = target_seconds.max(0.0);
+        self.initialized = true;
+        self.consume_peeked_for_target(clamped);
+        if let Some(hit) = self.cached_hit_for_target(clamped) {
+            self.last_target_seconds = Some(clamped);
+            return Ok(Some(hit));
+        }
+
+        while let Some(frame) = next_fn()? {
+            if frame.pts_seconds > clamped + SEQUENTIAL_EPSILON_SEC {
+                if self.last_frame.is_some() {
+                    self.peeked_frame = Some(frame);
+                } else {
+                    self.peeked_frame = Some(frame.clone());
+                    self.last_target_seconds = Some(clamped);
+                    return Ok(Some(frame));
+                }
+                break;
+            }
+            let close = (clamped - frame.pts_seconds).abs() <= SEQUENTIAL_EPSILON_SEC;
+            self.last_frame = Some(frame);
+            if close {
+                break;
+            }
+        }
+
+        self.last_target_seconds = Some(clamped);
+        Ok(self.last_frame.clone())
+    }
+
+    fn can_advance_sequentially(&self, clamped: f64) -> bool {
+        if !self.initialized {
+            return false;
+        }
+        let anchor = self
+            .last_frame
+            .as_ref()
+            .map(|f| f.pts_seconds)
+            .or(self.last_target_seconds);
+        anchor.is_some_and(|a| {
+            clamped + SEQUENTIAL_EPSILON_SEC >= a && clamped <= a + SEQUENTIAL_FORWARD_GAP_SEC
+        })
+    }
+
+    fn consume_peeked_for_target(&mut self, clamped: f64) {
+        let _ = self.initialized;
+        if let Some(peek) = &self.peeked_frame
+            && peek.pts_seconds <= clamped + SEQUENTIAL_EPSILON_SEC
+        {
+            self.last_frame = self.peeked_frame.take();
+        }
+    }
+
+    fn cached_hit_for_target(&self, clamped: f64) -> Option<DecodedVideoFrame> {
+        if let Some(peek) = &self.peeked_frame
+            && peek.pts_seconds > clamped + SEQUENTIAL_EPSILON_SEC
+        {
+            return self.last_frame.clone().or_else(|| Some(peek.clone()));
+        }
+        if let Some(last) = &self.last_frame
+            && (clamped - last.pts_seconds).abs() <= SEQUENTIAL_EPSILON_SEC
+        {
+            return Some(last.clone());
+        }
+        None
+    }
+}
+
 /// 映像デコーダの共通トレイト。
 pub trait VideoDecoder: Send {
     /// ストリーム情報を返す。
@@ -374,4 +507,66 @@ pub fn open_audio_decoder(
     preference: BackendPreference,
 ) -> Result<Box<dyn AudioDecoderStream>, MediaError> {
     backends::open_audio_decoder(path, preference)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::color::RgbaColor;
+
+    #[test]
+    fn sequential_tracker_avoids_seek_during_forward_playback_and_seeks_on_jump() {
+        let pts_list: Vec<f64> = (0..120).map(|i| f64::from(i) / 30.0).collect();
+        let mut cursor = 0usize;
+        let mut seek_count = 0usize;
+        let mut tracker = SequentialVideoTracker::new();
+
+        let step = |tracker: &mut SequentialVideoTracker,
+                    target: f64,
+                    cursor: &mut usize,
+                    seek_count: &mut usize| {
+            if let Some(seek_to) = tracker.prepare_seek(target) {
+                *seek_count += 1;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let idx = (seek_to * 30.0).floor() as usize;
+                *cursor = idx.min(pts_list.len());
+            }
+            tracker
+                .complete_advance(target, || {
+                    if *cursor >= pts_list.len() {
+                        return Ok(None);
+                    }
+                    let pts = pts_list[*cursor];
+                    *cursor += 1;
+                    Ok(Some(DecodedVideoFrame {
+                        pts_seconds: pts,
+                        buffer: VideoFrameBuffer::solid_bgra8(2, 2, RgbaColor::BLACK),
+                    }))
+                })
+                .ok()
+                .flatten()
+        };
+
+        // 0..30 frames in 60fps steps over 30fps stream: 0 seeks!
+        for i in 0..60 {
+            let f = step(
+                &mut tracker,
+                f64::from(i) / 60.0,
+                &mut cursor,
+                &mut seek_count,
+            );
+            assert!(f.is_some());
+        }
+        assert_eq!(seek_count, 0);
+
+        // Backward scrub triggers 1 seek.
+        let back = step(&mut tracker, 0.25, &mut cursor, &mut seek_count);
+        assert!(back.is_some());
+        assert_eq!(seek_count, 1);
+
+        // Big forward jump (> 2.5s) triggers 1 seek.
+        let jump = step(&mut tracker, 3.5, &mut cursor, &mut seek_count);
+        assert!(jump.is_some());
+        assert_eq!(seek_count, 2);
+    }
 }
