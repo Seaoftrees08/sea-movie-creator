@@ -1305,6 +1305,7 @@ impl Render for SeaEditorWindow {
             root.child(render_export_dialog_overlay(
                 &self.controller,
                 &self.controller.export_dialog,
+                window,
                 cx,
             ))
         } else if self.timeline_length_modal.is_some() {

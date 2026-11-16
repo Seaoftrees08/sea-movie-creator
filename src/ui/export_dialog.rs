@@ -3,9 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Side, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, Div, InteractiveElement as _, ParentElement as _, Styled as _, div, px, rgba,
+    Anchor, AnyElement, Context, Div, ElementId, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, Styled as _, Window, div, px, relative, rgba,
 };
 
 use crate::export::manifest::{ExportOptionField, ExportOptionKind, PresetSchema};
@@ -272,38 +275,93 @@ impl ExportDialogState {
     }
 }
 
+/// ウィンドウのビューポート寸法に応じた書き出しダイアログの `(width, max_height)` を算出する。
+#[must_use]
+pub fn compute_export_modal_bounds(viewport_w: f32, viewport_h: f32) -> (f32, f32) {
+    let width = (viewport_w - 32.0).clamp(320.0, 560.0);
+    let max_height = (viewport_h - 48.0).clamp(240.0, 620.0);
+    (width, max_height)
+}
+
+fn render_combo_button<F>(
+    id: impl Into<ElementId>,
+    label: String,
+    menu_width: f32,
+    disabled: bool,
+    builder: F,
+) -> AnyElement
+where
+    F: Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+{
+    let btn = Button::new(id)
+        .outline()
+        .small()
+        .w_full()
+        .dropdown_caret(true)
+        .disabled(disabled)
+        .label(label);
+    if disabled {
+        btn.into_any_element()
+    } else {
+        btn.dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, window, cx| {
+            builder(
+                menu.min_w(px(menu_width))
+                    .max_h(px(300.))
+                    .scrollable(true)
+                    .check_side(Side::Right),
+                window,
+                cx,
+            )
+        })
+        .into_any_element()
+    }
+}
+
 /// 書き出し設定モーダルダイアログの GPUI オーバーレイを描画する。
+///
+/// 各選択項目はコンボボックス化し、中央設定エリアを独立スクロールさせることで、
+/// 狭いウィンドウでも「保存先変更」「書き出し開始」等の操作ボタンが画面外へ見切れないようにする。
 pub fn render_export_dialog_overlay(
     controller: &AppController,
     state: &ExportDialogState,
+    window: &Window,
     cx: &mut Context<SeaEditorWindow>,
 ) -> Div {
     let theme = cx.theme().clone();
     let is_busy = state.running_job.is_some();
+    let vp_size = window.viewport_size();
+    let (modal_w, modal_max_h) =
+        compute_export_modal_bounds(f32::from(vp_size.width), f32::from(vp_size.height));
 
-    let card = div()
-        .w(px(620.))
-        .max_h(px(680.))
+    let body = v_flex()
+        .id("export-dialog-scroll-body")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scrollbar()
+        .px_4()
+        .py_3()
+        .gap_2p5()
+        .child(render_plugin_selector(state, is_busy, cx))
+        .child(render_license_notice(state, cx))
+        .child(render_preset_selector(state, is_busy, cx))
+        .child(render_range_and_resolution_row(
+            controller, state, is_busy, cx,
+        ))
+        .child(render_option_fields(state, is_busy, cx))
+        .child(render_output_target_row(state, is_busy, cx));
+
+    let card = v_flex()
+        .w(px(modal_w))
+        .max_h(px(modal_max_h))
         .bg(theme.popover)
         .border_1()
         .border_color(theme.border)
         .rounded(px(8.))
         .text_color(theme.foreground)
-        .child(
-            v_flex()
-                .max_h(px(680.))
-                .overflow_hidden()
-                .p_4()
-                .gap_3()
-                .child(render_dialog_header(is_busy, cx))
-                .child(render_plugin_selector(state, is_busy, cx))
-                .child(render_license_notice(state, cx))
-                .child(render_preset_selector(state, is_busy, cx))
-                .child(render_resolution_selector(controller, state, is_busy, cx))
-                .child(render_option_fields(state, is_busy, cx))
-                .child(render_output_target_row(state, is_busy, cx))
-                .child(render_progress_and_actions(state, is_busy, cx)),
-        );
+        .overflow_hidden()
+        .child(render_dialog_header(is_busy, cx))
+        .child(body)
+        .child(render_progress_and_actions(state, is_busy, cx));
 
     div()
         .absolute()
@@ -331,8 +389,11 @@ fn render_dialog_header(is_busy: bool, cx: &mut Context<SeaEditorWindow>) -> Div
         }));
     }
     h_flex()
+        .flex_shrink_0()
         .items_center()
         .justify_between()
+        .px_4()
+        .pt_3()
         .pb_2()
         .border_b_1()
         .border_color(theme.border)
@@ -347,11 +408,15 @@ fn render_plugin_selector(
 ) -> Div {
     let theme = cx.theme().clone();
     let plugins = state.registry.plugins();
-    let mut row = h_flex().gap_2().flex_wrap();
     if plugins.is_empty() {
         return v_flex()
             .gap_1()
-            .child(div().text_xs().text_color(theme.muted_foreground).child("エンコーダプラグイン"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("エンコーダプラグイン"),
+            )
             .child(
                 div()
                     .p_2()
@@ -362,38 +427,63 @@ fn render_plugin_selector(
             );
     }
 
-    for (idx, plugin) in plugins.iter().enumerate() {
-        let selected = idx == state.selected_plugin_idx;
-        let suffix = if plugin.executable_path.is_some() {
-            ""
-        } else {
-            " [未ビルド]"
-        };
-        let label = format!("{}{}", plugin.manifest.name, suffix);
-        let btn = Button::new(("exp-plugin", idx)).xsmall().label(label);
-        let btn = if selected {
-            btn.primary()
-        } else {
-            btn.outline()
-        };
-        let btn = if is_busy {
-            btn
-        } else {
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                let base_dir = this
-                    .controller
-                    .project_path
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf);
-                this.controller
-                    .export_dialog
-                    .select_plugin(idx, base_dir.as_deref());
-                cx.notify();
-            }))
-        };
-        row = row.child(btn);
-    }
+    let current_label = state.selected_plugin().map_or_else(
+        || "プラグインを選択...".to_owned(),
+        |p| {
+            if p.executable_path.is_some() {
+                p.manifest.name.clone()
+            } else {
+                format!("{} [未ビルド]", p.manifest.name)
+            }
+        },
+    );
+    let items: Vec<(usize, String)> = plugins
+        .iter()
+        .enumerate()
+        .map(|(idx, plugin)| {
+            let suffix = if plugin.executable_path.is_some() {
+                ""
+            } else {
+                " [未ビルド]"
+            };
+            (idx, format!("{}{}", plugin.manifest.name, suffix))
+        })
+        .collect();
+    let selected_idx = state.selected_plugin_idx;
+    let weak = cx.weak_entity();
+
+    let combo = render_combo_button(
+        "exp-plugin-combo",
+        current_label,
+        420.0,
+        is_busy,
+        move |menu, _, _| {
+            let mut popup = menu.label("エンコーダプラグイン");
+            for (idx, label) in &items {
+                let weak_item = weak.clone();
+                let target_idx = *idx;
+                popup = popup.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(target_idx == selected_idx)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_item.update(cx, |this, cx| {
+                                let base_dir = this
+                                    .controller
+                                    .project_path
+                                    .as_deref()
+                                    .and_then(Path::parent)
+                                    .map(Path::to_path_buf);
+                                this.controller
+                                    .export_dialog
+                                    .select_plugin(target_idx, base_dir.as_deref());
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            popup
+        },
+    );
 
     v_flex()
         .gap_1()
@@ -403,7 +493,7 @@ fn render_plugin_selector(
                 .text_color(theme.muted_foreground)
                 .child("エンコーダプラグイン"),
         )
-        .child(row)
+        .child(div().w_full().child(combo))
 }
 
 fn render_license_notice(state: &ExportDialogState, cx: &mut Context<SeaEditorWindow>) -> Div {
@@ -458,35 +548,53 @@ fn render_preset_selector(
         return div();
     };
     let theme = cx.theme().clone();
-    let mut row = h_flex().gap_2().flex_wrap();
-    for (idx, preset) in plugin.manifest.presets.iter().enumerate() {
-        let selected = idx == state.selected_preset_idx;
-        let btn = Button::new(("exp-preset", idx))
-            .xsmall()
-            .label(format!("{} (.{})", preset.label, preset.container_ext));
-        let btn = if selected {
-            btn.primary()
-        } else {
-            btn.outline()
-        };
-        let btn = if is_busy {
-            btn
-        } else {
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                let base_dir = this
-                    .controller
-                    .project_path
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf);
-                this.controller
-                    .export_dialog
-                    .select_preset(idx, base_dir.as_deref());
-                cx.notify();
-            }))
-        };
-        row = row.child(btn);
-    }
+    let current_label = state.selected_preset().map_or_else(
+        || "プリセットを選択...".to_owned(),
+        |p| format!("{} (.{})", p.label, p.container_ext),
+    );
+    let items: Vec<(usize, String)> = plugin
+        .manifest
+        .presets
+        .iter()
+        .enumerate()
+        .map(|(idx, preset)| (idx, format!("{} (.{})", preset.label, preset.container_ext)))
+        .collect();
+    let selected_idx = state.selected_preset_idx;
+    let weak = cx.weak_entity();
+    let disabled = is_busy || items.is_empty();
+
+    let combo = render_combo_button(
+        "exp-preset-combo",
+        current_label,
+        420.0,
+        disabled,
+        move |menu, _, _| {
+            let mut popup = menu.label("プリセット");
+            for (idx, label) in &items {
+                let weak_item = weak.clone();
+                let target_idx = *idx;
+                popup = popup.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(target_idx == selected_idx)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_item.update(cx, |this, cx| {
+                                let base_dir = this
+                                    .controller
+                                    .project_path
+                                    .as_deref()
+                                    .and_then(Path::parent)
+                                    .map(Path::to_path_buf);
+                                this.controller
+                                    .export_dialog
+                                    .select_preset(target_idx, base_dir.as_deref());
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            popup
+        },
+    );
 
     let desc = state.selected_preset().map_or_else(String::new, |p| {
         format!(
@@ -502,7 +610,7 @@ fn render_preset_selector(
                 .text_color(theme.muted_foreground)
                 .child("プリセット"),
         )
-        .child(row)
+        .child(div().w_full().child(combo))
         .child(
             div()
                 .text_xs()
@@ -511,37 +619,16 @@ fn render_preset_selector(
         )
 }
 
-fn render_resolution_selector(
+fn render_range_and_resolution_row(
     controller: &AppController,
     state: &ExportDialogState,
     is_busy: bool,
     cx: &mut Context<SeaEditorWindow>,
 ) -> Div {
     let theme = cx.theme().clone();
-    let choices = [
-        ExportResolutionPreset::ProjectNative,
-        ExportResolutionPreset::Hd720p,
-        ExportResolutionPreset::Fhd1080p,
-    ];
-    let mut row = h_flex().gap_2();
-    for (idx, choice) in choices.into_iter().enumerate() {
-        let selected = state.resolution.0 == choice;
-        let btn = Button::new(("exp-res", idx)).xsmall().label(choice.label());
-        let btn = if selected {
-            btn.primary()
-        } else {
-            btn.outline()
-        };
-        let btn = if is_busy {
-            btn
-        } else {
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.controller.export_dialog.resolution = ExportResolutionPresetChoice(choice);
-                cx.notify();
-            }))
-        };
-        row = row.child(btn);
-    }
+    let range_combo = render_range_combo(controller, is_busy, cx);
+    let res_combo = render_resolution_combo(controller, state, is_busy, cx);
+
     let (w, h) = state.resolution.0.dimensions(&controller.document);
     let total_frames = controller.document.total_duration_frames().max(1);
     let (range_start, range_end) = crate::export::runner::resolve_export_frame_range(
@@ -549,65 +636,166 @@ fn render_resolution_selector(
         controller.export_selection_only,
     );
     let export_frames = range_end.get().saturating_sub(range_start.get());
+
     v_flex()
         .gap_1()
-        .child(render_range_selector_row(controller, is_busy, cx))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_start()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("書き出し範囲"),
+                        )
+                        .child(range_combo),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("出力解像度"),
+                        )
+                        .child(res_combo),
+                ),
+        )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(format!(
-                    "出力解像度: {w}x{h} / 範囲: {}..{} ({export_frames}f / 総尺 {total_frames}f)",
+                    "出力: {w}x{h} / 範囲: {}..{} ({export_frames}f / 総尺 {total_frames}f)",
                     range_start.get(),
                     range_end.get()
                 )),
         )
-        .child(row)
 }
 
-fn render_range_selector_row(
+fn render_range_combo(
     controller: &AppController,
     is_busy: bool,
     cx: &mut Context<SeaEditorWindow>,
-) -> Div {
+) -> AnyElement {
     let has_selection = controller.document.selection_range.is_some();
     let sel_only = controller.export_selection_only && has_selection;
-
-    let mut full_btn = Button::new("exp-range-full")
-        .xsmall()
-        .label("プロジェクト全体");
-    full_btn = if sel_only {
-        full_btn.outline()
-    } else {
-        full_btn.primary()
-    };
-    if !is_busy {
-        full_btn = full_btn.on_click(cx.listener(|this, _, _, cx| {
-            this.controller.export_selection_only = false;
-            cx.notify();
-        }));
-    }
-
     let sel_label = match controller.document.selection_range {
         Some(r) => format!("選択範囲のみ ({}..{})", r.start.get(), r.end.get()),
         None => "選択範囲のみ (未設定)".to_owned(),
     };
-    let mut sel_btn = Button::new("exp-range-sel").xsmall().label(sel_label);
-    sel_btn = if sel_only {
-        sel_btn.primary()
+    let current_label = if sel_only {
+        sel_label.clone()
     } else {
-        sel_btn.outline()
+        "プロジェクト全体".to_owned()
     };
-    if !has_selection || is_busy {
-        sel_btn = sel_btn.disabled(true);
-    } else {
-        sel_btn = sel_btn.on_click(cx.listener(|this, _, _, cx| {
-            this.controller.export_selection_only = true;
-            cx.notify();
-        }));
-    }
+    let weak = cx.weak_entity();
 
-    h_flex().gap_2().child(full_btn).child(sel_btn)
+    render_combo_button(
+        "exp-range-combo",
+        current_label,
+        240.0,
+        is_busy,
+        move |menu, _, _| {
+            let weak_full = weak.clone();
+            let weak_sel = weak.clone();
+            menu.label("書き出し範囲")
+                .item(
+                    PopupMenuItem::new("プロジェクト全体")
+                        .checked(!sel_only)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_full.update(cx, |this, cx| {
+                                this.controller.export_selection_only = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(sel_label.clone())
+                        .checked(sel_only)
+                        .disabled(!has_selection)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_sel.update(cx, |this, cx| {
+                                this.controller.export_selection_only = true;
+                                cx.notify();
+                            });
+                        }),
+                )
+        },
+    )
+}
+
+fn render_resolution_combo(
+    controller: &AppController,
+    state: &ExportDialogState,
+    is_busy: bool,
+    cx: &mut Context<SeaEditorWindow>,
+) -> AnyElement {
+    let choices = [
+        ExportResolutionPreset::ProjectNative,
+        ExportResolutionPreset::Hd720p,
+        ExportResolutionPreset::Fhd1080p,
+    ];
+    let current_choice = state.resolution.0;
+    let current_dims = current_choice.dimensions(&controller.document);
+    let current_label = if current_choice == ExportResolutionPreset::ProjectNative {
+        format!(
+            "{} ({}x{})",
+            current_choice.label(),
+            current_dims.0,
+            current_dims.1
+        )
+    } else {
+        current_choice.label().to_owned()
+    };
+    let items: Vec<(ExportResolutionPreset, String)> = choices
+        .into_iter()
+        .map(|choice| {
+            let label = if choice == ExportResolutionPreset::ProjectNative {
+                let d = choice.dimensions(&controller.document);
+                format!("{} ({}x{})", choice.label(), d.0, d.1)
+            } else {
+                choice.label().to_owned()
+            };
+            (choice, label)
+        })
+        .collect();
+    let weak = cx.weak_entity();
+
+    render_combo_button(
+        "exp-res-combo",
+        current_label,
+        240.0,
+        is_busy,
+        move |menu, _, _| {
+            let mut popup = menu.label("出力解像度");
+            for (choice, label) in &items {
+                let weak_item = weak.clone();
+                let chosen = *choice;
+                popup = popup.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(chosen == current_choice)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_item.update(cx, |this, cx| {
+                                this.controller.export_dialog.resolution =
+                                    ExportResolutionPresetChoice(chosen);
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            popup
+        },
+    )
 }
 
 fn render_option_fields(
@@ -629,9 +817,10 @@ fn render_option_fields(
             .text_color(theme.muted_foreground)
             .child("詳細オプション"),
     );
+    let plugin_idx = state.selected_plugin_idx;
     for (idx, field) in plugin.manifest.option_fields.iter().enumerate() {
         box_div = box_div.child(render_single_option_field(
-            idx,
+            plugin_idx * 64 + idx,
             field,
             merged.get(&field.key),
             is_busy,
@@ -764,33 +953,54 @@ fn render_select_option(
     let cur_str = current_val
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let mut row = h_flex().gap_1().flex_wrap();
-    for (c_idx, choice) in choices.iter().enumerate() {
-        let selected = cur_str == choice.value;
-        let choice_val = choice.value.clone();
-        let key_owned = field.key.clone();
-        let mut btn = Button::new(("exp-opt-sel", idx * 32 + c_idx))
-            .xsmall()
-            .label(choice.label.clone());
-        btn = if selected {
-            btn.primary()
-        } else {
-            btn.outline()
-        };
-        if !is_busy {
-            btn = btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.controller
-                    .export_dialog
-                    .set_select_option(&key_owned, choice_val.clone());
-                cx.notify();
-            }));
-        }
-        row = row.child(btn);
-    }
-    v_flex()
-        .gap_1()
-        .child(div().text_xs().child(field.label.clone()))
-        .child(row)
+    let current_label = choices
+        .iter()
+        .find(|c| c.value == cur_str)
+        .map_or_else(|| cur_str.to_owned(), |c| c.label.clone());
+    let items: Vec<(String, String)> = choices
+        .iter()
+        .map(|c| (c.value.clone(), c.label.clone()))
+        .collect();
+    let cur_owned = cur_str.to_owned();
+    let key_owned = field.key.clone();
+    let menu_title = field.label.clone();
+    let weak = cx.weak_entity();
+    let disabled = is_busy || items.is_empty();
+
+    let combo = render_combo_button(
+        ("exp-opt-combo", idx),
+        current_label,
+        280.0,
+        disabled,
+        move |menu, _, _| {
+            let mut popup = menu.label(menu_title.clone());
+            for (val, label) in &items {
+                let weak_item = weak.clone();
+                let key_item = key_owned.clone();
+                let val_item = val.clone();
+                popup = popup.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(*val == cur_owned)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_item.update(cx, |this, cx| {
+                                this.controller
+                                    .export_dialog
+                                    .set_select_option(&key_item, val_item.clone());
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            popup
+        },
+    );
+
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(div().text_xs().flex_shrink_0().child(field.label.clone()))
+        .child(div().flex_1().min_w(px(140.)).max_w(px(300.)).child(combo))
 }
 
 fn render_output_target_row(
@@ -841,21 +1051,25 @@ fn render_output_target_row(
         )
         .child(
             h_flex()
+                .w_full()
                 .gap_2()
                 .items_center()
-                .justify_between()
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .p_2()
                         .rounded(px(4.))
                         .bg(theme.background)
                         .border_1()
                         .border_color(theme.border)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_middle()
                         .text_xs()
                         .child(state.output_path.clone()),
                 )
-                .child(pick_btn),
+                .child(div().flex_shrink_0().child(pick_btn)),
         )
 }
 
@@ -865,7 +1079,13 @@ fn render_progress_and_actions(
     cx: &mut Context<SeaEditorWindow>,
 ) -> Div {
     let theme = cx.theme().clone();
-    let mut section = v_flex().gap_2();
+    let mut section = v_flex()
+        .flex_shrink_0()
+        .gap_2()
+        .px_4()
+        .py_3()
+        .border_t_1()
+        .border_color(theme.border);
     if let Some(prog) = &state.last_progress {
         let ratio = if prog.total_frames == 0 {
             0.0_f32
@@ -887,10 +1107,11 @@ fn render_progress_and_actions(
                         .bg(theme.background)
                         .border_1()
                         .border_color(theme.border)
+                        .overflow_hidden()
                         .child(
                             div()
                                 .h_full()
-                                .w(px(ratio * 580.0))
+                                .w(relative(ratio))
                                 .rounded(px(3.))
                                 .bg(rgba(0x3a82_f6ff)),
                         ),
@@ -1019,5 +1240,13 @@ mod tests {
             executable_path: None,
         };
         let _ = sample;
+    }
+
+    #[test]
+    fn modal_bounds_clamp_cleanly_for_small_and_large_viewports() {
+        assert_eq!(compute_export_modal_bounds(1920.0, 1080.0), (560.0, 620.0));
+        assert_eq!(compute_export_modal_bounds(1280.0, 720.0), (560.0, 620.0));
+        assert_eq!(compute_export_modal_bounds(400.0, 400.0), (368.0, 352.0));
+        assert_eq!(compute_export_modal_bounds(200.0, 200.0), (320.0, 240.0));
     }
 }
