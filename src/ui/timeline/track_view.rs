@@ -32,7 +32,8 @@ fn visible_window_bounds(controller: &AppController) -> (u64, u64) {
     let scroll_x = controller.timeline_scroll_x_frames;
     let visible_frames =
         ((controller.timeline_viewport_canvas_width_px.max(320.0)) / ppf).ceil() as u64;
-    (scroll_x, visible_frames.saturating_add(120))
+    let visible_end = scroll_x.saturating_add(visible_frames).saturating_add(120);
+    (scroll_x, visible_end)
 }
 
 fn clip_asset_id(clip: &Clip) -> Option<&crate::core::ids::AssetId> {
@@ -304,7 +305,7 @@ fn render_track_lane(
     let ppf = controller
         .timeline_px_per_frame
         .max(MIN_TIMELINE_PX_PER_FRAME);
-    let (scroll_x, win_frames) = visible_window_bounds(controller);
+    let (scroll_x, visible_end) = visible_window_bounds(controller);
     let lane_bg = if layer.locked {
         rgba(0x2a1b_1eff)
     } else if layer_idx.is_multiple_of(2) {
@@ -355,7 +356,7 @@ fn render_track_lane(
             clip.timeline_start.get(),
             clip.duration.get(),
             scroll_x,
-            win_frames,
+            visible_end,
         ) {
             continue;
         }
@@ -1043,7 +1044,8 @@ fn append_lane_playhead_and_guides(
 
 #[cfg(test)]
 mod tests {
-    use super::clip_block_height_px;
+    use super::{clip_block_height_px, clip_intersects_window, visible_window_bounds};
+    use crate::ui::app_controller::AppController;
 
     #[test]
     fn clip_block_height_fills_track_minus_vertical_margins() {
@@ -1051,5 +1053,21 @@ mod tests {
         assert!((clip_block_height_px(22.0) - 18.0).abs() < 1e-6);
         assert!((clip_block_height_px(42.0) - 38.0).abs() < 1e-6);
         assert!((clip_block_height_px(6.0) - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn visible_window_bounds_includes_scrolled_split_right_clip() {
+        let mut controller = AppController::new();
+        controller.timeline_viewport_canvas_width_px = 900.0;
+        controller.timeline_px_per_frame = 3.0;
+        controller.timeline_scroll_x_frames = 6900;
+
+        let (visible_start, visible_end) = visible_window_bounds(&controller);
+        assert_eq!(visible_start, 6900);
+        assert!(visible_end > 7200);
+
+        // 左分割クリップ [0..7175) と右分割クリップ [7175..7232) の両方が可視範囲に含まれること
+        assert!(clip_intersects_window(0, 7175, visible_start, visible_end));
+        assert!(clip_intersects_window(7175, 57, visible_start, visible_end));
     }
 }
