@@ -88,6 +88,46 @@ pub enum PreviewDragMode {
     MoveAnchor,
 }
 
+/// 拡縮ハンドル上で表示する画面空間のリサイズ方向軸。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeCursorAxis {
+    /// 水平リサイズ (`↔`)。
+    Horizontal,
+    /// 垂直リサイズ (`↕`)。
+    Vertical,
+    /// 左上〜右下リサイズ (`↖↘`)。
+    DiagNwSe,
+    /// 右上〜左下リサイズ (`↗↙`)。
+    DiagNeSw,
+}
+
+/// プレビューキャンバス上でのホバー／ドラッグ対象ヒント。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewHoverKind {
+    /// パン移動（`Space` 押下中・中ボタンドラッグ）。
+    Pan,
+    /// クリップ本体上の平行移動操作。
+    MoveClip,
+    /// ロックされたレイヤー上の操作不可状態。
+    LockedClip,
+    /// 選択クリップの専用操作ハンドル（アンカー・回転・8拡縮）。
+    Handle {
+        /// ホバー中のハンドル種別。
+        handle: PreviewHandleKind,
+        /// 回転角度を加味したリサイズカーソル方向軸。
+        axis: ResizeCursorAxis,
+    },
+}
+
+/// プレビューキャンバス上の現在ホバー状態と対象画面座標。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewHoverState {
+    /// 現在のホバー／ドラッグ操作種別。
+    pub kind: PreviewHoverKind,
+    /// ハイライト・バッジ表示用の画面座標 (px)。
+    pub screen_pos: (f32, f32),
+}
+
 /// ドラッグ中の修飾キー状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DragModifiers {
@@ -527,6 +567,150 @@ pub fn hit_test_preview_layers(
         .iter()
         .rev()
         .find(|quad| !quad.is_locked && point_in_quad_screen((sx, sy), &quad.screen_corners))
+}
+
+/// 選択四角形の辺方向（正規化軸ベクトル）から、アスペクト比に歪まず回転・反転に追従するリサイズカーソル軸を算出する。
+#[must_use]
+pub fn scale_handle_cursor_axis(
+    quad: &PreviewLayerHitQuad,
+    handle: PreviewHandleKind,
+) -> ResizeCursorAxis {
+    let [tl, tr, _, bl] = quad.screen_corners;
+    let ux = (tr.0 - tl.0, tr.1 - tl.1);
+    let uy = (bl.0 - tl.0, bl.1 - tl.1);
+    let len_x = ux.0.hypot(ux.1);
+    let len_y = uy.0.hypot(uy.1);
+    let (nx, ny) = if len_x > 1e-3 && len_y > 1e-3 {
+        ((ux.0 / len_x, ux.1 / len_x), (uy.0 / len_y, uy.1 / len_y))
+    } else {
+        ((1.0, 0.0), (0.0, 1.0))
+    };
+
+    let (dx, dy) = match handle {
+        PreviewHandleKind::ScaleL | PreviewHandleKind::ScaleR => nx,
+        PreviewHandleKind::ScaleT | PreviewHandleKind::ScaleB => ny,
+        PreviewHandleKind::ScaleTR | PreviewHandleKind::ScaleBL => (nx.0 - ny.0, nx.1 - ny.1),
+        PreviewHandleKind::ScaleTL
+        | PreviewHandleKind::ScaleBR
+        | PreviewHandleKind::Move
+        | PreviewHandleKind::Rotate
+        | PreviewHandleKind::Anchor => (nx.0 + ny.0, nx.1 + ny.1),
+    };
+    if dx.hypot(dy) < 1e-3 {
+        return ResizeCursorAxis::DiagNwSe;
+    }
+    let pi = std::f32::consts::PI;
+    let angle = dy.atan2(dx).rem_euclid(pi);
+    let sector = (angle / (pi / 8.0)).floor();
+    if !(1.0..7.0).contains(&sector) {
+        ResizeCursorAxis::Horizontal
+    } else if sector < 3.0 {
+        ResizeCursorAxis::DiagNwSe
+    } else if sector < 5.0 {
+        ResizeCursorAxis::Vertical
+    } else {
+        ResizeCursorAxis::DiagNeSw
+    }
+}
+
+/// ホバーカーソル判定に必要なプレビュー領域入力情報。
+pub struct PreviewHoverQuery<'a> {
+    /// 現在のプロジェクトドキュメント。
+    pub doc: &'a ProjectDocument,
+    /// 現在再生フレーム位置。
+    pub playhead: FrameIndex,
+    /// プレビュービューポート座標変換。
+    pub viewport: &'a PreviewViewportTransform,
+    /// プライマリ選択中クリップ ID。
+    pub primary_clip_id: Option<&'a ClipId>,
+    /// 枠・ハンドルガイドを表示中か。
+    pub show_guides: bool,
+    /// `Space` キーでパン待機中か。
+    pub space_pan_held: bool,
+    /// 現在進行中のドラッグ種別。
+    pub active_drag: Option<PreviewDragMode>,
+    /// マウスポインタのウィンドウ座標 (px)。
+    pub mouse_window: (f32, f32),
+}
+
+/// ポインタ位置と選択状態からプレビュー上のホバーカーソル種別を決定する。
+#[must_use]
+pub fn compute_preview_hover(query: &PreviewHoverQuery<'_>) -> Option<PreviewHoverState> {
+    let (bx, by, bw, bh) = query.viewport.bounds;
+    let (mx, my) = query.mouse_window;
+    let inside = mx >= bx && mx <= bx + bw && my >= by && my <= by + bh;
+    if !inside && query.active_drag.is_none() {
+        return None;
+    }
+
+    if let Some(mode) = query.active_drag {
+        let kind = match mode {
+            PreviewDragMode::PanViewport => PreviewHoverKind::Pan,
+            PreviewDragMode::MoveObject => PreviewHoverKind::MoveClip,
+            PreviewDragMode::MoveAnchor => PreviewHoverKind::Handle {
+                handle: PreviewHandleKind::Anchor,
+                axis: ResizeCursorAxis::Horizontal,
+            },
+            PreviewDragMode::RotateHandle => PreviewHoverKind::Handle {
+                handle: PreviewHandleKind::Rotate,
+                axis: ResizeCursorAxis::Horizontal,
+            },
+            PreviewDragMode::ScaleHandle { handle } => {
+                let quads = build_preview_hit_quads(query.doc, query.playhead, query.viewport);
+                let axis = query
+                    .primary_clip_id
+                    .and_then(|pid| quads.iter().find(|q| &q.clip_id == pid))
+                    .map_or(ResizeCursorAxis::DiagNwSe, |pq| {
+                        scale_handle_cursor_axis(pq, handle)
+                    });
+                PreviewHoverKind::Handle { handle, axis }
+            }
+        };
+        return Some(PreviewHoverState {
+            kind,
+            screen_pos: (mx, my),
+        });
+    }
+
+    if query.space_pan_held {
+        return Some(PreviewHoverState {
+            kind: PreviewHoverKind::Pan,
+            screen_pos: (mx, my),
+        });
+    }
+
+    let quads = build_preview_hit_quads(query.doc, query.playhead, query.viewport);
+    if query.show_guides
+        && let Some(pid) = query.primary_clip_id
+        && let Some(pq) = quads.iter().find(|q| &q.clip_id == pid)
+        && let Some(handle) = hit_test_selection_handle(pq, mx, my)
+    {
+        let pos = handle_screen_positions(pq)
+            .into_iter()
+            .find(|(k, _)| *k == handle)
+            .map_or((mx, my), |(_, p)| p);
+        return Some(PreviewHoverState {
+            kind: PreviewHoverKind::Handle {
+                handle,
+                axis: scale_handle_cursor_axis(pq, handle),
+            },
+            screen_pos: pos,
+        });
+    }
+
+    let hit = quads
+        .iter()
+        .rev()
+        .find(|quad| point_in_quad_screen((mx, my), &quad.screen_corners))?;
+    let kind = if hit.is_locked {
+        PreviewHoverKind::LockedClip
+    } else {
+        PreviewHoverKind::MoveClip
+    };
+    Some(PreviewHoverState {
+        kind,
+        screen_pos: (mx, my),
+    })
 }
 
 /// 任意の凸四角形 `[TL, TR, BR, BL]` の内外を反転（負スケール）に依存せず判定する。
@@ -1321,6 +1505,108 @@ mod tests {
         if let Some(updated) = out.updated {
             assert_eq!(updated.rotation_deg, AnimatedParameter::constant(15.0));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hover_detection_distinguishes_rotate_scale_anchor_and_move()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = ProjectDocument::new("hover");
+        let layer = crate::timeline::document::Layer::new(LayerId::new("l1")?, "Track 1");
+        let clip = crate::timeline::document::Clip {
+            id: ClipId::new("c1")?,
+            name: "title".to_owned(),
+            timeline_start: FrameIndex::ZERO,
+            duration: FrameCount::new(60)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(crate::media::visual_properties::SubtitleProperties::new(
+                "Hello",
+            )),
+        };
+        doc.layers.push(layer);
+        doc.layers[0].clips.push(clip);
+
+        let viewport = PreviewViewportTransform {
+            bounds: (0.0, 0.0, 1920.0, 1080.0),
+            proj_size: (1920, 1080),
+            zoom: PreviewZoomMode::Percent(100),
+            pan_px: (0.0, 0.0),
+        };
+        let quads = build_preview_hit_quads(&doc, FrameIndex::ZERO, &viewport);
+        let q = quads.first().ok_or("expected hit quad")?;
+
+        let rot_hover = compute_preview_hover(&PreviewHoverQuery {
+            doc: &doc,
+            playhead: FrameIndex::ZERO,
+            viewport: &viewport,
+            primary_clip_id: Some(&q.clip_id),
+            show_guides: true,
+            space_pan_held: false,
+            active_drag: None,
+            mouse_window: q.rotate_handle_screen,
+        })
+        .ok_or("expected rotate hover")?;
+        assert!(matches!(
+            rot_hover.kind,
+            PreviewHoverKind::Handle {
+                handle: PreviewHandleKind::Rotate,
+                ..
+            }
+        ));
+
+        let anchor_hover = compute_preview_hover(&PreviewHoverQuery {
+            doc: &doc,
+            playhead: FrameIndex::ZERO,
+            viewport: &viewport,
+            primary_clip_id: Some(&q.clip_id),
+            show_guides: true,
+            space_pan_held: false,
+            active_drag: None,
+            mouse_window: q.anchor_screen,
+        })
+        .ok_or("expected anchor hover")?;
+        assert!(matches!(
+            anchor_hover.kind,
+            PreviewHoverKind::Handle {
+                handle: PreviewHandleKind::Anchor,
+                ..
+            }
+        ));
+
+        let tl_hover = compute_preview_hover(&PreviewHoverQuery {
+            doc: &doc,
+            playhead: FrameIndex::ZERO,
+            viewport: &viewport,
+            primary_clip_id: Some(&q.clip_id),
+            show_guides: true,
+            space_pan_held: false,
+            active_drag: None,
+            mouse_window: q.screen_corners[0],
+        })
+        .ok_or("expected TL handle hover")?;
+        assert_eq!(
+            tl_hover.kind,
+            PreviewHoverKind::Handle {
+                handle: PreviewHandleKind::ScaleTL,
+                axis: ResizeCursorAxis::DiagNwSe,
+            }
+        );
+
+        let inside_pt = (q.anchor_screen.0 + 25.0, q.anchor_screen.1 + 10.0);
+        let move_hover = compute_preview_hover(&PreviewHoverQuery {
+            doc: &doc,
+            playhead: FrameIndex::ZERO,
+            viewport: &viewport,
+            primary_clip_id: Some(&q.clip_id),
+            show_guides: true,
+            space_pan_held: false,
+            active_drag: None,
+            mouse_window: inside_pt,
+        })
+        .ok_or("expected move hover")?;
+        assert_eq!(move_hover.kind, PreviewHoverKind::MoveClip);
         Ok(())
     }
 }

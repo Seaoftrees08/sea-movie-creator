@@ -11,6 +11,10 @@ use gpui_kit::{Context, Entity, IntoElement, ParentElement as _, Styled as _, di
 use crate::timeline::document::TimelineLengthMode;
 use crate::ui::ai_chat_panel::{AiProviderSelectItem, render_ai_chat_panel};
 use crate::ui::app_controller::{AppController, RightPanelTab};
+use crate::ui::i18n::{
+    active_language_code, available_languages, primary_lang_dir, reload_languages,
+    set_active_language, tr, tr_fmt,
+};
 use crate::ui::inspector_panel::{InspectorWidgetBank, InspectorWidgets, render_clip_inspector};
 use crate::ui::window::SeaEditorWindow;
 
@@ -34,16 +38,19 @@ pub fn render_right_panel(
     let theme = cx.theme().clone();
     let selected_count = controller.effective_selected_clip_ids().len();
     let clip_tab_label = match selected_count {
-        0 => "クリップ (選択なし)".to_owned(),
-        1 => "クリップ".to_owned(),
-        n => format!("クリップ ({n}個)"),
+        0 => tr("tab.clip_none"),
+        1 => tr("tab.clip"),
+        n => {
+            let n_str = n.to_string();
+            tr_fmt("tab.clip_count", &[("n", &n_str)])
+        }
     };
 
     let tabs = [
-        (clip_tab_label.as_str(), RightPanelTab::ClipInspector),
-        ("AIチャット", RightPanelTab::AiChat),
-        ("トラック", RightPanelTab::LayerList),
-        ("プロジェクト", RightPanelTab::ProjectInfo),
+        (clip_tab_label, RightPanelTab::ClipInspector),
+        (tr("tab.ai"), RightPanelTab::AiChat),
+        (tr("tab.layers"), RightPanelTab::LayerList),
+        (tr("tab.project"), RightPanelTab::ProjectInfo),
     ];
 
     let tab_bar = h_flex()
@@ -53,9 +60,7 @@ pub fn render_right_panel(
         .border_color(theme.border)
         .flex_wrap()
         .children(tabs.into_iter().enumerate().map(|(ix, (label, tab))| {
-            let mut btn = Button::new(("right-tab-btn", ix))
-                .small()
-                .label(label.to_owned());
+            let mut btn = Button::new(("right-tab-btn", ix)).small().label(label);
             btn = if controller.right_tab == tab {
                 btn.primary()
             } else {
@@ -217,70 +222,158 @@ fn render_project_tab(
     let doc = &controller.document;
     let res = doc.resolution;
     let total_f = doc.total_duration_frames();
+    let total_str = total_f.to_string();
     let length_desc = match doc.timeline_length {
-        TimelineLengthMode::AutoToLastClip => format!("自動 ({total_f}f)"),
-        TimelineLengthMode::Manual { end_frame } => format!("手動 ({}f)", end_frame.get()),
+        TimelineLengthMode::AutoToLastClip => tr_fmt("timeline.len_auto", &[("total", &total_str)]),
+        TimelineLengthMode::Manual { end_frame } => {
+            let end_s = end_frame.get().to_string();
+            tr_fmt("timeline.len_manual", &[("total", &end_s)])
+        }
     };
+    let w_str = res.width.to_string();
+    let h_str = res.height.to_string();
+    let fps_str = format!("{}", doc.fps.as_f64());
+    let tracks_str = doc.layers.len().to_string();
+    let assets_str = doc.assets.len().to_string();
 
     v_flex()
         .gap_2()
+        .w_full()
+        .child(
+            v_flex()
+                .gap_2()
+                .p_2()
+                .rounded_sm()
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(theme.border)
+                .child(div().text_sm().font_semibold().child(doc.name.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tr_fmt(
+                            "project.resolution",
+                            &[("w", &w_str), ("h", &h_str), ("fps", &fps_str)],
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tr_fmt(
+                            "project.summary",
+                            &[
+                                ("tracks", &tracks_str),
+                                ("assets", &assets_str),
+                                ("len", &length_desc),
+                            ],
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .child(
+                            Button::new("proj-auto-len-btn")
+                                .ghost()
+                                .small()
+                                .label(tr("project.len_auto_btn"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this
+                                        .controller
+                                        .set_timeline_length(TimelineLengthMode::AutoToLastClip);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("proj-manual-len-btn")
+                                .ghost()
+                                .small()
+                                .label(tr("project.len_manual_btn"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_timeline_length_modal(window, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tr_fmt(
+                            "project.status",
+                            &[("status", &controller.status_message)],
+                        )),
+                ),
+        )
+        .child(render_language_card(theme, cx))
+}
+
+fn render_language_card(theme: &Theme, cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
+    let active_lang = active_language_code();
+    let languages = available_languages();
+    let lang_dir_text = primary_lang_dir().display().to_string();
+
+    v_flex()
+        .gap_1p5()
         .p_2()
         .rounded_sm()
         .bg(theme.secondary)
         .border_1()
         .border_color(theme.border)
-        .child(div().text_sm().font_semibold().child(doc.name.clone()))
         .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!(
-                    "解像度: {}x{} @ {}fps",
-                    res.width,
-                    res.height,
-                    doc.fps.as_f64()
-                )),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!(
-                    "トラック: {} / 素材: {} / 総尺: {length_desc}",
-                    doc.layers.len(),
-                    doc.assets.len(),
-                )),
+            h_flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .child(tr("project.language_title")),
+                )
+                .child(
+                    Button::new("proj-lang-reload-btn")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("project.language_reload"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let n = reload_languages();
+                            this.controller.status_message =
+                                format!("lang/ を再読み込みしました ({n} 言語)");
+                            this.reload_app_menus(cx);
+                            cx.notify();
+                        })),
+                ),
         )
         .child(
             h_flex()
                 .gap_1()
                 .flex_wrap()
-                .child(
-                    Button::new("proj-auto-len-btn")
-                        .ghost()
+                .children(languages.into_iter().enumerate().map(|(ix, lang)| {
+                    let is_active = lang.code == active_lang;
+                    let code = lang.code.clone();
+                    let mut btn = Button::new(("proj-lang-btn", ix))
                         .small()
-                        .label("総尺を自動へ")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this
-                                .controller
-                                .set_timeline_length(TimelineLengthMode::AutoToLastClip);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("proj-manual-len-btn")
-                        .ghost()
-                        .small()
-                        .label("総尺を設定...")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_timeline_length_modal(window, cx);
-                        })),
-                ),
+                        .label(format!("{} ({})", lang.name, lang.code));
+                    btn = if is_active {
+                        btn.primary()
+                    } else {
+                        btn.ghost()
+                    };
+                    btn.on_click(cx.listener(move |this, _, _, cx| {
+                        if let Ok(info) = set_active_language(&code) {
+                            this.controller.status_message =
+                                format!("Language: {} ({})", info.name, info.code);
+                            this.reload_app_menus(cx);
+                        }
+                        cx.notify();
+                    }))
+                })),
         )
         .child(
             div()
-                .text_xs()
+                .text_size(gpui_kit::px(10.0))
                 .text_color(theme.muted_foreground)
-                .child(format!("状態: {}", controller.status_message)),
+                .child(format!("{}: {lang_dir_text}", tr("project.language_hint"))),
         )
 }

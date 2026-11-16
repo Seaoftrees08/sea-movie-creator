@@ -820,4 +820,31 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[test]
+    fn resolves_ai_executable_inside_plugin_subdir() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDirGuard::create("plugin-subdir")?;
+        let ai_dir = dir.0.join("acp");
+        fs::create_dir_all(&ai_dir)?;
+        let exe_name = if std::env::consts::EXE_SUFFIX.is_empty() {
+            "custom-ai-bin".to_owned()
+        } else {
+            format!("custom-ai-bin{}", std::env::consts::EXE_SUFFIX)
+        };
+        let exe_path = ai_dir.join(&exe_name);
+        fs::write(&exe_path, b"stub")?;
+        fs::write(
+            ai_dir.join("ai-plugin.json"),
+            r#"{"schema_version":1,"id":"test.ai.local","name":"Local AI","version":"0.1.0","entrypoint":"custom-ai-bin"}"#,
+        )?;
+
+        let reg = AiPluginRegistry::discover_in_dirs(std::slice::from_ref(&dir.0));
+        assert_eq!(
+            reg.find("test.ai.local")
+                .and_then(|p| p.executable_path.as_deref()),
+            Some(exe_path.as_path())
+        );
+        let _provider = reg.resolve_provider("test.ai.local")?;
+        Ok(())
+    }
 }

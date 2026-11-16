@@ -16,6 +16,7 @@ use crate::export::registry::{DiscoveredPlugin, PluginRegistry};
 use crate::export::runner::{ExportJobHandle, ExportOutcome, ExportProgress};
 use crate::timeline::document::ProjectDocument;
 use crate::ui::app_controller::AppController;
+use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
 
 /// 出力解像度プリセット。
@@ -562,7 +563,7 @@ fn render_dialog_header(is_busy: bool, cx: &mut Context<SeaEditorWindow>) -> Div
     let mut close_btn = Button::new("export-close-x")
         .ghost()
         .xsmall()
-        .label("閉じる");
+        .label(tr("common.close"));
     if !is_busy {
         close_btn = close_btn.on_click(cx.listener(|this, _, _, cx| {
             this.controller.export_dialog.close();
@@ -578,7 +579,7 @@ fn render_dialog_header(is_busy: bool, cx: &mut Context<SeaEditorWindow>) -> Div
         .pb_2()
         .border_b_1()
         .border_color(theme.border)
-        .child(div().text_sm().child("動画の書き出し (プラグイン形式)"))
+        .child(div().text_sm().child(tr("export.title")))
         .child(close_btn)
 }
 
@@ -677,7 +678,7 @@ fn render_plugin_selector(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("エンコーダプラグイン"),
+                .child(tr("export.encoder_plugin")),
         )
         .child(div().w_full().child(combo))
 }
@@ -796,7 +797,7 @@ fn render_preset_selector(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("プリセット"),
+                .child(tr("export.preset")),
         )
         .child(div().w_full().child(combo))
         .child(
@@ -1267,7 +1268,7 @@ fn render_output_target_row(
     let mut pick_btn = Button::new("exp-pick-out")
         .outline()
         .xsmall()
-        .label("出力先変更...");
+        .label(tr("export.browse_output"));
     if !is_busy {
         pick_btn = pick_btn.on_click(cx.listener(|this, _, _, cx| {
             let ext = this
@@ -1302,7 +1303,7 @@ fn render_output_target_row(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("保存先ファイル"),
+                .child(tr("export.output_file")),
         )
         .child(
             h_flex()
@@ -1406,7 +1407,7 @@ fn render_progress_and_actions(
     let mut start_btn = Button::new("exp-start")
         .primary()
         .small()
-        .label("書き出し開始");
+        .label(tr("export.start"));
     if can_start {
         start_btn = start_btn.on_click(cx.listener(|this, _, _, cx| {
             if let Err(err) = this.controller.start_export_from_dialog() {
@@ -1421,7 +1422,7 @@ fn render_progress_and_actions(
         let cancel_btn = Button::new("exp-cancel")
             .outline()
             .small()
-            .label("書き出しを中断")
+            .label(tr("export.cancel_job"))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.controller.cancel_active_export();
                 cx.notify();

@@ -6,9 +6,9 @@
 
 ## Q1. 「有効なプラグインが見つかりませんでした」／AI や音声プラグインが動かない
 
-書き出し（`sea-export-av1`, `sea-export-h264`, `sea-export-h265`）、AI CLI アダプタ（`sea-ai-acp`, `sea-ai-antigravity`）、音声隔離ホスト（`sea-audio-host`）は、本体と同じフォルダに存在する**別実行ファイル ＋ `plugins/` マニフェスト**を必要とします。
+書き出し（`sea-export-av1`, `sea-export-h264`, `sea-export-h265`）、AI CLI アダプタ（`sea-ai-acp`, `sea-ai-antigravity`）、音声隔離ワーカー（`sea-audio-host`）は、それぞれ **`plugins/` サブフォルダ内の実行ファイルとマニフェスト**を必要とします。
 
-- **確認点 1（配布フォルダ）**: `sea-movie-creator.exe` の横に各 `sea-*.exe` と `plugins/export/`, `plugins/ai/` フォルダが揃っているか確認してください。
+- **確認点 1（配布フォルダ）**: `plugins/export/{av1,h264,h265}/`, `plugins/ai/{acp,antigravity}/`, `plugins/audio/` の中にそれぞれの `sea-*.exe`（およびマニフェスト `plugin.json` / `ai-plugin.json`）が揃っているか確認してください。
 - **確認点 2（ソースビルド時）**: `cargo run` だけではプラグイン側バイナリがビルドされない場合があります。必ずワークスペース全体を事前ビルドしてください。
   ```bash
   cargo build --release --workspace

@@ -8,27 +8,36 @@
 
 ### 必要なフォルダ配置
 
-アプリは実行ファイルと同じ階層（またはカレントディレクトリ）の `plugins/` を自動検出します。**バイナリ単体だけを別フォルダへ移動せず、以下の構成を保ったまま配置してください。**
+アプリは実行ファイルと同じ階層（またはカレントディレクトリ）の `plugins/` と `lang/` を自動検出します。配布フォルダ直下には起動ソフト (`sea-movie-creator.exe`) のみを置き、プラグイン・音声隔離ホスト実行ファイルは `plugins/` 配下へ整理されています。
 
 ```text
 <配布フォルダ>/
-├── sea-movie-creator.exe        # アプリ本体（GUI / CLI / MCP サーバー）
-├── sea-export-av1.exe           # 書き出しプラグイン: 標準 AV1 (rav1e + FLAC) / OS HW
-├── sea-export-h264.exe          # 書き出しプラグイン: H.264 (OS Media Foundation / 外部 ffmpeg)
-├── sea-export-h265.exe          # 書き出しプラグイン: H.265 (OS HW HEVC / 外部 ffmpeg)
-├── sea-audio-host.exe           # 音声プラグイン隔離ホスト (VST3 / CLAP)
-├── sea-ai-acp.exe               # AI CLI プラグイン: ACP Stdio (Claude / Codex / Copilot)
-├── sea-ai-antigravity.exe       # AI CLI プラグイン: Antigravity 公式 ACP (agy acp --sandbox)
+├── sea-movie-creator.exe        # アプリ本体（起動用）
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
+├── lang/                        # 多言語ファイル（`<code >.json` を追加するだけで言語追加可能）
+│   ├── ja.json
+│   └── en.json
 └── plugins/
     ├── ai/
-    │   ├── acp/ai-plugin.json
-    │   └── antigravity/ai-plugin.json
+    │   ├── acp/
+    │   │   ├── ai-plugin.json
+    │   │   └── sea-ai-acp.exe          # AI CLI プラグイン: ACP Stdio (Claude / Codex / Copilot)
+    │   └── antigravity/
+    │       ├── ai-plugin.json
+    │       └── sea-ai-antigravity.exe  # AI CLI プラグイン: Antigravity 公式 ACP
+    ├── audio/
+    │   └── sea-audio-host.exe          # 音声プラグイン (VST3 / CLAP) 用内部隔離ワーカー
     └── export/
-        ├── av1/plugin.json
-        ├── h264/plugin.json
-        └── h265/plugin.json
+        ├── av1/
+        │   ├── plugin.json
+        │   └── sea-export-av1.exe      # 書き出しプラグイン: 標準 AV1 (rav1e + FLAC)
+        ├── h264/
+        │   ├── plugin.json
+        │   └── sea-export-h264.exe     # 書き出しプラグイン: H.264 (OS Media Foundation 等)
+        └── h265/
+            ├── plugin.json
+            └── sea-export-h265.exe     # 書き出しプラグイン: H.265 / HEVC
 ```
 
 > [!TIP]

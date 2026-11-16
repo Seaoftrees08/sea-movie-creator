@@ -20,6 +20,7 @@ use crate::timeline::document::TimelineLengthMode;
 use crate::ui::app_controller::{
     AppController, MIN_TIMELINE_PX_PER_FRAME, TimeDisplayUnit, TimelineRowDensity,
 };
+use crate::ui::i18n::{tr, tr_fmt};
 use crate::ui::window::SeaEditorWindow;
 
 use self::ruler::{compute_ruler_ticks, render_timeline_ruler};
@@ -244,14 +245,18 @@ fn render_header_controls(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement + use<> {
     let total = controller.document.total_duration_frames();
+    let total_str = total.to_string();
     let len_label = match controller.document.timeline_length {
-        TimelineLengthMode::AutoToLastClip => format!("尺: 自動 ({total}f)"),
-        TimelineLengthMode::Manual { end_frame } => format!("尺: 手動 ({}f)", end_frame.get()),
+        TimelineLengthMode::AutoToLastClip => tr_fmt("timeline.len_auto", &[("total", &total_str)]),
+        TimelineLengthMode::Manual { end_frame } => {
+            let end_s = end_frame.get().to_string();
+            tr_fmt("timeline.len_manual", &[("total", &end_s)])
+        }
     };
     let density_label = match controller.timeline_row_density {
-        TimelineRowDensity::Compact => "高さ: 小",
-        TimelineRowDensity::Medium => "高さ: 中",
-        TimelineRowDensity::Large => "高さ: 大",
+        TimelineRowDensity::Compact => tr("timeline.density_compact"),
+        TimelineRowDensity::Medium => tr("timeline.density_medium"),
+        TimelineRowDensity::Large => tr("timeline.density_large"),
     };
     let unit_label = match controller.time_display_unit {
         TimeDisplayUnit::Timecode => "TC",
@@ -273,7 +278,7 @@ fn render_header_controls(
                     div()
                         .text_size(px(11.))
                         .text_color(rgba(0xe5e7_ebff))
-                        .child("拡張編集"),
+                        .child(tr("timeline.title")),
                 )
                 .child(header_pill(
                     "tl-unit-pill",
@@ -297,7 +302,7 @@ fn render_header_controls(
                 ))
                 .child(header_pill(
                     "tl-follow-toggle",
-                    "追従",
+                    tr("timeline.follow"),
                     controller.follow_selected_on_seek,
                     cx.listener(|this, _, _, cx| {
                         this.controller.toggle_follow_selected_on_seek();
@@ -306,7 +311,7 @@ fn render_header_controls(
                 ))
                 .child(header_pill(
                     "tl-snap-toggle",
-                    "スナップ",
+                    tr("timeline.snap"),
                     controller.snap_config.enabled,
                     cx.listener(|this, _, _, cx| {
                         this.controller.toggle_snap_enabled();
@@ -324,7 +329,7 @@ fn render_header_controls(
                 ))
                 .child(header_pill(
                     "tl-add-layer-btn",
-                    "+ トラック",
+                    tr("timeline.add_track"),
                     false,
                     cx.listener(|this, _, _, cx| {
                         if let Err(err) = this.controller.add_empty_layer() {
@@ -404,7 +409,7 @@ fn render_track_viewport(
             .justify_center()
             .text_size(px(12.))
             .text_color(rgba(0x9ca3_afff))
-            .child("タイムラインは空です。「+ トラック」またはドラッグ＆ドロップで追加できます。")
+            .child(tr("timeline.empty_hint"))
             .into_any_element();
     }
 
@@ -919,14 +924,14 @@ fn render_timeline_length_modal_card(
             div()
                 .text_size(px(13.))
                 .text_color(rgba(0xe5e7_ebff))
-                .child("タイムライン長の変更"),
+                .child(tr("timeline.modal_title")),
         )
         .child(
             h_flex()
                 .gap_2()
                 .child(header_pill(
                     "tl-len-mode-auto",
-                    "自動（最終クリップまで）",
+                    tr("timeline.modal_auto"),
                     !is_manual,
                     cx.listener(|this, _, _, cx| {
                         if let Some(modal) = &mut this.timeline_length_modal {
@@ -937,7 +942,7 @@ fn render_timeline_length_modal_card(
                 ))
                 .child(header_pill(
                     "tl-len-mode-manual",
-                    "手動指定",
+                    tr("timeline.modal_manual"),
                     is_manual,
                     cx.listener(|this, _, _, cx| {
                         if let Some(modal) = &mut this.timeline_length_modal {
@@ -966,7 +971,7 @@ fn render_timeline_length_modal_card(
             .gap_2()
             .child(header_pill(
                 "tl-len-cancel",
-                "キャンセル",
+                tr("common.cancel"),
                 false,
                 cx.listener(|this, _, _, cx| {
                     this.close_timeline_length_modal();
@@ -975,7 +980,7 @@ fn render_timeline_length_modal_card(
             ))
             .child(header_pill(
                 "tl-len-apply",
-                "適用",
+                tr("timeline.modal_apply"),
                 true,
                 cx.listener(|this, _, window, cx| {
                     this.apply_timeline_length_modal(window, cx);

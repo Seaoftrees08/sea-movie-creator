@@ -6,6 +6,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::select::Select;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, IntoElement, ParentElement as _, Styled as _, Window, div, px, rgba,
@@ -18,6 +19,7 @@ use crate::media::visual_properties::{BlendMode, SubtitleProperties, TextAlignme
 use crate::timeline::command::{EditCommand, ParameterPath, ParameterTarget, ParameterValue};
 use crate::timeline::document::{AudioProperties, Clip, ClipKind, Layer};
 use crate::ui::app_controller::{AppController, RightPanelTab};
+use crate::ui::i18n::tr;
 use crate::ui::inspector::midpoint_bar::render_midpoint_bar;
 use crate::ui::inspector::segment_ops::{
     InspectorParameterSlot, build_batch_relative_xy_offset_command, build_expression_command,
@@ -25,7 +27,10 @@ use crate::ui::inspector::segment_ops::{
     build_reset_color_adjustments_command, clip_has_non_default_color_adjustments,
     effect_frame_at_playhead, evaluation_context_for_clip, sample_parameter_curve,
 };
-use crate::ui::inspector::trackbar_row::{InspectorWidgetBank, render_trackbar_row};
+use crate::ui::inspector::trackbar_row::{
+    InspectorWidgetBank, apply_subtitle_font_family_command, render_trackbar_row,
+    spawn_google_font_install, spawn_google_font_search,
+};
 use crate::ui::window::SeaEditorWindow;
 
 /// インスペクタ描画に必要な UI ウィジェット群への参照。
@@ -75,18 +80,19 @@ fn render_empty_inspector(theme: &Theme, _cx: &mut Context<SeaEditorWindow>) -> 
                 .text_sm()
                 .font_semibold()
                 .text_color(theme.foreground)
-                .child("オブジェクト未選択"),
-        )
-        .child(
-            div().text_xs().text_color(theme.muted_foreground).child(
-                "タイムラインまたはプレビューでオブジェクトをクリックして選択してください。",
-            ),
+                .child(tr("inspector.no_selection")),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("Shift / Ctrl + クリック、または空白ドラッグで複数選択できます。"),
+                .child(tr("inspector.no_selection_hint")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(tr("inspector.multi_select_hint")),
         )
 }
 
@@ -126,7 +132,10 @@ fn render_multi_select_inspector(
                         .text_sm()
                         .font_semibold()
                         .text_color(theme.foreground)
-                        .child(format!("{count} 個のオブジェクトを選択中")),
+                        .child(crate::ui::i18n::tr_fmt(
+                            "inspector.multi_select_title",
+                            &[("count", &count.to_string())],
+                        )),
                 )
                 .child(
                     div()
@@ -157,7 +166,7 @@ fn render_multi_select_actions(
             Button::new("multi-dup-btn")
                 .ghost()
                 .small()
-                .label("一括複製")
+                .label(tr("inspector.bulk_duplicate"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     duplicate_selected_clips(this, &ids_dup, window, cx);
                 })),
@@ -166,7 +175,7 @@ fn render_multi_select_actions(
             Button::new("multi-del-btn")
                 .ghost()
                 .small()
-                .label("一括削除")
+                .label(tr("inspector.bulk_delete"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     delete_selected_clips(this, &ids_del, window, cx);
                 })),
@@ -336,7 +345,7 @@ fn render_single_clip_inspector(
         let std_open = controller.is_inspector_section_open("standard");
         root = root.child(render_collapsible_section(
             "standard",
-            "標準描画",
+            tr("inspector.section_standard"),
             false,
             std_open,
             render_standard_section_body(controller, clip, bank, theme, cx),
@@ -361,7 +370,7 @@ fn render_single_clip_inspector(
         let sub_open = controller.is_inspector_section_open("subtitle");
         root = root.child(render_collapsible_section(
             "subtitle",
-            "字幕設定",
+            tr("inspector.section_subtitle"),
             false,
             sub_open,
             render_subtitle_section_body(controller, clip, sub, bank, theme, cx),
@@ -374,7 +383,7 @@ fn render_single_clip_inspector(
         let audio_open = controller.is_inspector_section_open("audio");
         root = root.child(render_collapsible_section(
             "audio",
-            "音声再生",
+            tr("inspector.section_audio"),
             false,
             audio_open,
             render_audio_section_body(controller, clip, audio, preserve_pitch, bank, theme, cx),
@@ -386,7 +395,7 @@ fn render_single_clip_inspector(
     let expr_open = controller.is_inspector_section_open("expression");
     root = root.child(render_collapsible_section(
         "expression",
-        "数式 f(t) / カーブ詳細",
+        tr("inspector.section_expr"),
         false,
         expr_open,
         render_curve_and_expr_section_body(controller, clip, bank, theme, cx),
@@ -457,7 +466,7 @@ fn render_object_header(
                     Button::new("clip-reset-all-btn")
                         .ghost()
                         .small()
-                        .label("リセット")
+                        .label(tr("inspector.reset"))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some((_, c)) = this.controller.document.find_clip(&cid_reset)
                                 && let Some(cmd) = build_reset_clip_parameters_command(c)
@@ -509,7 +518,7 @@ fn render_object_header(
 #[allow(clippy::too_many_arguments)]
 fn render_collapsible_section(
     key: &'static str,
-    title: &'static str,
+    title: impl AsRef<str>,
     blue_dot: bool,
     open: bool,
     content: AnyElement,
@@ -530,7 +539,7 @@ fn render_collapsible_section(
             Button::new(format!("insp-sec-btn-{key}"))
                 .ghost()
                 .small()
-                .label(format!("{caret} {title}"))
+                .label(format!("{caret} {}", title.as_ref()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.controller.toggle_inspector_section(key);
                     cx.notify();
@@ -576,7 +585,7 @@ fn render_standard_section_body(
     }
     body = body.child(render_collapsible_section(
         "anchor",
-        "拡張: 基準点",
+        tr("inspector.section_anchor"),
         false,
         anchor_open,
         anchor_content.into_any_element(),
@@ -659,7 +668,7 @@ fn render_subtitle_text_box(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("字幕本文 (複数行可)"),
+                .child(tr("inspector.subtitle_text")),
         )
         .child(Textarea::new(&bank.subtitle_textarea).h(px(64.0)))
         .child(
@@ -667,7 +676,7 @@ fn render_subtitle_text_box(
                 Button::new("apply-sub-text-btn")
                     .primary()
                     .small()
-                    .label("本文適用")
+                    .label(tr("inspector.subtitle_apply"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let text = this
                             .inspector_widgets
@@ -698,20 +707,27 @@ fn render_subtitle_font_align_row(
 ) -> impl IntoElement {
     let cid_align = clip_id.clone();
     let alignments = [
-        ("左", TextAlignment::Left),
-        ("中央", TextAlignment::Center),
-        ("右", TextAlignment::Right),
+        (tr("inspector.align_left"), TextAlignment::Left),
+        (tr("inspector.align_center"), TextAlignment::Center),
+        (tr("inspector.align_right"), TextAlignment::Right),
     ];
-    h_flex()
+
+    let top_row = h_flex()
         .items_center()
         .gap_1()
+        .w_full()
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("ﾌｫﾝﾄ"),
+                .child(tr("inspector.font")),
         )
-        .child(div().flex_1().child(Input::new(&bank.font_family_input)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(120.0))
+                .child(Select::new(&bank.font_family_select).small()),
+        )
         .children(
             alignments
                 .into_iter()
@@ -736,6 +752,92 @@ fn render_subtitle_font_align_row(
                         cx.notify();
                     }))
                 }),
+        );
+
+    v_flex()
+        .gap_1()
+        .w_full()
+        .child(top_row)
+        .child(render_subtitle_custom_gf_row(clip_id, bank, theme, cx))
+}
+
+fn render_subtitle_custom_gf_row(
+    clip_id: &ClipId,
+    bank: &InspectorWidgetBank,
+    theme: &Theme,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let cid_manual = clip_id.clone();
+    let cid_gf = clip_id.clone();
+    v_flex()
+        .gap_0p5()
+        .w_full()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .w_full()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child(tr("inspector.font_custom_label")),
+                )
+                .child(div().flex_1().child(Input::new(&bank.font_family_input)))
+                .child(
+                    Button::new("sub-font-apply-btn")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("inspector.font_apply"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let val = this
+                                .inspector_widgets
+                                .font_family_input
+                                .read(cx)
+                                .value()
+                                .to_string();
+                            apply_subtitle_font_family_command(this, &cid_manual, &val);
+                            this.font_select_needs_refresh = true;
+                            this.mark_sliders_dirty();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("sub-font-gf-search-btn")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("inspector.font_gf_search"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let q = this
+                                .inspector_widgets
+                                .font_family_input
+                                .read(cx)
+                                .value()
+                                .to_string();
+                            spawn_google_font_search(&q, cx);
+                        })),
+                )
+                .child(
+                    Button::new("sub-font-gf-fetch-btn")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("inspector.font_gf_fetch"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let fam = this
+                                .inspector_widgets
+                                .font_family_input
+                                .read(cx)
+                                .value()
+                                .to_string();
+                            spawn_google_font_install(&fam, Some(cid_gf.clone()), cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.muted_foreground)
+                .child(tr("inspector.font_gf_hint")),
         )
 }
 
@@ -750,12 +852,12 @@ fn render_subtitle_color_outline_row(
         .child(
             ColorPicker::new(&bank.text_color_picker)
                 .small()
-                .label("文字色"),
+                .label(tr("inspector.text_color")),
         )
         .child(
             ColorPicker::new(&bank.outline_color_picker)
                 .small()
-                .label("縁色"),
+                .label(tr("inspector.outline_color")),
         )
         .child(
             h_flex()
@@ -765,7 +867,7 @@ fn render_subtitle_color_outline_row(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("縁幅"),
+                        .child(tr("inspector.outline_width")),
                 )
                 .child(
                     div()

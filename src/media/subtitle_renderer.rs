@@ -1,8 +1,9 @@
 //! `cosmic-text` を用いた純粋 Rust 字幕テキスト・アウトラインラスタライザ。
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cosmic_text::{
@@ -12,6 +13,10 @@ use cosmic_text::{
 use crate::core::color::RgbaColor;
 
 use super::decoder::VideoFrameBuffer;
+use super::google_fonts::{
+    DownloadedGoogleFont, FontCatalogEntry, build_font_catalog, download_google_font_ttf,
+    user_downloaded_fonts_dir,
+};
 use super::visual_properties::{SubtitleProperties, TextAlignment};
 
 const MAX_CACHED_SUBTITLES: usize = 128;
@@ -59,12 +64,44 @@ pub fn render_subtitle_cached(
     }
 }
 
+/// 標準プリセット・OS 導入フォント・キャッシュ済み Google Fonts を統合したフォント候補一覧を返す。
+#[must_use]
+pub fn list_available_font_families() -> Vec<FontCatalogEntry> {
+    match GLOBAL_SUBTITLE_RENDERER.lock() {
+        Ok(renderer) => renderer.available_font_families(),
+        Err(poisoned) => poisoned.into_inner().available_font_families(),
+    }
+}
+
+/// Google Fonts から指定ファミリをユーザー指示により取得し、`fonts/` へ保存して字幕レンダラへ即時登録する。
+///
+/// # Errors
+///
+/// HTTP 取得または保存ディレクトリ書き込みに失敗した場合。
+pub fn install_google_font_for_subtitles(family: &str) -> Result<DownloadedGoogleFont, String> {
+    let dir = user_downloaded_fonts_dir()
+        .ok_or_else(|| "フォント保存ディレクトリを取得できませんでした".to_owned())?;
+    let downloaded = download_google_font_ttf(family, &dir)?;
+    match GLOBAL_SUBTITLE_RENDERER.lock() {
+        Ok(mut renderer) => {
+            renderer.register_custom_font_files(&downloaded.font_bytes);
+        }
+        Err(poisoned) => {
+            poisoned
+                .into_inner()
+                .register_custom_font_files(&downloaded.font_bytes);
+        }
+    }
+    Ok(downloaded)
+}
+
 /// `FontSystem` / `SwashCache` とラスタライズ済みキャッシュを保持する字幕レンダラ。
 pub struct SubtitleRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     cache: HashMap<u64, Arc<VideoFrameBuffer>>,
     order: VecDeque<u64>,
+    cached_families: HashSet<String>,
 }
 
 impl Default for SubtitleRenderer {
@@ -74,15 +111,56 @@ impl Default for SubtitleRenderer {
 }
 
 impl SubtitleRenderer {
-    /// システムフォントを読み込んだ新しい字幕レンダラを生成する。
+    /// システムフォントおよびローカルキャッシュ済みフォントを読み込んだ新しい字幕レンダラを生成する。
     #[must_use]
     pub fn new() -> Self {
+        let mut font_system = FontSystem::new();
+        let cached_families = user_downloaded_fonts_dir()
+            .map(|dir| load_cached_fonts_from_dir(&mut font_system, &dir))
+            .unwrap_or_default();
         Self {
-            font_system: FontSystem::new(),
+            font_system,
             swash_cache: SwashCache::new(),
             cache: HashMap::new(),
             order: VecDeque::new(),
+            cached_families,
         }
+    }
+
+    /// ダウンロード済み等の TTF/OTF バイト列を登録し、既存字幕キャッシュを破棄する。
+    pub fn register_custom_font_files(&mut self, files: &[Vec<u8>]) {
+        let before = self.collect_db_family_names();
+        for bytes in files {
+            self.font_system.db_mut().load_font_data(bytes.clone());
+        }
+        let after = self.collect_db_family_names();
+        for fam in after {
+            if !before.contains(&fam) {
+                self.cached_families.insert(fam);
+            }
+        }
+        self.cache.clear();
+        self.order.clear();
+    }
+
+    /// 字幕コンボボックス向けの利用可能フォント候補一覧を返す。
+    #[must_use]
+    pub fn available_font_families(&self) -> Vec<FontCatalogEntry> {
+        let installed: Vec<String> = self.collect_db_family_names().into_iter().collect();
+        build_font_catalog(&installed, &self.cached_families)
+    }
+
+    fn collect_db_family_names(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for face in self.font_system.db().faces() {
+            for (fam, _) in &face.families {
+                let clean = fam.trim();
+                if !clean.is_empty() {
+                    names.insert(clean.to_owned());
+                }
+            }
+        }
+        names
     }
 
     /// キャッシュを参照しつつ字幕テキストを BGRA8 へラスタライズする。
@@ -408,6 +486,37 @@ fn resolve_font_family(font_family: &str) -> Family<'_> {
     } else {
         Family::Name(trimmed)
     }
+}
+
+fn load_cached_fonts_from_dir(font_system: &mut FontSystem, dir: &Path) -> HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return HashSet::new();
+    };
+    let mut before = HashSet::new();
+    for face in font_system.db().faces() {
+        for (fam, _) in &face.families {
+            before.insert(fam.clone());
+        }
+    }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_font = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
+        if is_font && let Ok(bytes) = std::fs::read(&path) {
+            font_system.db_mut().load_font_data(bytes);
+        }
+    }
+    let mut cached = HashSet::new();
+    for face in font_system.db().faces() {
+        for (fam, _) in &face.families {
+            if !before.contains(fam) {
+                cached.insert(fam.clone());
+            }
+        }
+    }
+    cached
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

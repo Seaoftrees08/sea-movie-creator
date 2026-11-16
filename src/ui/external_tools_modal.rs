@@ -15,6 +15,7 @@ use gpui_kit::{
 use crate::export::external_tools::{
     ExternalToolsConfig, resolve_executable_path, validate_ffmpeg_input,
 };
+use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
 
 /// 外部ツール設定モーダルの編集中状態。
@@ -213,7 +214,7 @@ fn render_external_tools_card(
                 .text_sm()
                 .font_semibold()
                 .text_color(theme.foreground)
-                .child("外部ツール設定 (ffmpeg)"),
+                .child(tr("tools.title")),
         )
         .child(
             div()
@@ -261,7 +262,7 @@ fn render_external_tools_input_row(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("ffmpeg 実行ファイルパス / コマンド"),
+                .child(tr("tools.path_label")),
         )
         .child(
             h_flex()
@@ -277,7 +278,7 @@ fn render_external_tools_input_row(
                     Button::new("ext-ffmpeg-browse-btn")
                         .outline()
                         .small()
-                        .label("参照...")
+                        .label(tr("tools.browse"))
                         .on_click(cx.listener(|_, _, _, cx| {
                             SeaEditorWindow::browse_external_ffmpeg_executable(cx);
                         })),
@@ -286,7 +287,7 @@ fn render_external_tools_input_row(
                     Button::new("ext-ffmpeg-detect-btn")
                         .outline()
                         .small()
-                        .label("自動検出")
+                        .label(tr("tools.autodetect"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.detect_external_ffmpeg_from_path(window, cx);
                         })),
@@ -304,7 +305,7 @@ fn render_external_tools_footer(cx: &mut Context<SeaEditorWindow>) -> AnyElement
             Button::new("ext-ffmpeg-clear-btn")
                 .ghost()
                 .small()
-                .label("設定をクリア（非表示に戻す）")
+                .label(tr("tools.clear"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     if let Some(m) = &mut this.external_tools_modal {
                         m.error = None;
@@ -321,7 +322,7 @@ fn render_external_tools_footer(cx: &mut Context<SeaEditorWindow>) -> AnyElement
                     Button::new("ext-ffmpeg-cancel-btn")
                         .outline()
                         .small()
-                        .label("キャンセル")
+                        .label(tr("common.cancel"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.close_external_tools_modal();
                             window.focus(&this.workspace_focus, cx);
@@ -332,7 +333,7 @@ fn render_external_tools_footer(cx: &mut Context<SeaEditorWindow>) -> AnyElement
                     Button::new("ext-ffmpeg-save-btn")
                         .primary()
                         .small()
-                        .label("保存")
+                        .label(tr("tools.save"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.apply_external_tools_modal(window, cx);
                         })),

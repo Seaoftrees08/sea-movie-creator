@@ -9,7 +9,16 @@ use gpui_kit::{
 };
 
 use crate::ui::app_controller::{PreviewZoomMode, RightPanelTab};
+use crate::ui::i18n::{active_language_code, available_languages, tr};
 use crate::ui::key_config::{KeyConfig, ShortcutAction};
+
+/// `lang/` から読み込んだ任意言語コードへ表示言語を切り替えるアクション。
+#[derive(Clone, PartialEq, Eq, gpui_kit::Action)]
+#[action(namespace = sea_editor, no_json)]
+pub struct SelectLanguageAction {
+    /// 切り替え先の言語コード（例: `"ja"`, `"en"`, `"ko"`）。
+    pub code: String,
+}
 
 actions!(
     sea_editor,
@@ -132,6 +141,8 @@ actions!(
         OpenExportDialog,
         /// 選択範囲のみで書き出しダイアログを開く。
         ExportSelectionDialogAction,
+        /// `lang/*.json` を再読み込みする。
+        ReloadLanguagePacksAction,
     ]
 );
 
@@ -318,16 +329,16 @@ pub fn build_app_menus(state: MenuCheckState) -> Vec<Menu> {
 
 fn build_file_menu() -> Menu {
     Menu {
-        name: "ファイル".into(),
+        name: tr("menu.file").into(),
         items: vec![
-            MenuItem::action("新規プロジェクト", NewProject),
-            MenuItem::action("開く...", OpenProject),
-            MenuItem::action("上書き保存", SaveProject),
-            MenuItem::action("名前を付けて保存...", SaveProjectAs),
+            MenuItem::action(tr("menu.file.new"), NewProject),
+            MenuItem::action(tr("menu.file.open"), OpenProject),
+            MenuItem::action(tr("menu.file.save"), SaveProject),
+            MenuItem::action(tr("menu.file.save_as"), SaveProjectAs),
             MenuItem::separator(),
-            MenuItem::action("素材を追加...", ImportMedia),
+            MenuItem::action(tr("menu.file.import"), ImportMedia),
             MenuItem::separator(),
-            MenuItem::action("終了", QuitApp),
+            MenuItem::action(tr("menu.file.quit"), QuitApp),
         ],
         disabled: false,
     }
@@ -335,19 +346,19 @@ fn build_file_menu() -> Menu {
 
 fn build_edit_menu() -> Menu {
     Menu {
-        name: "編集".into(),
+        name: tr("menu.edit").into(),
         items: vec![
-            MenuItem::action("元に戻す", UndoAction),
-            MenuItem::action("やり直し", RedoAction),
+            MenuItem::action(tr("menu.edit.undo"), UndoAction),
+            MenuItem::action(tr("menu.edit.redo"), RedoAction),
             MenuItem::separator(),
-            MenuItem::action("切り取り", CutClip),
-            MenuItem::action("コピー", CopyClip),
-            MenuItem::action("貼り付け", PasteClip),
-            MenuItem::action("複製", DuplicateClip),
-            MenuItem::action("削除", DeleteClip),
+            MenuItem::action(tr("menu.edit.cut"), CutClip),
+            MenuItem::action(tr("menu.edit.copy"), CopyClip),
+            MenuItem::action(tr("menu.edit.paste"), PasteClip),
+            MenuItem::action(tr("menu.edit.duplicate"), DuplicateClip),
+            MenuItem::action(tr("menu.edit.delete"), DeleteClip),
             MenuItem::separator(),
-            MenuItem::action("すべて選択", SelectAllClips),
-            MenuItem::action("選択範囲を解除", ClearSelectionRange),
+            MenuItem::action(tr("menu.edit.select_all"), SelectAllClips),
+            MenuItem::action(tr("menu.edit.clear_selection"), ClearSelectionRange),
         ],
         disabled: false,
     }
@@ -355,17 +366,17 @@ fn build_edit_menu() -> Menu {
 
 fn build_timeline_menu() -> Menu {
     Menu {
-        name: "タイムライン".into(),
+        name: tr("menu.timeline").into(),
         items: vec![
-            MenuItem::action("再生位置で分割", SplitClip),
-            MenuItem::action("中間点を追加", AddMidpointAction),
-            MenuItem::action("付近の中間点を削除", RemoveMidpointAction),
+            MenuItem::action(tr("menu.timeline.split"), SplitClip),
+            MenuItem::action(tr("menu.timeline.add_midpoint"), AddMidpointAction),
+            MenuItem::action(tr("menu.timeline.remove_midpoint"), RemoveMidpointAction),
             MenuItem::separator(),
-            MenuItem::action("再生位置へ字幕を追加", AddSubtitleAction),
+            MenuItem::action(tr("menu.timeline.add_subtitle"), AddSubtitleAction),
             MenuItem::separator(),
-            MenuItem::action("選択範囲の開始を設定", SetSelectionStartAction),
-            MenuItem::action("選択範囲の終了を設定", SetSelectionEndAction),
-            MenuItem::action("重なったクリップを巡回選択", CycleClipAction),
+            MenuItem::action(tr("menu.timeline.set_sel_start"), SetSelectionStartAction),
+            MenuItem::action(tr("menu.timeline.set_sel_end"), SetSelectionEndAction),
+            MenuItem::action(tr("menu.timeline.cycle_clip"), CycleClipAction),
         ],
         disabled: false,
     }
@@ -373,54 +384,81 @@ fn build_timeline_menu() -> Menu {
 
 fn build_settings_menu(state: MenuCheckState) -> Menu {
     Menu {
-        name: "設定".into(),
+        name: tr("menu.settings").into(),
         items: vec![
-            MenuItem::action("タイムライン長を変更...", SetTimelineLengthAction),
-            MenuItem::action("最終クリップ末尾に自動調整", SnapTimelineLengthAutoAction),
+            MenuItem::action(tr("menu.settings.timeline_length"), SetTimelineLengthAction),
+            MenuItem::action(
+                tr("menu.settings.timeline_snap_auto"),
+                SnapTimelineLengthAutoAction,
+            ),
             MenuItem::separator(),
             MenuItem::action(
-                "シーク・移動時にクリップ設定を追従",
+                tr("menu.settings.follow_seek"),
                 ToggleFollowSelectedOnSeekAction,
             )
             .checked(state.follow_selected_on_seek),
             MenuItem::separator(),
-            MenuItem::action("外部ツール (ffmpeg) 設定...", OpenExternalToolsAction),
-            MenuItem::action("ショートカットキー設定...", OpenKeyConfigAction),
+            MenuItem::submenu(build_language_submenu()),
+            MenuItem::separator(),
+            MenuItem::action(tr("menu.settings.external_tools"), OpenExternalToolsAction),
+            MenuItem::action(tr("menu.settings.key_config"), OpenKeyConfigAction),
         ],
+        disabled: false,
+    }
+}
+
+fn build_language_submenu() -> Menu {
+    let active = active_language_code();
+    let mut items: Vec<MenuItem> = available_languages()
+        .into_iter()
+        .map(|lang| {
+            let label = format!("{} ({})", lang.name, lang.code);
+            let checked = lang.code == active;
+            MenuItem::action(label, SelectLanguageAction { code: lang.code }).checked(checked)
+        })
+        .collect();
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action(
+        tr("menu.settings.language_reload"),
+        ReloadLanguagePacksAction,
+    ));
+    Menu {
+        name: tr("menu.settings.language").into(),
+        items,
         disabled: false,
     }
 }
 
 fn build_view_menu(state: MenuCheckState) -> Menu {
     Menu {
-        name: "表示".into(),
+        name: tr("menu.view").into(),
         items: vec![
-            MenuItem::action("枠・ハンドルを表示", TogglePreviewGuidesAction)
+            MenuItem::action(tr("menu.view.guides"), TogglePreviewGuidesAction)
                 .checked(state.preview_overlays.guides),
-            MenuItem::action("グリッド線を表示", TogglePreviewGridAction)
+            MenuItem::action(tr("menu.view.grid"), TogglePreviewGridAction)
                 .checked(state.preview_overlays.grid),
-            MenuItem::action("マスター音声波形を表示", TogglePreviewWaveformAction)
+            MenuItem::action(tr("menu.view.waveform"), TogglePreviewWaveformAction)
                 .checked(state.preview_overlays.waveform),
             MenuItem::separator(),
-            MenuItem::action("プレビュー倍率: フィット", PreviewZoomFitAction)
+            MenuItem::action(tr("menu.view.zoom_fit"), PreviewZoomFitAction)
                 .checked(state.preview_zoom == PreviewZoomMode::Fit),
-            MenuItem::action("プレビュー倍率: 50%", PreviewZoom50Action)
+            MenuItem::action(tr("menu.view.zoom_50"), PreviewZoom50Action)
                 .checked(state.preview_zoom == PreviewZoomMode::Percent(50)),
-            MenuItem::action("プレビュー倍率: 100%", PreviewZoom100Action)
+            MenuItem::action(tr("menu.view.zoom_100"), PreviewZoom100Action)
                 .checked(state.preview_zoom == PreviewZoomMode::Percent(100)),
-            MenuItem::action("プレビュー倍率: 200%", PreviewZoom200Action)
+            MenuItem::action(tr("menu.view.zoom_200"), PreviewZoom200Action)
                 .checked(state.preview_zoom == PreviewZoomMode::Percent(200)),
             MenuItem::separator(),
-            MenuItem::action("タイムラインを拡大", TimelineZoomIn),
-            MenuItem::action("タイムラインを縮小", TimelineZoomOut),
+            MenuItem::action(tr("menu.view.tl_zoom_in"), TimelineZoomIn),
+            MenuItem::action(tr("menu.view.tl_zoom_out"), TimelineZoomOut),
             MenuItem::separator(),
-            MenuItem::action("右パネル: クリップ設定", ShowTabClipInspectorAction)
+            MenuItem::action(tr("menu.view.tab_inspector"), ShowTabClipInspectorAction)
                 .checked(state.right_tab == RightPanelTab::ClipInspector),
-            MenuItem::action("右パネル: AIチャット", ShowTabAiChatAction)
+            MenuItem::action(tr("menu.view.tab_ai"), ShowTabAiChatAction)
                 .checked(state.right_tab == RightPanelTab::AiChat),
-            MenuItem::action("右パネル: トラック", ShowTabLayerListAction)
+            MenuItem::action(tr("menu.view.tab_layers"), ShowTabLayerListAction)
                 .checked(state.right_tab == RightPanelTab::LayerList),
-            MenuItem::action("右パネル: プロジェクト情報", ShowTabProjectInfoAction)
+            MenuItem::action(tr("menu.view.tab_project"), ShowTabProjectInfoAction)
                 .checked(state.right_tab == RightPanelTab::ProjectInfo),
         ],
         disabled: false,
@@ -429,25 +467,25 @@ fn build_view_menu(state: MenuCheckState) -> Menu {
 
 fn build_playback_menu(state: MenuCheckState) -> Menu {
     Menu {
-        name: "再生".into(),
+        name: tr("menu.playback").into(),
         items: vec![
-            MenuItem::action("再生 / 一時停止", TogglePlayPause),
-            MenuItem::action("停止", StopPlaybackAction),
+            MenuItem::action(tr("menu.playback.toggle"), TogglePlayPause),
+            MenuItem::action(tr("menu.playback.stop"), StopPlaybackAction),
             MenuItem::action(
-                "停止時に再生開始位置へ戻す",
+                tr("menu.playback.return_start"),
                 ToggleReturnToStartOnStopAction,
             )
             .checked(state.return_to_start_on_stop),
             MenuItem::separator(),
-            MenuItem::action("1 フレーム戻る", StepBackOneFrame),
-            MenuItem::action("1 フレーム進む", StepForwardOneFrame),
-            MenuItem::action("0.5 秒戻る", StepBackHalfSecAction),
-            MenuItem::action("0.5 秒進む", StepForwardHalfSecAction),
+            MenuItem::action(tr("menu.playback.step_back"), StepBackOneFrame),
+            MenuItem::action(tr("menu.playback.step_fwd"), StepForwardOneFrame),
+            MenuItem::action(tr("menu.playback.half_back"), StepBackHalfSecAction),
+            MenuItem::action(tr("menu.playback.half_fwd"), StepForwardHalfSecAction),
             MenuItem::separator(),
-            MenuItem::action("前のクリップ境界・中間点", PrevBoundaryAction),
-            MenuItem::action("次のクリップ境界・中間点", NextBoundaryAction),
-            MenuItem::action("先頭フレームへ移動", SeekStart),
-            MenuItem::action("末尾フレームへ移動", SeekEnd),
+            MenuItem::action(tr("menu.playback.prev_boundary"), PrevBoundaryAction),
+            MenuItem::action(tr("menu.playback.next_boundary"), NextBoundaryAction),
+            MenuItem::action(tr("menu.playback.seek_start"), SeekStart),
+            MenuItem::action(tr("menu.playback.seek_end"), SeekEnd),
         ],
         disabled: false,
     }
@@ -455,10 +493,10 @@ fn build_playback_menu(state: MenuCheckState) -> Menu {
 
 fn build_export_menu() -> Menu {
     Menu {
-        name: "書き出し".into(),
+        name: tr("menu.export").into(),
         items: vec![
-            MenuItem::action("動画を書き出し...", OpenExportDialog),
-            MenuItem::action("選択範囲のみを書き出し...", ExportSelectionDialogAction),
+            MenuItem::action(tr("menu.export.open"), OpenExportDialog),
+            MenuItem::action(tr("menu.export.selection"), ExportSelectionDialogAction),
         ],
         disabled: false,
     }

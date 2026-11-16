@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
 
 /// キー設定ファイル名。
@@ -683,7 +684,7 @@ fn render_key_config_header(cx: &mut Context<SeaEditorWindow>) -> AnyElement {
                 .text_size(px(14.0))
                 .font_bold()
                 .text_color(rgba(0xf8fa_fcff))
-                .child("ショートカットキー設定 (AviUtl互換)"),
+                .child(tr("keycfg.title")),
         )
         .child(
             Button::new("key-cfg-reset")
@@ -714,7 +715,7 @@ fn render_key_config_footer(cx: &mut Context<SeaEditorWindow>) -> AnyElement {
             Button::new("key-cfg-cancel")
                 .small()
                 .ghost()
-                .label("キャンセル")
+                .label(tr("common.cancel"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.key_config_modal = None;
                     cx.notify();
@@ -724,7 +725,7 @@ fn render_key_config_footer(cx: &mut Context<SeaEditorWindow>) -> AnyElement {
             Button::new("key-cfg-apply")
                 .small()
                 .primary()
-                .label("保存して適用")
+                .label(tr("keycfg.save"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.apply_and_save_key_config_modal(cx);
                     cx.notify();

@@ -14,7 +14,7 @@ use crate::audio::plugins::descriptor::{AudioWorkerRequest, AudioWorkerResponse,
 use crate::audio::properties::{AudioPluginFormat, AudioPluginParamValue, AudioPluginSlot};
 use crate::core::animation::EvaluationContext;
 use crate::core::ids::ClipId;
-use crate::export::registry::resolve_plugin_executable;
+use crate::export::registry::{platform_exe_candidates, resolve_plugin_executable};
 
 const DEFAULT_MAX_BLOCK_FRAMES: u32 = 4096;
 const STEREO_CHANNELS: u16 = 2;
@@ -379,6 +379,16 @@ fn evaluate_plugin_param(value: &AudioPluginParamValue, ctx: EvaluationContext) 
 }
 
 fn resolve_audio_host_binary(override_path: Option<&Path>) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    resolve_audio_host_binary_in(override_path, exe.as_deref(), cwd.as_deref())
+}
+
+fn resolve_audio_host_binary_in(
+    override_path: Option<&Path>,
+    exe_path: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         if p.is_file() {
             return Ok(p.to_path_buf());
@@ -388,12 +398,35 @@ fn resolve_audio_host_binary(override_path: Option<&Path>) -> Result<PathBuf, St
             p.display()
         ));
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    resolve_plugin_executable(&cwd.join("plugins").join("audio"), "sea-audio-host").ok_or_else(
-        || {
-            "sea-audio-host executable not found; run `cargo build --workspace` before executing audio plugin tests".to_owned()
-        },
-    )
+
+    let names = platform_exe_candidates("sea-audio-host");
+    let mut audio_plugin_dirs = Vec::new();
+    if let Some(exe_dir) = exe_path.and_then(Path::parent) {
+        for ancestor in exe_dir.ancestors().take(6) {
+            audio_plugin_dirs.push(ancestor.join("plugins").join("audio"));
+        }
+    }
+    if let Some(cwd_dir) = cwd {
+        audio_plugin_dirs.push(cwd_dir.join("plugins").join("audio"));
+    }
+
+    for dir in &audio_plugin_dirs {
+        for name in &names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    let primary_dir = audio_plugin_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("plugins").join("audio"));
+    resolve_plugin_executable(&primary_dir, "sea-audio-host").ok_or_else(|| {
+        "sea-audio-host executable not found in plugins/audio/ or build target; run `cargo build --workspace`"
+            .to_owned()
+    })
 }
 
 fn exchange_ipc(
@@ -408,5 +441,37 @@ fn exchange_ipc(
             Err("audio plugin worker closed IPC pipe unexpectedly (EOF)".to_owned())
         }
         Err(e) => Err(format!("failed to read IPC response from worker: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_audio_host_inside_exe_plugins_audio_before_cwd()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("sea-audio-host-res-{}", std::process::id()));
+        let exe_dir = root.join("dist");
+        let audio_dir = exe_dir.join("plugins").join("audio");
+        let other_cwd = root.join("other_cwd");
+        std::fs::create_dir_all(&audio_dir)?;
+        std::fs::create_dir_all(other_cwd.join("plugins").join("audio"))?;
+
+        let exe_name = platform_exe_candidates("sea-audio-host")
+            .into_iter()
+            .next_back()
+            .ok_or("missing exe candidate")?;
+        let dist_host = audio_dir.join(&exe_name);
+        let cwd_host = other_cwd.join("plugins").join("audio").join(&exe_name);
+        std::fs::write(&dist_host, b"dist-host")?;
+        std::fs::write(&cwd_host, b"cwd-host")?;
+
+        let app_exe = exe_dir.join("sea-movie-creator.exe");
+        let resolved = resolve_audio_host_binary_in(None, Some(&app_exe), Some(&other_cwd))?;
+        assert_eq!(resolved, dist_host);
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

@@ -6,19 +6,25 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Rgba, Styled as _, Subscription,
-    Window, div, px, relative, rgba,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Rgba, SharedString, Styled as _,
+    Subscription, Window, div, px, relative, rgba,
 };
 
 use crate::core::animation::EasingCurve;
 use crate::core::color::RgbaColor;
 use crate::core::ids::{ClipId, ClipRef};
+use crate::media::google_fonts::{FontSourceKind, fetch_google_fonts_catalog};
+use crate::media::subtitle_renderer::{
+    install_google_font_for_subtitles, list_available_font_families,
+};
 use crate::timeline::command::{EditCommand, ParameterPath, ParameterTarget, ParameterValue};
 use crate::timeline::document::{Clip, ClipKind};
 use crate::ui::app_controller::{AppController, MIN_RIGHT_PANEL_WIDTH};
+use crate::ui::i18n::tr;
 use crate::ui::inspector::segment_ops::{
     InspectorMode, InspectorParameterSlot, MovementModeEdit, MovementModePreset,
     SegmentEndpointEdit, TrackBarDragStart, build_apply_bezier_curve_command,
@@ -30,6 +36,82 @@ use crate::ui::window::SeaEditorWindow;
 
 const WIDE_ROW_BREAKPOINT_PX: f32 = 380.0;
 
+/// 字幕フォントコンボボックスに表示するフォント候補アイテム。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontSelectItem {
+    /// コンボボックス一覧に表示するラベル（標準 / OS導入済 / GF取得可）。
+    pub title: SharedString,
+    /// `SubtitleProperties::font_family` へ保存される実フォントファミリ名。
+    pub family: String,
+    /// ローカル環境に導入済みでオフライン即時描画できるか。
+    pub is_local: bool,
+}
+
+impl SelectItem for FontSelectItem {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.family
+    }
+}
+
+/// 標準プリセット・OS導入フォント・Google Fonts 検索結果を統合したコンボボックス候補を生成する。
+#[must_use]
+pub fn build_font_select_items(
+    extra_families: &[String],
+    current_font: Option<&str>,
+) -> SearchableVec<FontSelectItem> {
+    let catalog = list_available_font_families();
+    let mut items = Vec::with_capacity(catalog.len() + extra_families.len() + 1);
+    let mut seen = std::collections::HashSet::new();
+
+    for entry in catalog {
+        seen.insert(entry.family.to_ascii_lowercase());
+        let suffix = match entry.source {
+            FontSourceKind::Standard => "  [標準]",
+            FontSourceKind::Installed => "",
+            FontSourceKind::GoogleCached => "  [GF導入済]",
+            FontSourceKind::GoogleAvailable => "  [GF取得可]",
+        };
+        items.push(FontSelectItem {
+            title: SharedString::from(format!("{}{suffix}", entry.family)),
+            family: entry.family,
+            is_local: entry.is_local,
+        });
+    }
+
+    for extra in extra_families {
+        let trimmed = extra.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_ascii_lowercase()) {
+            continue;
+        }
+        items.push(FontSelectItem {
+            title: SharedString::from(format!("{trimmed}  [GF検索]")),
+            family: trimmed.to_owned(),
+            is_local: false,
+        });
+    }
+
+    if let Some(cur) = current_font.map(str::trim).filter(|s| !s.is_empty())
+        && seen.insert(cur.to_ascii_lowercase())
+    {
+        items.insert(
+            0,
+            FontSelectItem {
+                title: SharedString::from(format!("{cur}  [カスタム]")),
+                family: cur.to_owned(),
+                is_local: false,
+            },
+        );
+    }
+
+    SearchableVec::new(items)
+}
+
 /// インスペクタ全体で共有する入力・カラーピッカーエンティティ群。
 #[derive(Clone)]
 pub struct InspectorWidgetBank {
@@ -39,7 +121,9 @@ pub struct InspectorWidgetBank {
     pub bezier_inputs: [Entity<InputState>; 4],
     /// 字幕複数行本文 `Textarea`。
     pub subtitle_textarea: Entity<TextareaState>,
-    /// 字幕フォントファミリ入力欄。
+    /// 字幕フォントファミリ検索可能コンボボックス状態。
+    pub font_family_select: Entity<SelectState<SearchableVec<FontSelectItem>>>,
+    /// 字幕フォントファミリ任意入力・Google Fonts 検索欄。
     pub font_family_input: Entity<InputState>,
     /// 字幕縁取り幅入力欄。
     pub outline_width_input: Entity<InputState>,
@@ -71,8 +155,26 @@ impl InspectorWidgetBank {
         let subtitle_textarea = cx.new(|cx| TextareaState::new(window, cx).rows(3).auto_grow(2, 6));
         subscriptions.push(subscribe_subtitle_textarea(&subtitle_textarea, window, cx));
 
-        let font_family_input =
-            cx.new(|cx| InputState::new(window, cx).default_value("sans-serif"));
+        let font_family_select = cx.new(|cx| {
+            SelectState::new(
+                build_font_select_items(&[], Some("sans-serif")),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        subscriptions.push(subscribe_font_family_select(
+            &font_family_select,
+            window,
+            cx,
+        ));
+
+        let font_family_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("sans-serif")
+                .placeholder(tr("inspector.font_custom_placeholder"))
+        });
         subscriptions.push(subscribe_font_family_input(&font_family_input, window, cx));
 
         let outline_width_input = cx.new(|cx| InputState::new(window, cx).default_value("2.0"));
@@ -131,6 +233,7 @@ impl InspectorWidgetBank {
             track_inputs,
             bezier_inputs,
             subtitle_textarea,
+            font_family_select,
             font_family_input,
             outline_width_input,
             text_color_picker,
@@ -185,6 +288,8 @@ impl InspectorWidgetBank {
     pub fn sync_from_controller(
         &self,
         controller: &mut AppController,
+        extra_fonts: &[String],
+        fonts_dirty: bool,
         window: &mut Window,
         cx: &mut Context<SeaEditorWindow>,
     ) {
@@ -205,7 +310,13 @@ impl InspectorWidgetBank {
 
         self.sync_track_values(controller, &clip_owned, force_context_changed, window, cx);
         self.sync_bezier_and_expr(controller, force_context_changed || synced, window, cx);
-        self.sync_subtitle_widgets(&clip_owned, force_context_changed || synced, window, cx);
+        self.sync_subtitle_widgets(
+            &clip_owned,
+            (force_context_changed || synced, fonts_dirty),
+            extra_fonts,
+            window,
+            cx,
+        );
     }
 
     fn sync_track_values(
@@ -298,7 +409,8 @@ impl InspectorWidgetBank {
     fn sync_subtitle_widgets(
         &self,
         clip: &Clip,
-        force_overwrite: bool,
+        (force_overwrite, fonts_dirty): (bool, bool),
+        extra_fonts: &[String],
         window: &mut Window,
         cx: &mut Context<SeaEditorWindow>,
     ) {
@@ -316,6 +428,15 @@ impl InspectorWidgetBank {
             let text = sub.text.clone();
             self.subtitle_textarea
                 .update(cx, |ta, cx| ta.set_value(&text, window, cx));
+        }
+        let current_selected = self.font_family_select.read(cx).selected_value().cloned();
+        if fonts_dirty || current_selected.as_deref() != Some(sub.font_family.as_str()) {
+            let items = build_font_select_items(extra_fonts, Some(&sub.font_family));
+            let target_family = sub.font_family.clone();
+            self.font_family_select.update(cx, |sel, cx| {
+                sel.set_items(items, window, cx);
+                sel.set_selected_value(&target_family, window, cx);
+            });
         }
         if (force_overwrite
             || !self
@@ -1198,6 +1319,149 @@ fn subscribe_subtitle_textarea(
     })
 }
 
+fn subscribe_font_family_select(
+    entity: &Entity<SelectState<SearchableVec<FontSelectItem>>>,
+    window: &Window,
+    cx: &mut Context<SeaEditorWindow>,
+) -> Subscription {
+    cx.subscribe_in(
+        entity,
+        window,
+        |this, _, ev: &SelectEvent<SearchableVec<FontSelectItem>>, _, cx| {
+            if this.syncing_widgets {
+                return;
+            }
+            let SelectEvent::Confirm(Some(family)) = ev else {
+                return;
+            };
+            let is_local = list_available_font_families()
+                .iter()
+                .any(|e| e.family.eq_ignore_ascii_case(family) && e.is_local);
+            let target_clip_id = this
+                .controller
+                .selected_clip()
+                .and_then(|(_, c)| matches!(c.kind, ClipKind::Subtitle(_)).then(|| c.id.clone()));
+            if let Some(cid) = target_clip_id.as_ref() {
+                apply_subtitle_font_family_command(this, cid, family);
+            }
+            if is_local {
+                this.mark_sliders_dirty();
+            } else {
+                spawn_google_font_install(family, target_clip_id, cx);
+            }
+            cx.notify();
+        },
+    )
+}
+
+/// 字幕クリップへフォントファミリ名変更コマンドを適用する。
+pub(crate) fn apply_subtitle_font_family_command(
+    this: &mut SeaEditorWindow,
+    clip_id: &ClipId,
+    family: &str,
+) {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some((_, clip)) = this.controller.document.find_clip(clip_id)
+        && let ClipKind::Subtitle(sub) = &clip.kind
+        && sub.font_family != trimmed
+    {
+        let cmd = EditCommand::SetParameter {
+            target: ParameterTarget::Clip {
+                clip_id: ClipRef::Id(clip_id.clone()),
+            },
+            path: ParameterPath::SubtitleFontFamily,
+            value: ParameterValue::Text {
+                value: trimmed.to_owned(),
+            },
+        };
+        let _ = this.controller.dispatch_command(&cmd);
+        this.controller.inspector.invalidate_sync();
+    }
+}
+
+/// ユーザーの明示指示に基づき Google Fonts から TTF/OTF を非同期取得し字幕レンダラへ登録する。
+pub(crate) fn spawn_google_font_install(
+    family: &str,
+    clip_id: Option<ClipId>,
+    cx: &mut Context<SeaEditorWindow>,
+) {
+    let trimmed = family.trim().to_owned();
+    if trimmed.is_empty() {
+        return;
+    }
+    cx.entity().update(cx, |this, cx| {
+        this.controller.status_message = format!("Google Fonts から '{trimmed}' を取得中...");
+        cx.notify();
+    });
+    cx.spawn(async move |this, cx| {
+        let fam_bg = trimmed.clone();
+        let res = cx
+            .background_executor()
+            .spawn(async move { install_google_font_for_subtitles(&fam_bg) })
+            .await;
+        let _ = this.update(cx, |view, cx| {
+            match res {
+                Ok(downloaded) => {
+                    if let Some(cid) = clip_id {
+                        apply_subtitle_font_family_command(view, &cid, &downloaded.family);
+                    }
+                    view.controller.invalidate_and_refresh_preview();
+                    view.font_select_needs_refresh = true;
+                    view.mark_sliders_dirty();
+                    view.controller.status_message = format!(
+                        "Google Font '{}' を導入・適用しました ({} files)",
+                        downloaded.family,
+                        downloaded.saved_paths.len()
+                    );
+                }
+                Err(err) => {
+                    view.controller.status_message =
+                        format!("Google Font 取得失敗 ({trimmed}): {err}");
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// ユーザーの検索操作に応じて Google Fonts メタデータを非同期検索しコンボボックス候補を更新する。
+pub(crate) fn spawn_google_font_search(query: &str, cx: &mut Context<SeaEditorWindow>) {
+    let trimmed = query.trim().to_owned();
+    cx.entity().update(cx, |this, cx| {
+        this.controller.status_message = format!("Google Fonts を検索中: '{trimmed}'...");
+        cx.notify();
+    });
+    cx.spawn(async move |this, cx| {
+        let q_bg = trimmed.clone();
+        let res = cx
+            .background_executor()
+            .spawn(async move { fetch_google_fonts_catalog(&q_bg, 25) })
+            .await;
+        let _ = this.update(cx, |view, cx| {
+            match res {
+                Ok(families) => {
+                    let count = families.len();
+                    view.extra_google_font_results = families;
+                    view.font_select_needs_refresh = true;
+                    view.mark_sliders_dirty();
+                    view.controller.status_message =
+                        format!("Google Fonts 検索結果: {count} 件をフォント一覧に追加しました");
+                }
+                Err(err) => {
+                    view.controller.status_message =
+                        format!("Google Fonts 検索失敗 (オフラインまたは接続不可): {err}");
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 fn subscribe_font_family_input(
     entity: &Entity<InputState>,
     window: &Window,
@@ -1212,18 +1476,12 @@ fn subscribe_font_family_input(
             return;
         }
         if let Some((_, clip)) = this.controller.selected_clip()
-            && let ClipKind::Subtitle(sub) = &clip.kind
-            && sub.font_family != raw
+            && let ClipKind::Subtitle(_) = &clip.kind
         {
-            let cmd = EditCommand::SetParameter {
-                target: ParameterTarget::Clip {
-                    clip_id: ClipRef::Id(clip.id.clone()),
-                },
-                path: ParameterPath::SubtitleFontFamily,
-                value: ParameterValue::Text { value: raw },
-            };
-            let _ = this.controller.dispatch_command(&cmd);
-            this.controller.inspector.invalidate_sync();
+            let cid = clip.id.clone();
+            apply_subtitle_font_family_command(this, &cid, &raw);
+            this.font_select_needs_refresh = true;
+            this.mark_sliders_dirty();
             cx.notify();
         }
     })

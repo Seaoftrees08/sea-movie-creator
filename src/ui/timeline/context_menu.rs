@@ -9,6 +9,7 @@ use crate::timeline::document::{Clip, ProjectDocument, TimelineLengthMode};
 use crate::ui::app_controller::{
     AppController, RightPanelTab, TimeDisplayUnit, TimelineContextClick,
 };
+use crate::ui::i18n::{tr, tr_fmt};
 use crate::ui::timeline::state::frame_at_timeline_window_x;
 use crate::ui::window::SeaEditorWindow;
 
@@ -332,7 +333,8 @@ fn build_lane_popup_menu(
     let lid_file = layer_id.clone();
     let lid_paste = layer_id.clone();
     let frame = avail.clicked_frame;
-    let frame_num = frame.get();
+    let frame_num = frame.get().to_string();
+    let sub_frame_num = frame_num.clone();
     let locked = avail.flags.layer_locked;
 
     let win_sub = win.clone();
@@ -340,52 +342,46 @@ fn build_lane_popup_menu(
     let win_paste = win.clone();
 
     let with_add = menu
-        .submenu(
-            "オブジェクトの追加",
-            window,
-            cx,
-            move |sub, _, _| {
-                let txt_layer = lid_sub.clone();
-                let med_layer = lid_file.clone();
-                let txt_win = win_sub.clone();
-                let med_win = win_file.clone();
-                sub.item(
-                    PopupMenuItem::new(format!("テキスト・字幕 ({frame_num}f)"))
-                        .disabled(locked)
-                        .on_click(move |_, window, cx| {
-                            txt_win.update(cx, |this, cx| {
-                                if let Err(err) = this
-                                    .controller
-                                    .insert_default_subtitle_at(Some(&txt_layer), frame)
-                                {
-                                    this.controller.status_message = err;
-                                }
-                                finish_mutation(this, window, cx);
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("動画・画像・音声ファイル...")
-                        .disabled(locked)
-                        .on_click(move |_, _, cx| {
-                            med_win.update(cx, |_, cx| {
-                                SeaEditorWindow::prompt_import_media_at(
-                                    Some(med_layer.clone()),
-                                    Some(frame),
-                                    cx,
-                                );
-                            });
-                        }),
-                )
-                .separator()
-                .item(PopupMenuItem::new("図形オブジェクト（準備中）").disabled(true))
-                .item(PopupMenuItem::new("シーンオブジェクト（準備中）").disabled(true))
-                .item(PopupMenuItem::new("カメラ制御（準備中）").disabled(true))
-            },
-        )
+        .submenu(tr("ctx.add_object"), window, cx, move |sub, _, _| {
+            let txt_layer = lid_sub.clone();
+            let med_layer = lid_file.clone();
+            let txt_win = win_sub.clone();
+            let med_win = win_file.clone();
+            sub.item(
+                PopupMenuItem::new(tr_fmt("ctx.add_subtitle", &[("frame", &sub_frame_num)]))
+                    .disabled(locked)
+                    .on_click(move |_, window, cx| {
+                        txt_win.update(cx, |this, cx| {
+                            if let Err(err) = this
+                                .controller
+                                .insert_default_subtitle_at(Some(&txt_layer), frame)
+                            {
+                                this.controller.status_message = err;
+                            }
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(tr("menu.file.import"))
+                    .disabled(locked)
+                    .on_click(move |_, _, cx| {
+                        med_win.update(cx, |_, cx| {
+                            SeaEditorWindow::prompt_import_media_at(
+                                Some(med_layer.clone()),
+                                Some(frame),
+                                cx,
+                            );
+                        });
+                    }),
+            )
+            .separator()
+            .item(PopupMenuItem::new(tr("ctx.add_scene_wip")).disabled(true))
+            .item(PopupMenuItem::new(tr("ctx.add_camera_wip")).disabled(true))
+        })
         .separator()
         .item(
-            PopupMenuItem::new(format!("ここに貼り付け ({frame_num}f)"))
+            PopupMenuItem::new(tr_fmt("ctx.paste_here", &[("frame", &frame_num)]))
                 .disabled(!avail.flags.has_clipboard || locked)
                 .on_click(move |_, window, cx| {
                     win_paste.update(cx, |this, cx| {
@@ -408,7 +404,7 @@ fn append_range_and_toggle_items(
     win: &Entity<SeaEditorWindow>,
 ) -> PopupMenu {
     let frame = avail.clicked_frame;
-    let frame_num = frame.get();
+    let frame_num = frame.get().to_string();
     let win_start = win.clone();
     let win_end = win.clone();
     let win_clear = win.clone();
@@ -420,7 +416,7 @@ fn append_range_and_toggle_items(
 
     menu.separator()
         .item(
-            PopupMenuItem::new(format!("このフレームを選択開始点 [ に設定 ({frame_num}f)"))
+            PopupMenuItem::new(tr_fmt("ctx.set_sel_start_here", &[("frame", &frame_num)]))
                 .on_click(move |_, window, cx| {
                     win_start.update(cx, |this, cx| {
                         let _ = this.controller.set_selection_range_start_at(frame);
@@ -429,16 +425,17 @@ fn append_range_and_toggle_items(
                 }),
         )
         .item(
-            PopupMenuItem::new(format!("このフレームを選択終了点 ] に設定 ({frame_num}f)"))
-                .on_click(move |_, window, cx| {
+            PopupMenuItem::new(tr_fmt("ctx.set_sel_end_here", &[("frame", &frame_num)])).on_click(
+                move |_, window, cx| {
                     win_end.update(cx, |this, cx| {
                         let _ = this.controller.set_selection_range_end_at(frame);
                         finish_mutation(this, window, cx);
                     });
-                }),
+                },
+            ),
         )
         .item(
-            PopupMenuItem::new("選択範囲をクリア")
+            PopupMenuItem::new(tr("ctx.clear_sel_range"))
                 .disabled(!avail.flags.has_selection_range)
                 .on_click(move |_, window, cx| {
                     win_clear.update(cx, |this, cx| {
@@ -449,7 +446,7 @@ fn append_range_and_toggle_items(
         )
         .separator()
         .item(
-            PopupMenuItem::new("最後のオブジェクト位置を終了点にする").on_click(
+            PopupMenuItem::new(tr("menu.settings.timeline_snap_auto")).on_click(
                 move |_, window, cx| {
                     win_auto.update(cx, |this, cx| {
                         let _ = this
@@ -461,7 +458,7 @@ fn append_range_and_toggle_items(
             ),
         )
         .item(
-            PopupMenuItem::new("タイムライン長を設定...").on_click(move |_, window, cx| {
+            PopupMenuItem::new(tr("ctx.set_timeline_length")).on_click(move |_, window, cx| {
                 win_len.update(cx, |this, cx| {
                     this.open_timeline_length_modal(window, cx);
                 });
@@ -469,7 +466,7 @@ fn append_range_and_toggle_items(
         )
         .separator()
         .item(
-            PopupMenuItem::new("スナップを有効")
+            PopupMenuItem::new(tr("ctx.snap_enable"))
                 .checked(avail.toggles.snap_enabled)
                 .on_click(move |_, window, cx| {
                     win_snap.update(cx, |this, cx| {
@@ -479,7 +476,7 @@ fn append_range_and_toggle_items(
                 }),
         )
         .item(
-            PopupMenuItem::new("シークで選択を追従")
+            PopupMenuItem::new(tr("ctx.follow_seek"))
                 .checked(avail.toggles.follow_selected_on_seek)
                 .on_click(move |_, window, cx| {
                     win_follow.update(cx, |this, cx| {
@@ -489,7 +486,7 @@ fn append_range_and_toggle_items(
                 }),
         )
         .item(
-            PopupMenuItem::new("フレーム番号表示")
+            PopupMenuItem::new(tr("ctx.frame_unit"))
                 .checked(avail.toggles.show_frames)
                 .on_click(move |_, window, cx| {
                     win_unit.update(cx, |this, cx| {

@@ -3,19 +3,22 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::StyledExt as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{
-    ActiveTheme as _, Theme, ThemeMode, TitleBar, VirtualListScrollHandle, h_flex, v_flex,
+    ActiveTheme as _, Sizable as _, Theme, ThemeMode, TitleBar, VirtualListScrollHandle, h_flex,
+    v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable as _,
     InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton,
     MouseMoveEvent, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    Subscription, Window, WindowBounds, WindowOptions, div, px, size,
+    Subscription, Window, WindowBounds, WindowOptions, div, px, rgba, size,
 };
 
 use crate::core::ids::{AssetId, LayerId};
@@ -31,6 +34,7 @@ use crate::ui::export_dialog::render_export_dialog_overlay;
 use crate::ui::external_tools_modal::{
     ExternalToolsModalState, render_external_tools_modal_overlay,
 };
+use crate::ui::i18n::{reload_languages, set_active_language, tr};
 use crate::ui::inspector_panel::InspectorWidgetBank;
 use crate::ui::key_config::{
     KeyConfig, KeyConfigModalState, keystroke_from_gpui_event, render_key_config_modal_overlay,
@@ -41,16 +45,16 @@ use crate::ui::menu_bar::{
     NewProject, NextBoundaryAction, NudgeDownAction, NudgeLeftAction, NudgeRightAction,
     NudgeUpAction, OpenExportDialog, OpenExternalToolsAction, OpenKeyConfigAction, OpenProject,
     PasteClip, PrevBoundaryAction, PreviewOverlayChecks, PreviewZoom50Action, PreviewZoom100Action,
-    PreviewZoom200Action, PreviewZoomFitAction, QuitApp, RedoAction, RemoveMidpointAction,
-    RotateLeftAction, RotateRightAction, SaveProject, SaveProjectAs, SeekEnd, SeekStart,
-    SelectAllClips, SetSelectionEndAction, SetSelectionStartAction, SetTimelineLengthAction,
-    ShowTabAiChatAction, ShowTabClipInspectorAction, ShowTabLayerListAction,
-    ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction,
-    StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction,
-    TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause,
-    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction,
-    ToggleReturnToStartOnStopAction, UndoAction, apply_key_config_bindings, setup_menus,
-    update_app_menus,
+    PreviewZoom200Action, PreviewZoomFitAction, QuitApp, RedoAction, ReloadLanguagePacksAction,
+    RemoveMidpointAction, RotateLeftAction, RotateRightAction, SaveProject, SaveProjectAs, SeekEnd,
+    SeekStart, SelectAllClips, SelectLanguageAction, SetSelectionEndAction,
+    SetSelectionStartAction, SetTimelineLengthAction, ShowTabAiChatAction,
+    ShowTabClipInspectorAction, ShowTabLayerListAction, ShowTabProjectInfoAction,
+    SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction, StepBackOneFrame,
+    StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction, TimelineZoomIn,
+    TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause, TogglePreviewGridAction,
+    TogglePreviewGuidesAction, TogglePreviewWaveformAction, ToggleReturnToStartOnStopAction,
+    UndoAction, apply_key_config_bindings, setup_menus, update_app_menus,
 };
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
@@ -85,6 +89,18 @@ pub(crate) enum PreviewPointerInputMode {
     WaveformScrubbing,
 }
 
+/// ウィンドウ終了時の未保存変更確認フロー状態。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ClosePromptState {
+    /// 通常の編集中。
+    #[default]
+    Idle,
+    /// 未保存変更確認モーダルを表示中。
+    ConfirmModal,
+    /// 「保存して終了」または「保存せず終了」確定済みで即時終了可能。
+    ConfirmedExit,
+}
+
 /// `sea-movie-creator` のメインエディタウィンドウビュー。
 pub struct SeaEditorWindow {
     /// アプリ状態・タイムライン・再生エンジン統括コントローラ。
@@ -108,10 +124,18 @@ pub struct SeaEditorWindow {
     pub(crate) external_tools_modal: Option<ExternalToolsModalState>,
     /// ショートカット設定モーダルの状態（`None` なら閉）。
     pub(crate) key_config_modal: Option<KeyConfigModalState>,
+    /// ウィンドウ終了時の未保存確認モーダル／終了確定状態。
+    pub(crate) close_prompt: ClosePromptState,
+    /// Google Fonts 検索結果の追加候補一覧。
+    pub(crate) extra_google_font_results: Vec<String>,
+    /// 字幕フォントコンボボックス一覧の再構築が必要か。
+    pub(crate) font_select_needs_refresh: bool,
     /// 非テキスト編集領域（プレビュー・タイムライン等）用の既定フォーカスハンドル。
     pub(crate) workspace_focus: FocusHandle,
     /// プレビュー領域ポインタ・パン修飾入力モード。
     pub(crate) preview_pointer_mode: PreviewPointerInputMode,
+    /// 直近のポインタウィンドウ座標 (px)。
+    pub(crate) last_mouse_window: (f32, f32),
     #[allow(dead_code)]
     pub(crate) dynamic_input_sub: Option<Subscription>,
     pub(crate) modal_focus_subs: Vec<Subscription>,
@@ -197,8 +221,12 @@ impl SeaEditorWindow {
             timeline_length_modal: None,
             external_tools_modal: None,
             key_config_modal: None,
+            close_prompt: ClosePromptState::Idle,
+            extra_google_font_results: Vec::new(),
+            font_select_needs_refresh: false,
             workspace_focus,
             preview_pointer_mode: PreviewPointerInputMode::Idle,
+            last_mouse_window: (0.0, 0.0),
             dynamic_input_sub: None,
             modal_focus_subs: Vec::new(),
             sliders_dirty: true,
@@ -350,9 +378,76 @@ impl SeaEditorWindow {
             }
         });
 
-        self.inspector_widgets
-            .sync_from_controller(&mut self.controller, window, cx);
+        let extra_fonts = self.extra_google_font_results.clone();
+        let fonts_dirty = std::mem::take(&mut self.font_select_needs_refresh);
+        self.inspector_widgets.sync_from_controller(
+            &mut self.controller,
+            &extra_fonts,
+            fonts_dirty,
+            window,
+            cx,
+        );
         self.syncing_widgets = false;
+    }
+
+    /// ウィンドウ終了リクエスト（`×` ボタン / `Alt+F4` 等）をインターセプトし、未保存変更があれば警告を表示する。
+    pub(crate) fn handle_window_should_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.close_prompt == ClosePromptState::ConfirmedExit
+            || !self.controller.has_unsaved_changes()
+        {
+            return true;
+        }
+        self.close_prompt = ClosePromptState::ConfirmModal;
+        window.activate_window();
+        cx.notify();
+        false
+    }
+
+    fn save_project_and_quit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(existing) = self.controller.project_path.clone() {
+            match self.controller.save_project_file(&existing) {
+                Ok(()) => {
+                    self.close_prompt = ClosePromptState::ConfirmedExit;
+                    cx.quit();
+                }
+                Err(err) => {
+                    self.close_prompt = ClosePromptState::Idle;
+                    self.controller.status_message = format!("保存失敗: {err}");
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        self.close_prompt = ClosePromptState::Idle;
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&dir, Some("project.smc.json"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let mut should_quit = false;
+                let _ = this.update(cx, |view, cx| {
+                    match view.controller.save_project_file(&path) {
+                        Ok(()) => {
+                            view.close_prompt = ClosePromptState::ConfirmedExit;
+                            should_quit = true;
+                        }
+                        Err(err) => {
+                            view.controller.status_message = format!("保存失敗: {err}");
+                            cx.notify();
+                        }
+                    }
+                });
+                if should_quit {
+                    cx.update(|app| app.quit());
+                }
+            } else {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
     }
 
     fn spawn_playback_loop(cx: &mut Context<Self>) {
@@ -608,6 +703,7 @@ impl SeaEditorWindow {
     #[must_use]
     fn allow_editor_shortcut(&self, window: &Window, cx: &App) -> bool {
         !self.is_any_text_input_focused(window, cx)
+            && self.close_prompt != ClosePromptState::ConfirmModal
             && self.key_config_modal.is_none()
             && self.external_tools_modal.is_none()
             && !self.controller.export_dialog.is_open
@@ -649,7 +745,9 @@ impl SeaEditorWindow {
 
     /// `Escape` キーの優先順位スタックに従ってドラッグ中断・モーダル閉鎖・フォーカス解除・選択解除を行う。
     pub(crate) fn handle_escape_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.controller.preview_drag.is_some() {
+        if self.close_prompt == ClosePromptState::ConfirmModal {
+            self.close_prompt = ClosePromptState::Idle;
+        } else if self.controller.preview_drag.is_some() {
             self.controller.cancel_preview_drag();
         } else if self.controller.trackbar_drag.is_some() {
             self.controller.cancel_trackbar_drag();
@@ -799,7 +897,11 @@ impl SeaEditorWindow {
             .on_action(cx.listener(Self::on_import_media))
             .on_action(cx.listener(Self::on_save_project))
             .on_action(cx.listener(Self::on_save_project_as))
-            .on_action(|_: &QuitApp, _, cx| cx.quit())
+            .on_action(cx.listener(|this, _: &QuitApp, window, cx| {
+                if this.handle_window_should_close(window, cx) {
+                    cx.quit();
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenExportDialog, _, cx| {
                 this.controller.export_selection_only = false;
                 this.controller.open_export_dialog();
@@ -975,74 +1077,80 @@ impl SeaEditorWindow {
     }
 
     fn bind_view_and_settings_actions(root: Div, cx: &mut Context<Self>) -> Div {
+        let with_view = root
+            .on_action(
+                cx.listener(|this, _: &ToggleFollowSelectedOnSeekAction, _, cx| {
+                    this.controller.toggle_follow_selected_on_seek();
+                    this.reload_app_menus(cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleReturnToStartOnStopAction, _, cx| {
+                    this.controller.toggle_return_playhead_to_start_on_stop();
+                    this.reload_app_menus(cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(|this, _: &OpenKeyConfigAction, _, cx| {
+                this.key_config_modal =
+                    Some(KeyConfigModalState::open(&this.controller.key_config));
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &OpenExternalToolsAction, window, cx| {
+                    this.open_external_tools_modal(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &TogglePreviewGuidesAction, _, cx| {
+                this.controller.show_preview_guides = !this.controller.show_preview_guides;
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TogglePreviewGridAction, _, cx| {
+                this.controller.show_preview_grid = !this.controller.show_preview_grid;
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TogglePreviewWaveformAction, _, cx| {
+                this.controller.show_preview_waveform = !this.controller.show_preview_waveform;
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PreviewZoomFitAction, _, cx| {
+                this.controller.preview_zoom = PreviewZoomMode::Fit;
+                this.controller.preview_pan_offset_px = (0.0, 0.0);
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PreviewZoom50Action, _, cx| {
+                this.controller.preview_zoom = PreviewZoomMode::Percent(50);
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PreviewZoom100Action, _, cx| {
+                this.controller.preview_zoom = PreviewZoomMode::Percent(100);
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PreviewZoom200Action, _, cx| {
+                this.controller.preview_zoom = PreviewZoomMode::Percent(200);
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TimelineZoomIn, _, cx| {
+                this.controller.zoom_timeline(1.25);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TimelineZoomOut, _, cx| {
+                this.controller.zoom_timeline(0.8);
+                cx.notify();
+            }));
+        Self::bind_panel_and_language_actions(with_view, cx)
+    }
+
+    fn bind_panel_and_language_actions(root: Div, cx: &mut Context<Self>) -> Div {
         root.on_action(
-            cx.listener(|this, _: &ToggleFollowSelectedOnSeekAction, _, cx| {
-                this.controller.toggle_follow_selected_on_seek();
-                this.reload_app_menus(cx);
-                cx.notify();
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &ToggleReturnToStartOnStopAction, _, cx| {
-                this.controller.toggle_return_playhead_to_start_on_stop();
-                this.reload_app_menus(cx);
-                cx.notify();
-            }),
-        )
-        .on_action(cx.listener(|this, _: &OpenKeyConfigAction, _, cx| {
-            this.key_config_modal = Some(KeyConfigModalState::open(&this.controller.key_config));
-            cx.notify();
-        }))
-        .on_action(
-            cx.listener(|this, _: &OpenExternalToolsAction, window, cx| {
-                this.open_external_tools_modal(window, cx);
-            }),
-        )
-        .on_action(cx.listener(|this, _: &TogglePreviewGuidesAction, _, cx| {
-            this.controller.show_preview_guides = !this.controller.show_preview_guides;
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &TogglePreviewGridAction, _, cx| {
-            this.controller.show_preview_grid = !this.controller.show_preview_grid;
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &TogglePreviewWaveformAction, _, cx| {
-            this.controller.show_preview_waveform = !this.controller.show_preview_waveform;
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &PreviewZoomFitAction, _, cx| {
-            this.controller.preview_zoom = PreviewZoomMode::Fit;
-            this.controller.preview_pan_offset_px = (0.0, 0.0);
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &PreviewZoom50Action, _, cx| {
-            this.controller.preview_zoom = PreviewZoomMode::Percent(50);
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &PreviewZoom100Action, _, cx| {
-            this.controller.preview_zoom = PreviewZoomMode::Percent(100);
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &PreviewZoom200Action, _, cx| {
-            this.controller.preview_zoom = PreviewZoomMode::Percent(200);
-            this.reload_app_menus(cx);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &TimelineZoomIn, _, cx| {
-            this.controller.zoom_timeline(1.25);
-            cx.notify();
-        }))
-        .on_action(cx.listener(|this, _: &TimelineZoomOut, _, cx| {
-            this.controller.zoom_timeline(0.8);
-            cx.notify();
-        }))
-        .on_action(
             cx.listener(|this, _: &ShowTabClipInspectorAction, window, cx| {
                 this.controller.right_tab = RightPanelTab::ClipInspector;
                 this.reload_app_menus(cx);
@@ -1062,6 +1170,19 @@ impl SeaEditorWindow {
         }))
         .on_action(cx.listener(|this, _: &ShowTabProjectInfoAction, _, cx| {
             this.controller.right_tab = RightPanelTab::ProjectInfo;
+            this.reload_app_menus(cx);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, action: &SelectLanguageAction, _, cx| {
+            if let Ok(info) = set_active_language(&action.code) {
+                this.controller.status_message = format!("Language: {} ({})", info.name, info.code);
+                this.reload_app_menus(cx);
+            }
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &ReloadLanguagePacksAction, _, cx| {
+            let count = reload_languages();
+            this.controller.status_message = format!("lang/ を再読み込みしました ({count} 言語)");
             this.reload_app_menus(cx);
             cx.notify();
         }))
@@ -1219,6 +1340,12 @@ impl SeaEditorWindow {
                     && this.preview_pointer_mode == PreviewPointerInputMode::Idle
                 {
                     this.preview_pointer_mode = PreviewPointerInputMode::SpacePanHeld;
+                    if this
+                        .controller
+                        .update_preview_hover(this.last_mouse_window, true)
+                    {
+                        cx.notify();
+                    }
                 }
             }))
             .on_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
@@ -1226,6 +1353,9 @@ impl SeaEditorWindow {
                     && this.preview_pointer_mode == PreviewPointerInputMode::SpacePanHeld
                 {
                     this.preview_pointer_mode = PreviewPointerInputMode::Idle;
+                    let _ = this
+                        .controller
+                        .update_preview_hover(this.last_mouse_window, false);
                     cx.notify();
                 }
             })),
@@ -1237,6 +1367,8 @@ impl SeaEditorWindow {
         root.on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
             let mx: f32 = ev.position.x / px(1.0);
             let my: f32 = ev.position.y / px(1.0);
+            this.last_mouse_window = (mx, my);
+            let space_pan = this.preview_pointer_mode == PreviewPointerInputMode::SpacePanHeld;
             if this.controller.preview_drag.is_some() {
                 this.controller.update_preview_drag(
                     (mx, my),
@@ -1246,6 +1378,7 @@ impl SeaEditorWindow {
                         alt: ev.modifiers.alt,
                     },
                 );
+                let _ = this.controller.update_preview_hover((mx, my), space_pan);
                 this.sliders_dirty = true;
                 cx.notify();
             } else if this.preview_pointer_mode == PreviewPointerInputMode::WaveformScrubbing {
@@ -1260,6 +1393,8 @@ impl SeaEditorWindow {
                 || this.controller.timeline_drag.is_some()
             {
                 handle_timeline_window_mouse_move(this, ev, window, cx);
+            } else if this.controller.update_preview_hover((mx, my), space_pan) {
+                cx.notify();
             }
         }))
         .on_mouse_up(
@@ -1320,6 +1455,15 @@ impl Render for SeaEditorWindow {
         } else {
             "EditorMain"
         };
+        let dirty_mark = if self.controller.has_unsaved_changes() {
+            " *"
+        } else {
+            ""
+        };
+        let title_text = format!(
+            "sea-movie-creator — {}{}",
+            self.controller.document.name, dirty_mark
+        );
         let top_bar = TitleBar::new().child(
             h_flex()
                 .w_full()
@@ -1330,7 +1474,7 @@ impl Render for SeaEditorWindow {
                     div()
                         .text_xs()
                         .text_color(theme.foreground)
-                        .child("sea-movie-creator"),
+                        .child(title_text),
                 )
                 .child(div().flex_1().child(self.menu_bar.clone())),
         );
@@ -1353,7 +1497,9 @@ impl Render for SeaEditorWindow {
                     .child(workspace),
             );
 
-        if let Some(modal) = &self.external_tools_modal {
+        if self.close_prompt == ClosePromptState::ConfirmModal {
+            root.child(render_unsaved_close_modal_overlay(cx))
+        } else if let Some(modal) = &self.external_tools_modal {
             root.child(render_external_tools_modal_overlay(modal, cx))
         } else if let Some(modal) = &self.key_config_modal {
             root.child(render_key_config_modal_overlay(modal, cx))
@@ -1370,6 +1516,74 @@ impl Render for SeaEditorWindow {
             root
         }
     }
+}
+
+fn render_unsaved_close_modal_overlay(cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    div()
+        .id("unsaved-close-backdrop")
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .bg(rgba(0x0000_0088))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            v_flex()
+                .w(px(420.0))
+                .p_4()
+                .gap_3()
+                .rounded_md()
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .child(div().text_sm().font_bold().child(tr("unsaved.title")))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tr("unsaved.message")),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("unsaved-cancel-btn")
+                                .ghost()
+                                .small()
+                                .label(tr("common.cancel"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_prompt = ClosePromptState::Idle;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("unsaved-discard-btn")
+                                .danger()
+                                .small()
+                                .label(tr("unsaved.discard_and_close"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_prompt = ClosePromptState::ConfirmedExit;
+                                    cx.quit();
+                                })),
+                        )
+                        .child(
+                            Button::new("unsaved-save-btn")
+                                .primary()
+                                .small()
+                                .label(tr("unsaved.save_and_close"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_project_and_quit(window, cx);
+                                })),
+                        ),
+                ),
+        )
 }
 
 /// タイトルバーのウィンドウ操作アイコン等を含む組み込みアセットソースを返す。
@@ -1401,7 +1615,16 @@ pub fn launch_app(open_project: Option<PathBuf>, auto_close_ms: Option<u64>) -> 
             };
 
             if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| SeaEditorWindow::new(menu_bar, open_project, window, cx))
+                let view = cx.new(|cx| SeaEditorWindow::new(menu_bar, open_project, window, cx));
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let mut allow = true;
+                    let _ = weak.update(cx, |this, cx| {
+                        allow = this.handle_window_should_close(window, cx);
+                    });
+                    allow
+                });
+                view
             }) {
                 eprintln!("failed to open window: {err}");
                 cx.quit();

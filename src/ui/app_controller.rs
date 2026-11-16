@@ -36,10 +36,10 @@ use crate::timeline::serialization::{
 };
 use crate::ui::preview::{
     DragModifiers, MasterWaveformCache, PreviewClipDragSnapshot, PreviewDragMode, PreviewDragState,
-    PreviewLayerHitQuad, PreviewViewportTransform, UpdatedClipVisualParams,
-    build_preview_hit_quads, clip_source_dimensions, clip_visual_props, clip_visual_props_mut,
-    compute_drag_updated_clip, hit_test_preview_layers, hit_test_selection_handle,
-    shift_animated_param,
+    PreviewHoverQuery, PreviewHoverState, PreviewLayerHitQuad, PreviewViewportTransform,
+    UpdatedClipVisualParams, build_preview_hit_quads, clip_source_dimensions, clip_visual_props,
+    clip_visual_props_mut, compute_drag_updated_clip, compute_preview_hover,
+    hit_test_preview_layers, hit_test_selection_handle, shift_animated_param,
 };
 use crate::ui::surface_bridge::{RenderImageSurfaceBridge, submit_composite_preview_to_bridge};
 
@@ -249,6 +249,8 @@ enum DropLayerStrategy<'a> {
 pub struct AppController {
     /// 現在のプロジェクトドキュメント。
     pub document: ProjectDocument,
+    /// 直近の保存／読込／新規作成時点のドキュメントスナップショット（未保存変更判定用）。
+    last_saved_document: ProjectDocument,
     /// コマンド適用および Undo/Redo 履歴管理。
     pub dispatcher: CommandDispatcher,
     /// 保存・読込済みプロジェクトファイルパス。
@@ -351,6 +353,8 @@ pub struct AppController {
     pub doc_audio_revision: u64,
     /// プレビューキャンバス上の直接ドラッグ操作状態。
     pub preview_drag: Option<PreviewDragState>,
+    /// プレビューキャンバス上のホバー／操作カーソル状態。
+    pub preview_hover: Option<PreviewHoverState>,
     /// プレビュー上に表示する非破壊の警告・案内バナー文言。
     pub preview_notice: Option<String>,
     /// マスター音声波形 LRU キャッシュ（4kHz / 10ms / 10s チャンク / 最大 16 チャンク）。
@@ -400,8 +404,10 @@ impl AppController {
             .and_then(|l| l.clips.first())
             .map(|c| c.id.clone());
 
+        let last_saved_document = document.clone();
         let mut controller = Self {
             document,
+            last_saved_document,
             dispatcher: CommandDispatcher::new(),
             project_path: None,
             frame_cache: FrameCache::new(DEFAULT_FRAME_CACHE_BYTES),
@@ -453,6 +459,7 @@ impl AppController {
             timeline_viewport_canvas_width_px: 900.0,
             doc_audio_revision: 1,
             preview_drag: None,
+            preview_hover: None,
             preview_notice: None,
             master_waveform: MasterWaveformCache::new(),
             export_selection_only: false,
@@ -498,6 +505,7 @@ impl AppController {
     pub fn new_project(&mut self) {
         self.stop();
         self.document = ProjectDocument::new("Untitled Project");
+        self.last_saved_document = self.document.clone();
         self.dispatcher.clear_history();
         self.project_path = None;
         self.frame_cache.clear();
@@ -528,6 +536,7 @@ impl AppController {
         let project_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
 
         self.document = doc;
+        self.last_saved_document = self.document.clone();
         self.dispatcher.clear_history();
         self.project_path = Some(path.to_path_buf());
         self.frame_cache.clear();
@@ -563,8 +572,39 @@ impl AppController {
     pub fn save_project_file(&mut self, path: &Path) -> Result<(), String> {
         save_project_file(&self.document, path).map_err(|err| err.to_string())?;
         self.project_path = Some(path.to_path_buf());
+        self.last_saved_document = self.document.clone();
         self.status_message = format!("保存しました: {}", path.display());
         Ok(())
+    }
+
+    /// 最後に保存・読込・新規作成した時点から未保存の編集変更があるかを返す。
+    #[must_use]
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.document != self.last_saved_document
+    }
+
+    /// プレビューキャッシュを無効化して現在フレームを即座に再合成する。
+    pub fn invalidate_and_refresh_preview(&mut self) {
+        self.dirty_preview = true;
+        self.refresh_preview_now();
+    }
+
+    /// ポインタ座標に応じてプレビューキャンバスのホバーカーソル状態を更新し、変化があった場合 `true` を返す。
+    pub fn update_preview_hover(&mut self, mouse_window: (f32, f32), space_pan_held: bool) -> bool {
+        let viewport = self.current_preview_viewport_transform();
+        let next = compute_preview_hover(&PreviewHoverQuery {
+            doc: &self.document,
+            playhead: self.clock.current_frame(),
+            viewport: &viewport,
+            primary_clip_id: self.selected_clip_id.as_ref(),
+            show_guides: self.show_preview_guides,
+            space_pan_held,
+            active_drag: self.preview_drag.as_ref().map(|d| d.mode),
+            mouse_window,
+        });
+        let changed = self.preview_hover.map(|h| h.kind) != next.map(|h| h.kind);
+        self.preview_hover = next;
+        changed
     }
 
     /// メディアファイル（動画・音声・画像）を取り込み、タイムライン末尾（または先頭）へ配置する。
@@ -4103,6 +4143,35 @@ mod tests {
         controller.stop();
         assert_eq!(controller.clock.current_frame(), FrameIndex::new(30));
         assert_eq!(controller.playback_state, PlaybackState::Stopped);
+        Ok(())
+    }
+
+    #[test]
+    fn unsaved_changes_tracks_edits_undo_save_and_new() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sea_mc_dirty_track_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let proj_path = temp_dir.join("dirty.smc.json");
+
+        let mut controller = AppController::new();
+        assert!(!controller.has_unsaved_changes());
+
+        controller.add_empty_layer()?;
+        assert!(controller.has_unsaved_changes());
+
+        assert!(controller.undo()?);
+        assert!(!controller.has_unsaved_changes());
+
+        controller.redo()?;
+        assert!(controller.has_unsaved_changes());
+
+        controller.save_project_file(&proj_path)?;
+        assert!(!controller.has_unsaved_changes());
+
+        controller.new_project();
+        assert!(!controller.has_unsaved_changes());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 }

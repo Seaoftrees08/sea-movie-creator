@@ -271,7 +271,7 @@ pub fn resolve_plugin_executable(plugin_dir: &Path, entrypoint: &str) -> Option<
     None
 }
 
-fn platform_exe_candidates(entrypoint: &str) -> Vec<String> {
+pub(crate) fn platform_exe_candidates(entrypoint: &str) -> Vec<String> {
     let mut out = vec![entrypoint.to_owned()];
     let suffix = env::consts::EXE_SUFFIX;
     if !suffix.is_empty() && !entrypoint.ends_with(suffix) {
@@ -344,6 +344,51 @@ mod tests {
             return Err("expected MissingExecutable error".into());
         };
         assert!(matches!(err, RegistryError::MissingExecutable { .. }));
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_executable_inside_plugin_subdir_before_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_plugin_root("inside-plugin-dir");
+        let export_dir = root.join("plugins").join("export");
+        let plugin_dir = export_dir.join("h264");
+        fs::create_dir_all(&plugin_dir)?;
+        let exe_name = platform_exe_candidates("sea-export-custom-test")
+            .into_iter()
+            .next_back()
+            .ok_or("missing exe candidate")?;
+        let exe_path = plugin_dir.join(&exe_name);
+        fs::write(&exe_path, b"stub")?;
+
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "id": "sea.export.custom.test",
+            "name": "Local Subdir Test",
+            "version": "0.1.0",
+            "kind": "export",
+            "entrypoint": "sea-export-custom-test",
+            "containers": ["mp4"],
+            "license": { "spdx": "MIT", "notice": null, "requires_external_binary": false },
+            "capabilities": { "supports_alpha": false, "supports_audio": true },
+            "presets": [{
+                "id": "default",
+                "label": "Default",
+                "video_codec": "h264",
+                "audio_codec": "aac",
+                "container_ext": "mp4"
+            }]
+        });
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        let registry = PluginRegistry::discover_in_dirs(std::slice::from_ref(&export_dir));
+        assert_eq!(registry.plugins().len(), 1);
+        let (_, resolved) = registry.resolve_runnable("sea.export.custom.test", "default")?;
+        assert_eq!(resolved, exe_path);
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }

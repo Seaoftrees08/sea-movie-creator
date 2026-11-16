@@ -30,6 +30,7 @@ use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvid
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
 use crate::ui::app_controller::AppController;
+use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
 
 /// チャット履歴に表示する 1 メッセージ。
@@ -933,7 +934,7 @@ fn render_chat_body(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> gp
             Button::new("ai-one-click-undo")
                 .ghost()
                 .xsmall()
-                .label("直前の AI 適用を取り消す (Undo)")
+                .label(tr("ai.undo_last"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.controller.undo_last_ai_plan();
                     this.sync_widgets_from_controller(cx);
@@ -1016,7 +1017,7 @@ fn render_diff_card(
                 Button::new("ai-apply-plan")
                     .primary()
                     .small()
-                    .label("承認して適用")
+                    .label(tr("ai.approve"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let _ = this.controller.approve_pending_ai_proposal();
                         this.sync_widgets_from_controller(cx);
@@ -1027,7 +1028,7 @@ fn render_diff_card(
                 Button::new("ai-discard-plan")
                     .ghost()
                     .small()
-                    .label("破棄")
+                    .label(tr("ai.discard"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.controller.discard_pending_ai_proposal();
                         cx.notify();
@@ -1501,7 +1502,7 @@ fn render_prompt_composer(
         Button::new("ai-stop-btn")
             .danger()
             .xsmall()
-            .label("停止")
+            .label(tr("ai.stop"))
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.controller.cancel_ai_prompt() {
                     cx.notify();
@@ -1511,7 +1512,7 @@ fn render_prompt_composer(
         Button::new("ai-send-btn")
             .primary()
             .xsmall()
-            .label("送信")
+            .label(tr("ai.send"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.submit_ai_chat_input(window, cx);
             }))

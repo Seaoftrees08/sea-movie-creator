@@ -4,6 +4,7 @@ pub mod ai_chat_panel;
 pub mod app_controller;
 pub mod export_dialog;
 pub mod external_tools_modal;
+pub mod i18n;
 pub mod inspector;
 pub mod inspector_panel;
 pub mod key_config;

@@ -17,8 +17,10 @@ use gpui_kit::{
 use crate::core::ids::ClipId;
 use crate::core::time::FrameIndex;
 use crate::ui::app_controller::{AppController, PreviewZoomMode};
+use crate::ui::i18n::tr;
 use crate::ui::preview::canvas_ops::{
-    PREVIEW_GRID_STEP_PX, PreviewLayerHitQuad, PreviewViewportTransform, build_preview_hit_quads,
+    PREVIEW_GRID_STEP_PX, PreviewHandleKind, PreviewHoverKind, PreviewHoverState,
+    PreviewLayerHitQuad, PreviewViewportTransform, ResizeCursorAxis, build_preview_hit_quads,
     find_missing_asset_clip_at_playhead, handle_screen_positions, step_zoom_preset,
     zoom_around_cursor,
 };
@@ -44,6 +46,7 @@ struct PreviewCanvasDrawPayload {
     show_guides: bool,
     selected_ids: Vec<ClipId>,
     primary_clip_id: Option<ClipId>,
+    hovered_handle: Option<PreviewHandleKind>,
     quads: Vec<PreviewQuadTemplate>,
 }
 
@@ -121,7 +124,7 @@ fn render_preview_header(
         )
         .child(render_header_toggle(
             "toggle-preview-guides",
-            "枠",
+            tr("preview.guides"),
             controller.show_preview_guides,
             cx.listener(|this, _, window, cx| {
                 this.controller.show_preview_guides = !this.controller.show_preview_guides;
@@ -143,7 +146,7 @@ fn render_preview_header(
         ))
         .child(render_header_toggle(
             "toggle-preview-waveform",
-            "波形",
+            tr("preview.waveform"),
             controller.show_preview_waveform,
             cx.listener(|this, _, window, cx| {
                 this.controller.show_preview_waveform = !this.controller.show_preview_waveform;
@@ -206,7 +209,7 @@ fn render_preview_zoom_group(
             Button::new("preview-pan-reset")
                 .xsmall()
                 .ghost()
-                .label("中央へ")
+                .label(tr("preview.center"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.controller.preview_zoom = PreviewZoomMode::Fit;
                     this.controller.preview_pan_offset_px = (0.0, 0.0);
@@ -221,13 +224,37 @@ fn render_preview_zoom_group(
 
 fn render_header_toggle(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<gpui_kit::SharedString>,
     active: bool,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> Button {
     let mut btn = Button::new(id).xsmall().label(label);
     btn = if active { btn.primary() } else { btn.ghost() };
     btn.on_click(on_click)
+}
+
+fn collect_preview_quad_templates(
+    controller: &AppController,
+    playhead: FrameIndex,
+) -> Vec<PreviewQuadTemplate> {
+    let proj_w = controller.document.resolution.width.get().max(1);
+    let proj_h = controller.document.resolution.height.get().max(1);
+    let nominal_tf = PreviewViewportTransform {
+        bounds: controller.preview_viewport_bounds.get(),
+        proj_size: (proj_w, proj_h),
+        zoom: controller.preview_zoom,
+        pan_px: controller.preview_pan_offset_px,
+    };
+    build_preview_hit_quads(&controller.document, playhead, &nominal_tf)
+        .into_iter()
+        .map(|q| PreviewQuadTemplate {
+            clip_id: q.clip_id,
+            layer_id: q.layer_id,
+            is_locked: q.is_locked,
+            canvas_corners: q.canvas_corners,
+            anchor_canvas: q.anchor_canvas,
+        })
+        .collect()
 }
 
 fn render_preview_viewport(
@@ -238,24 +265,12 @@ fn render_preview_viewport(
 ) -> AnyElement {
     let proj_w = controller.document.resolution.width.get().max(1);
     let proj_h = controller.document.resolution.height.get().max(1);
-    let nominal_tf = PreviewViewportTransform {
-        bounds: controller.preview_viewport_bounds.get(),
-        proj_size: (proj_w, proj_h),
-        zoom: controller.preview_zoom,
-        pan_px: controller.preview_pan_offset_px,
-    };
-    let quads: Vec<PreviewQuadTemplate> =
-        build_preview_hit_quads(&controller.document, playhead, &nominal_tf)
-            .into_iter()
-            .map(|q| PreviewQuadTemplate {
-                clip_id: q.clip_id,
-                layer_id: q.layer_id,
-                is_locked: q.is_locked,
-                canvas_corners: q.canvas_corners,
-                anchor_canvas: q.anchor_canvas,
-            })
-            .collect();
+    let quads = collect_preview_quad_templates(controller, playhead);
 
+    let hovered_handle = controller.preview_hover.and_then(|h| match h.kind {
+        PreviewHoverKind::Handle { handle, .. } => Some(handle),
+        _ => None,
+    });
     let payload = PreviewCanvasDrawPayload {
         bounds_cell: Rc::clone(&controller.preview_viewport_bounds),
         proj_size: (proj_w, proj_h),
@@ -266,6 +281,7 @@ fn render_preview_viewport(
         show_guides: controller.show_preview_guides,
         selected_ids: controller.effective_selected_clip_ids(),
         primary_clip_id: controller.selected_clip_id.clone(),
+        hovered_handle,
         quads,
     };
 
@@ -286,6 +302,7 @@ fn render_preview_viewport(
     )
     .size_full();
 
+    let hover_cursor = cursor_style_for_preview_hover(controller.preview_hover.as_ref());
     let mut container = div()
         .id("preview-viewport")
         .relative()
@@ -294,6 +311,7 @@ fn render_preview_viewport(
         .min_h(px(120.0))
         .overflow_hidden()
         .bg(rgba(0x0b0e_14ff))
+        .cursor(hover_cursor)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -331,7 +349,65 @@ fn render_preview_viewport(
         container = container.child(render_preview_notice_banner(notice.clone(), cx));
     }
 
+    if let Some(hover) = controller.preview_hover {
+        container = container.child(render_preview_hover_badge(hover));
+    }
+
     container.into_any_element()
+}
+
+fn cursor_style_for_preview_hover(hover: Option<&PreviewHoverState>) -> gpui_kit::CursorStyle {
+    match hover.map(|h| h.kind) {
+        None => gpui_kit::CursorStyle::Arrow,
+        Some(PreviewHoverKind::Pan) => gpui_kit::CursorStyle::PointingHand,
+        Some(PreviewHoverKind::MoveClip) => gpui_kit::CursorStyle::Crosshair,
+        Some(PreviewHoverKind::LockedClip) => gpui_kit::CursorStyle::OperationNotAllowed,
+        Some(PreviewHoverKind::Handle { handle, axis }) => match handle {
+            PreviewHandleKind::Anchor | PreviewHandleKind::Move => gpui_kit::CursorStyle::Crosshair,
+            PreviewHandleKind::Rotate => gpui_kit::CursorStyle::PointingHand,
+            PreviewHandleKind::ScaleTL
+            | PreviewHandleKind::ScaleT
+            | PreviewHandleKind::ScaleTR
+            | PreviewHandleKind::ScaleR
+            | PreviewHandleKind::ScaleBR
+            | PreviewHandleKind::ScaleB
+            | PreviewHandleKind::ScaleBL
+            | PreviewHandleKind::ScaleL => match axis {
+                ResizeCursorAxis::Horizontal => gpui_kit::CursorStyle::ResizeLeftRight,
+                ResizeCursorAxis::Vertical => gpui_kit::CursorStyle::ResizeUpDown,
+                ResizeCursorAxis::DiagNwSe => gpui_kit::CursorStyle::ResizeUpLeftDownRight,
+                ResizeCursorAxis::DiagNeSw => gpui_kit::CursorStyle::ResizeUpRightDownLeft,
+            },
+        },
+    }
+}
+
+fn render_preview_hover_badge(hover: PreviewHoverState) -> AnyElement {
+    let key = match hover.kind {
+        PreviewHoverKind::Pan => "preview.hover.pan",
+        PreviewHoverKind::MoveClip => "preview.hover.move",
+        PreviewHoverKind::LockedClip => "preview.hover.locked",
+        PreviewHoverKind::Handle { handle, .. } => match handle {
+            PreviewHandleKind::Rotate => "preview.hover.rotate",
+            PreviewHandleKind::Anchor => "preview.hover.anchor",
+            PreviewHandleKind::Move => "preview.hover.move",
+            _ => "preview.hover.scale",
+        },
+    };
+    div()
+        .absolute()
+        .bottom(px(8.0))
+        .left(px(8.0))
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .bg(rgba(0x0f17_2acc))
+        .border_1()
+        .border_color(rgba(0x38bd_f866))
+        .text_size(px(10.0))
+        .text_color(rgba(0xe2e8_f0ff))
+        .child(tr(key))
+        .into_any_element()
 }
 
 fn handle_preview_wheel(controller: &mut AppController, ev: &ScrollEvent) {
@@ -517,7 +593,7 @@ fn paint_selection_wireframes(
         let is_primary = data.primary_clip_id.as_ref() == Some(&q.clip_id);
         if is_primary && !q.is_locked {
             let synth_quad = build_overlay_hit_quad(q, sc, anchor_sc);
-            paint_primary_handles(&synth_quad, window);
+            paint_primary_handles(&synth_quad, data.hovered_handle, window);
         }
     }
 }
@@ -573,7 +649,11 @@ fn build_overlay_hit_quad(
     }
 }
 
-fn paint_primary_handles(q: &PreviewLayerHitQuad, window: &mut Window) {
+fn paint_primary_handles(
+    q: &PreviewLayerHitQuad,
+    hovered: Option<PreviewHandleKind>,
+    window: &mut Window,
+) {
     let top_mid = (
         f32::midpoint(q.screen_corners[0].0, q.screen_corners[1].0),
         f32::midpoint(q.screen_corners[0].1, q.screen_corners[1].1),
@@ -589,65 +669,133 @@ fn paint_primary_handles(q: &PreviewLayerHitQuad, window: &mut Window) {
     }
 
     for (kind, pos) in handle_screen_positions(q) {
+        let is_hovered = hovered == Some(kind);
         match kind {
-            super::canvas_ops::PreviewHandleKind::Anchor => {
-                let r = 5.5_f32;
-                let box_b = Bounds {
-                    origin: point(px(pos.0 - r), px(pos.1 - r)),
-                    size: size(px(r * 2.0), px(r * 2.0)),
-                };
-                window.paint_quad(quad(
-                    box_b,
-                    Corners::all(px(r)),
-                    rgba(0xf59e_0bcc),
-                    Edges::all(px(1.5)),
-                    rgba(0xffff_ffff),
-                    BorderStyle::Solid,
-                ));
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: point(px(pos.0 - 4.0), px(pos.1 - 0.5)),
-                        size: size(px(8.0), px(1.0)),
-                    },
-                    rgba(0xffff_ffff),
-                ));
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: point(px(pos.0 - 0.5), px(pos.1 - 4.0)),
-                        size: size(px(1.0), px(8.0)),
-                    },
-                    rgba(0xffff_ffff),
-                ));
-            }
-            super::canvas_ops::PreviewHandleKind::Rotate => {
-                let r = 4.5_f32;
-                window.paint_quad(quad(
-                    Bounds {
-                        origin: point(px(pos.0 - r), px(pos.1 - r)),
-                        size: size(px(r * 2.0), px(r * 2.0)),
-                    },
-                    Corners::all(px(r)),
-                    rgba(0x10b9_81ff),
-                    Edges::all(px(1.0)),
-                    rgba(0xffff_ffff),
-                    BorderStyle::Solid,
-                ));
-            }
-            _ => {
-                let half = 3.5_f32;
-                window.paint_quad(quad(
-                    Bounds {
-                        origin: point(px(pos.0 - half), px(pos.1 - half)),
-                        size: size(px(half * 2.0), px(half * 2.0)),
-                    },
-                    Corners::all(px(1.0)),
-                    rgba(0xffff_ffff),
-                    Edges::all(px(1.0)),
-                    rgba(0x0284_c7ff),
-                    BorderStyle::Solid,
-                ));
-            }
+            PreviewHandleKind::Anchor => paint_anchor_handle(pos, is_hovered, window),
+            PreviewHandleKind::Rotate => paint_rotate_handle(pos, is_hovered, window),
+            _ => paint_scale_handle(pos, is_hovered, window),
         }
+    }
+}
+
+fn paint_anchor_handle(pos: (f32, f32), is_hovered: bool, window: &mut Window) {
+    if is_hovered {
+        let hr = 9.0_f32;
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(px(pos.0 - hr), px(pos.1 - hr)),
+                size: size(px(hr * 2.0), px(hr * 2.0)),
+            },
+            Corners::all(px(hr)),
+            rgba(0xf59e_0b33),
+            Edges::all(px(1.5)),
+            rgba(0xfef0_8aff),
+            BorderStyle::Solid,
+        ));
+    }
+    let r = if is_hovered { 6.5_f32 } else { 5.5_f32 };
+    window.paint_quad(quad(
+        Bounds {
+            origin: point(px(pos.0 - r), px(pos.1 - r)),
+            size: size(px(r * 2.0), px(r * 2.0)),
+        },
+        Corners::all(px(r)),
+        rgba(0xf59e_0bcc),
+        Edges::all(px(1.5)),
+        rgba(0xffff_ffff),
+        BorderStyle::Solid,
+    ));
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(pos.0 - 4.0), px(pos.1 - 0.5)),
+            size: size(px(8.0), px(1.0)),
+        },
+        rgba(0xffff_ffff),
+    ));
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(pos.0 - 0.5), px(pos.1 - 4.0)),
+            size: size(px(1.0), px(8.0)),
+        },
+        rgba(0xffff_ffff),
+    ));
+}
+
+fn paint_rotate_handle(pos: (f32, f32), is_hovered: bool, window: &mut Window) {
+    if is_hovered {
+        paint_rotate_hover_ring(pos, window);
+    }
+    let r = if is_hovered { 5.5_f32 } else { 4.5_f32 };
+    window.paint_quad(quad(
+        Bounds {
+            origin: point(px(pos.0 - r), px(pos.1 - r)),
+            size: size(px(r * 2.0), px(r * 2.0)),
+        },
+        Corners::all(px(r)),
+        rgba(0x10b9_81ff),
+        Edges::all(px(1.0)),
+        rgba(0xffff_ffff),
+        BorderStyle::Solid,
+    ));
+}
+
+fn paint_scale_handle(pos: (f32, f32), is_hovered: bool, window: &mut Window) {
+    if is_hovered {
+        let hh = 6.0_f32;
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(px(pos.0 - hh), px(pos.1 - hh)),
+                size: size(px(hh * 2.0), px(hh * 2.0)),
+            },
+            Corners::all(px(2.0)),
+            rgba(0x38bd_f844),
+            Edges::all(px(1.5)),
+            rgba(0x38bd_f8ff),
+            BorderStyle::Solid,
+        ));
+    }
+    let half = if is_hovered { 4.5_f32 } else { 3.5_f32 };
+    window.paint_quad(quad(
+        Bounds {
+            origin: point(px(pos.0 - half), px(pos.1 - half)),
+            size: size(px(half * 2.0), px(half * 2.0)),
+        },
+        Corners::all(px(1.0)),
+        rgba(0xffff_ffff),
+        Edges::all(px(1.0)),
+        rgba(0x0284_c7ff),
+        BorderStyle::Solid,
+    ));
+}
+
+fn paint_rotate_hover_ring(center: (f32, f32), window: &mut Window) {
+    let outer_r = 10.5_f32;
+    let steps = 16;
+    let start_deg = -45.0_f32;
+    let sweep_deg = 270.0_f32;
+    let mut arc = PathBuilder::stroke(px(1.75));
+    for idx in 0..=steps {
+        #[allow(clippy::cast_precision_loss)]
+        let frac = (idx as f32) / (steps as f32);
+        let rad = (start_deg + sweep_deg * frac).to_radians();
+        let x = center.0 + outer_r * rad.cos();
+        let y = center.1 + outer_r * rad.sin();
+        if idx == 0 {
+            arc.move_to(point(px(x), px(y)));
+        } else {
+            arc.line_to(point(px(x), px(y)));
+        }
+    }
+    let end_rad = (start_deg + sweep_deg).to_radians();
+    let tip = (
+        center.0 + outer_r * end_rad.cos(),
+        center.1 + outer_r * end_rad.sin(),
+    );
+    arc.line_to(point(px(tip.0 - 4.0), px(tip.1 - 3.0)));
+    arc.move_to(point(px(tip.0), px(tip.1)));
+    arc.line_to(point(px(tip.0 + 3.0), px(tip.1 - 4.0)));
+    if let Ok(path) = arc.build() {
+        window.paint_path(path, rgba(0x34d3_99ff));
     }
 }
 

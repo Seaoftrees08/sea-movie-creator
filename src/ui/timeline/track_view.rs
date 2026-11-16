@@ -680,25 +680,29 @@ fn append_clip_segments(
             .top_0()
             .bottom_0()
             .left(px(seg_left))
-            .w(px(seg_w))
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    on_clip_segment_mouse_down(
-                        this,
-                        &clip_id_click,
-                        layer_idx,
-                        seg_idx,
-                        layer_locked,
-                        row_h,
-                        evt,
-                        window,
-                        cx,
-                    );
-                }),
-            );
+            .w(px(seg_w));
+        seg_div = if layer_locked {
+            seg_div.cursor_not_allowed()
+        } else {
+            seg_div.cursor_crosshair()
+        }
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                on_clip_segment_mouse_down(
+                    this,
+                    &clip_id_click,
+                    layer_idx,
+                    seg_idx,
+                    layer_locked,
+                    row_h,
+                    evt,
+                    window,
+                    cx,
+                );
+            }),
+        );
         if dimmed {
             seg_div = seg_div.bg(rgba(0x0000_0055));
         }
