@@ -2,9 +2,11 @@
 
 use std::sync::mpsc;
 
+use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
@@ -243,6 +245,20 @@ impl AiChatState {
     #[must_use]
     pub const fn is_busy(&self) -> bool {
         self.running_job.is_some()
+    }
+
+    /// 会話履歴・提案差分・エラー状態をクリアし、新しいチャットを開始する。
+    pub fn clear_conversation(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.turns.clear();
+        self.streaming_preview.clear();
+        self.pending_proposal = None;
+        self.last_error = None;
+        self.can_one_click_undo = false;
+        "自然言語で編集指示を入力してください（適用前に差分を確認できます）"
+            .clone_into(&mut self.status_banner);
     }
 
     /// 現在の UI 設定から [`AiProvider`] 実装を構築する。
@@ -605,64 +621,24 @@ impl AiProvider for FailedPluginProvider {
 }
 
 /// 右側 AI Chat タブの VS Code 風チャットパネルを描画する。
+///
+/// 上部はプロバイダ切替と認証状態のみのシンプルなヘッダとし、会話領域を下側へ伸縮させ、
+/// モデル／思考レベル選択を内包した単一の入力コンポーザーを最下部に固定配置する。
 pub fn render_ai_chat_panel(
     controller: &AppController,
     ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
     ai_chat_input: &Entity<InputState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    let theme = cx.theme().clone();
     let chat = &controller.ai_chat;
-    let cred_label = format_cred_label(chat);
 
-    let mut panel = v_flex()
+    v_flex()
         .size_full()
-        .p_3()
-        .gap_2()
+        .min_h(px(0.))
         .text_xs()
-        .child(render_provider_combo_bar(ai_provider_select, &theme))
-        .child(
-            h_flex()
-                .justify_between()
-                .gap_2()
-                .text_color(theme.muted_foreground)
-                .child(format!("Model: {}", chat.active_model_label()))
-                .child(cred_label),
-        );
-    if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
-        panel = panel.child(
-            div()
-                .p_2()
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
-                .text_color(theme.muted_foreground)
-                .child(notice),
-        );
-    }
-    panel = panel.child(render_thread_box(chat, cx));
-
-    if let Some(proposal) = &chat.pending_proposal {
-        panel = panel.child(render_diff_card(proposal, cx));
-    }
-    if chat.can_one_click_undo {
-        panel = panel.child(
-            Button::new("ai-one-click-undo")
-                .ghost()
-                .small()
-                .label("直前の AI 適用を取り消す (Undo)")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.controller.undo_last_ai_plan();
-                    this.sync_widgets_from_controller(cx);
-                    cx.notify();
-                })),
-        );
-    }
-    if let Some(err) = &chat.last_error {
-        panel = panel.child(div().text_color(theme.danger).child(err.clone()));
-    }
-
-    panel.child(render_prompt_composer(chat, ai_chat_input, cx))
+        .child(render_compact_header(chat, ai_provider_select, cx))
+        .child(render_chat_body(chat, cx))
+        .child(render_prompt_composer(chat, ai_chat_input, cx))
 }
 
 fn format_cred_label(chat: &AiChatState) -> String {
@@ -675,74 +651,188 @@ fn format_cred_label(chat: &AiChatState) -> String {
     }
 }
 
-fn render_provider_combo_bar(
+fn render_compact_header(
+    chat: &AiChatState,
     ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
-    theme: &gpui_kit::component::Theme,
+    cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
-    h_flex()
+    let theme = cx.theme().clone();
+    let cred_color = if chat.has_resolved_credentials() {
+        theme.muted_foreground
+    } else {
+        theme.danger
+    };
+
+    let mut right_actions = h_flex()
         .items_center()
+        .gap_1()
+        .flex_shrink_0()
+        .child(div().text_color(cred_color).child(format_cred_label(chat)));
+    if !chat.turns.is_empty() {
+        right_actions = right_actions.child(
+            Button::new("ai-new-chat")
+                .ghost()
+                .xsmall()
+                .disabled(chat.is_busy())
+                .label("+")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller.ai_chat.clear_conversation();
+                    cx.notify();
+                })),
+        );
+    }
+
+    h_flex()
+        .w_full()
+        .flex_shrink_0()
+        .items_center()
+        .justify_between()
         .gap_2()
-        .child(div().text_color(theme.muted_foreground).child("API"))
+        .px_2()
+        .py_1p5()
+        .border_b_1()
+        .border_color(theme.border)
         .child(
-            div().flex_1().min_w(px(120.)).child(
+            div().flex_1().min_w(px(90.)).child(
                 Select::new(ai_provider_select)
-                    .menu_width(px(260.))
-                    .with_size(Size::Small),
+                    .menu_width(px(230.))
+                    .with_size(Size::XSmall),
             ),
         )
+        .child(right_actions)
 }
 
-fn render_thread_box(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
+fn render_chat_body(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> gpui_kit::AnyElement {
+    use gpui_kit::IntoElement as _;
+
     let theme = cx.theme().clone();
-    let mut box_el = v_flex()
-        .flex_1()
-        .p_2()
-        .gap_2()
-        .overflow_hidden()
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child(chat.status_banner.clone()),
-        );
+    let is_idle_empty = chat.turns.is_empty()
+        && !chat.is_busy()
+        && chat.pending_proposal.is_none()
+        && chat.last_error.is_none()
+        && !chat.can_one_click_undo;
 
-    for turn in chat.turns.iter().rev().take(6).rev() {
-        let prefix = match turn.role {
-            AiRole::User => "You: ",
-            AiRole::Assistant => "AI: ",
-            AiRole::System => "Sys: ",
-        };
-        let color = if turn.role == AiRole::User {
-            theme.foreground
+    if is_idle_empty {
+        let mut welcome = v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .py_4()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child("AI 編集アシスタント"),
+            )
+            .child(
+                div()
+                    .text_center()
+                    .text_color(theme.muted_foreground)
+                    .child(chat.status_banner.clone()),
+            );
+        if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
+            welcome = welcome.child(
+                div()
+                    .mt_2()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.secondary)
+                    .text_color(theme.muted_foreground)
+                    .child(notice),
+            );
+        }
+        return welcome.into_any_element();
+    }
+
+    let mut thread = v_flex().w_full().gap_2().px_2().py_2();
+    for turn in chat.turns.iter().rev().take(12).rev() {
+        thread = thread.child(render_chat_turn(turn, &theme));
+    }
+    if chat.is_busy() {
+        let label = if chat.streaming_preview.is_empty() {
+            "受信中...".to_owned()
         } else {
-            theme.muted_foreground
+            let snippet: String = chat
+                .streaming_preview
+                .chars()
+                .rev()
+                .take(180)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            format!("受信中: {snippet}")
         };
-        box_el = box_el.child(
+        thread = thread.child(div().px_1().text_color(theme.muted_foreground).child(label));
+    }
+    if let Some(proposal) = &chat.pending_proposal {
+        thread = thread.child(render_diff_card(proposal, cx));
+    }
+    if chat.can_one_click_undo {
+        thread = thread.child(
+            Button::new("ai-one-click-undo")
+                .ghost()
+                .xsmall()
+                .label("直前の AI 適用を取り消す (Undo)")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.controller.undo_last_ai_plan();
+                    this.sync_widgets_from_controller(cx);
+                    cx.notify();
+                })),
+        );
+    }
+    if let Some(err) = &chat.last_error {
+        thread = thread.child(
             div()
-                .text_color(color)
-                .child(format!("{prefix}{}", turn.text)),
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.danger)
+                .text_color(theme.danger)
+                .child(err.clone()),
         );
     }
 
-    if chat.is_busy() && !chat.streaming_preview.is_empty() {
-        let snippet: String = chat
-            .streaming_preview
-            .chars()
-            .rev()
-            .take(180)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        box_el = box_el.child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child(format!("受信中: {snippet}")),
-        );
+    div()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.))
+        .overflow_y_scrollbar()
+        .child(thread)
+        .into_any_element()
+}
+
+fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
+    use gpui_kit::IntoElement as _;
+
+    match turn.role {
+        AiRole::User => div()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .bg(theme.secondary)
+            .text_color(theme.foreground)
+            .child(turn.text.clone())
+            .into_any_element(),
+        AiRole::Assistant => v_flex()
+            .w_full()
+            .gap_0p5()
+            .px_1()
+            .child(div().text_color(theme.muted_foreground).child("AI"))
+            .child(div().text_color(theme.foreground).child(turn.text.clone()))
+            .into_any_element(),
+        AiRole::System => div()
+            .w_full()
+            .px_1()
+            .text_color(theme.muted_foreground)
+            .child(turn.text.clone())
+            .into_any_element(),
     }
-    box_el
 }
 
 fn render_diff_card(
@@ -819,7 +909,7 @@ fn render_model_menu_button(
     let catalog = chat.selected_provider.model_catalog();
     let current_model = chat.model_name.clone();
     let current_thinking = chat.thinking_level;
-    let trigger_label = format!("{} ▾", chat.active_model_label());
+    let trigger_label = format!("{} ▾", chat.active_model_display_name());
 
     Button::new("ai-model-picker")
         .ghost()
@@ -897,7 +987,7 @@ fn render_thinking_menu_button(
     }
     let weak = cx.weak_entity();
     let current = chat.thinking_level;
-    let label = format!("思考: {} ▾", current.display_label());
+    let label = format!("{} ▾", current.display_label());
 
     Some(
         Button::new("ai-thinking-picker")
@@ -941,7 +1031,7 @@ fn render_prompt_composer(
 
     let mut selectors = h_flex()
         .items_center()
-        .gap_1()
+        .gap_0p5()
         .flex_1()
         .min_w_0()
         .flex_wrap()
@@ -950,30 +1040,33 @@ fn render_prompt_composer(
         selectors = selectors.child(thinking_btn);
     }
 
-    v_flex()
-        .gap_2()
-        .p_2()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .child(Input::new(ai_chat_input))
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .gap_1()
-                .child(selectors)
-                .child(
-                    Button::new("ai-send-btn")
-                        .primary()
-                        .xsmall()
-                        .label(send_label)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.submit_ai_chat_input(window, cx);
-                        })),
-                ),
-        )
+    div().w_full().px_2().pb_2().pt_1().flex_shrink_0().child(
+        v_flex()
+            .gap_1p5()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .child(Input::new(ai_chat_input).appearance(false).small())
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .child(selectors)
+                    .child(
+                        Button::new("ai-send-btn")
+                            .primary()
+                            .xsmall()
+                            .disabled(chat.is_busy())
+                            .label(send_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_ai_chat_input(window, cx);
+                            })),
+                    ),
+            ),
+    )
 }
 
 #[cfg(test)]
@@ -1039,5 +1132,32 @@ mod tests {
         assert!(formatted.contains("Extra"));
         assert!(formatted.contains("[New]"));
         Ok(())
+    }
+
+    #[test]
+    fn clear_conversation_resets_turns_and_preserves_model_selection() {
+        let mut chat = AiChatState::default();
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        chat.select_provider(agy.clone());
+        chat.select_model("gemini-4-hydrogen", AiThinkingLevel::Extra);
+        chat.turns.push(super::AiChatTurn {
+            role: crate::ai::provider::AiRole::User,
+            text: "テロップを追加して".to_owned(),
+        });
+        chat.last_error = Some("temporary error".to_owned());
+        chat.can_one_click_undo = true;
+        chat.streaming_preview = "partial".to_owned();
+
+        chat.clear_conversation();
+
+        assert_eq!(chat.turns, Vec::new());
+        assert_eq!(chat.last_error, None);
+        assert!(!chat.can_one_click_undo);
+        assert_eq!(chat.streaming_preview, "");
+        assert_eq!(chat.selected_provider, agy);
+        assert_eq!(chat.model_name, "gemini-4-hydrogen");
+        assert_eq!(chat.thinking_level, AiThinkingLevel::Extra);
     }
 }

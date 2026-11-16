@@ -1,8 +1,8 @@
 //! 右側インスペクタ・タブコンテナ（クリップ設定 / AIチャット / レイヤー / プロジェクト）。
 
-use gpui_kit::base::{Disableable as _, StyledExt as _};
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
@@ -89,9 +89,13 @@ pub fn render_right_panel(
             .flex_1()
             .w_full()
             .min_h(px(0.0))
-            .overflow_y_scrollbar()
-            .p_2()
-            .child(render_ai_chat_tab(controller, &widgets, &theme, cx))
+            .overflow_hidden()
+            .child(render_ai_chat_panel(
+                controller,
+                widgets.ai_provider_select,
+                widgets.ai_chat_input,
+                cx,
+            ))
             .into_any_element(),
         RightPanelTab::LayerList => div()
             .flex_1()
@@ -118,80 +122,6 @@ pub fn render_right_panel(
         .border_color(theme.border)
         .child(tab_bar)
         .child(body)
-}
-
-fn render_ai_chat_tab(
-    controller: &AppController,
-    widgets: &RightPanelWidgets<'_>,
-    theme: &Theme,
-    cx: &mut Context<SeaEditorWindow>,
-) -> impl IntoElement {
-    let mut root = v_flex()
-        .gap_2()
-        .w_full()
-        .child(render_ai_chat_panel(
-            controller,
-            widgets.ai_provider_select,
-            widgets.ai_chat_input,
-            cx,
-        ))
-        .child(
-            h_flex()
-                .gap_1()
-                .child(div().flex_1().child(Input::new(widgets.ai_chat_input)))
-                .child(
-                    Button::new("ai-chat-send-btn")
-                        .primary()
-                        .small()
-                        .disabled(controller.ai_chat.is_busy())
-                        .label("送信")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.submit_ai_chat_input(window, cx);
-                        })),
-                ),
-        );
-
-    if let Some((_, clip)) = controller.selected_clip()
-        && let crate::timeline::document::ClipKind::Video { playback_rate, .. }
-        | crate::timeline::document::ClipKind::Audio { playback_rate, .. } = &clip.kind
-    {
-        let rate = *playback_rate;
-        root = root.child(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .flex_wrap()
-                .p_1p5()
-                .rounded_sm()
-                .bg(theme.secondary)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("選択クリップ速度: {rate:?}")),
-                )
-                .child(speed_button("0.5x", 1, 2, cx))
-                .child(speed_button("1.0x", 1, 1, cx))
-                .child(speed_button("2.0x", 2, 1, cx)),
-        );
-    }
-    root
-}
-
-fn speed_button(
-    label: &'static str,
-    num: u32,
-    den: u32,
-    cx: &mut Context<SeaEditorWindow>,
-) -> impl IntoElement {
-    Button::new(("right-speed", num * 10 + den))
-        .ghost()
-        .small()
-        .label(label)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            let _ = this.controller.set_selected_clip_playback_rate(num, den);
-            cx.notify();
-        }))
 }
 
 fn render_layers_tab(

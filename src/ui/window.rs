@@ -145,9 +145,8 @@ impl SeaEditorWindow {
                 cx,
             )
         });
-        let ai_chat_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("AI 編集指示を入力 (Enter で送信)...")
-        });
+        let ai_chat_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("編集指示を入力 (Enter で送信)"));
 
         let mut subscriptions = vec![
             cx.subscribe_in(&scrub_slider, window, Self::on_scrub_slider),
