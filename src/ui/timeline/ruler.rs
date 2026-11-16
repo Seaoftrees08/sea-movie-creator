@@ -259,11 +259,21 @@ fn build_ruler_lane(
             cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
                 on_ruler_mouse_down(this, evt, window, cx);
             }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, evt: &MouseDownEvent, _, _| {
+                crate::ui::timeline::context_menu::record_ruler_right_click(
+                    this,
+                    f32::from(evt.position.x),
+                );
+            }),
         );
 
     let lane = decorate_ruler_ranges(lane, controller, scroll_x, ppf);
     let lane = append_ruler_ticks(lane, &ticks, scroll_x, ppf);
-    append_ruler_playhead(lane, head_x)
+    let lane = append_ruler_playhead(lane, head_x);
+    crate::ui::timeline::context_menu::attach_ruler_context_menu(lane, cx.entity())
 }
 
 fn on_ruler_mouse_down(

@@ -481,18 +481,39 @@ impl SeaEditorWindow {
 
     #[allow(clippy::unused_self)] // GPUI cx.listener シグネチャ要件のため &mut self を維持
     fn on_import_media(&mut self, _: &ImportMedia, _: &mut Window, cx: &mut Context<Self>) {
+        Self::prompt_import_media_at(None, None, cx);
+    }
+
+    /// 動画・画像・音声ファイルを選択し、任意の位置・レイヤー（未指定時はプレイヘッド基準）へ追加する。
+    pub(crate) fn prompt_import_media_at(
+        layer_id: Option<LayerId>,
+        target_frame: Option<FrameIndex>,
+        cx: &mut Context<Self>,
+    ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
+            multiple: true,
             prompt: Some(SharedString::from("動画・音声・静止画ファイルを選択")),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.into_iter().next()
+                && !paths.is_empty()
             {
                 let _ = this.update(cx, |view, cx| {
-                    if let Err(err) = view.controller.import_media_file(&path) {
+                    let result = if let Some(frame) = target_frame {
+                        view.controller
+                            .import_media_files_at_drop(&paths, layer_id.as_ref(), Some(frame))
+                            .map(|_| ())
+                    } else if paths.len() == 1 {
+                        view.controller.import_media_file(&paths[0]).map(|_| ())
+                    } else {
+                        let head = view.controller.clock.current_frame();
+                        view.controller
+                            .import_media_files_at_drop(&paths, layer_id.as_ref(), Some(head))
+                            .map(|_| ())
+                    };
+                    if let Err(err) = result {
                         view.controller.status_message = format!("素材追加失敗: {err}");
                     }
                     view.sliders_dirty = true;

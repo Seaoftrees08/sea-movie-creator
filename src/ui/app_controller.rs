@@ -221,6 +221,21 @@ pub fn clamp_timeline_height(window_height: f32, requested: Option<f32>) -> f32 
         .clamp(MIN_TIMELINE_HEIGHT, max_h)
 }
 
+/// タイムライン上の右クリックコンテキストメニュー発生位置情報。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TimelineContextClick {
+    /// 右クリックしたタイムラインフレーム位置。
+    pub frame: FrameIndex,
+    /// 右クリックしたトラックレイヤー ID（ルーラー上では `None`）。
+    pub layer_id: Option<LayerId>,
+    /// 右クリックしたクリップ ID（空き領域上では `None`）。
+    pub clip_id: Option<ClipId>,
+    /// 右クリックしたセグメント番号（クリップ上のみ）。
+    pub segment_index: Option<usize>,
+    /// 右クリックした中間点のエフェクト基準フレーム（中間点上のみ）。
+    pub midpoint_effect_frame: Option<i64>,
+}
+
 /// プロジェクト編集・デコード・再生状態を一元保持するヘッドレスコントローラ。
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppController {
@@ -308,6 +323,8 @@ pub struct AppController {
     pub timeline_drag: Option<crate::ui::timeline_panel::TimelineDragState>,
     /// タイムライン上の一般化ポインタジェスチャ状態（マーキー・中間点・Ctrl複製等）。
     pub timeline_gesture: Option<crate::ui::timeline::state::TimelinePointerGesture>,
+    /// タイムライン右クリックメニュー用のクリック位置スナップショット。
+    pub timeline_context_click: Option<TimelineContextClick>,
     /// タイムラインキャンバスの推定表示幅 (px)。
     pub timeline_viewport_canvas_width_px: f32,
     /// ドキュメント音声状態が変わるたびに単調増加するリビジョン番号。
@@ -405,6 +422,7 @@ impl AppController {
             snap_guide_frame: None,
             timeline_drag: None,
             timeline_gesture: None,
+            timeline_context_click: None,
             timeline_viewport_canvas_width_px: 900.0,
             doc_audio_revision: 1,
             preview_drag: None,
@@ -803,13 +821,27 @@ impl AppController {
             .clone()
             .ok_or_else(|| "分割するクリップが選択されていません".to_owned())?;
         let playhead = self.clock.current_frame();
+        self.split_clip_at_frame(&clip_id, playhead)
+    }
+
+    /// 指定クリップを指定フレーム位置で左右 2 つに非破壊分割する。
+    ///
+    /// # Errors
+    ///
+    /// クリップ不在、レイヤーロック中、または分割位置がクリップ境界外の場合。
+    pub fn split_clip_at_frame(
+        &mut self,
+        clip_id: &ClipId,
+        split_frame: FrameIndex,
+    ) -> Result<(), String> {
         let cmd = EditCommand::SplitClip {
-            clip_id: ClipRef::Id(clip_id),
-            split_at_timeline_frame: playhead,
+            clip_id: ClipRef::Id(clip_id.clone()),
+            split_at_timeline_frame: split_frame,
             right_temp_id: None,
             right_id: None,
         };
         let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
         Ok(())
     }
 
@@ -867,21 +899,34 @@ impl AppController {
     ///
     /// クリップボードが空、または貼り付け失敗時。
     pub fn paste_clipboard_at_playhead(&mut self) -> Result<(), String> {
+        let layer = self.selected_layer_id.clone();
+        let head = self.clock.current_frame();
+        self.paste_clipboard_at(layer.as_ref(), head)
+    }
+
+    /// クリップボード内容を指定トラック・フレーム位置へ衝突回避付きで貼り付ける。
+    ///
+    /// # Errors
+    ///
+    /// クリップボードが空、または貼り付け失敗時。
+    pub fn paste_clipboard_at(
+        &mut self,
+        layer_id: Option<&LayerId>,
+        start_frame: FrameIndex,
+    ) -> Result<(), String> {
         let cb = self
             .clipboard
             .as_ref()
             .ok_or_else(|| "貼り付けるクリップボードが空です".to_owned())?
             .clone();
-        let base_layer = self
-            .selected_layer_id
-            .as_ref()
+        let base_layer = layer_id
+            .or(self.selected_layer_id.as_ref())
             .and_then(|lid| self.document.layers.iter().position(|l| &l.id == lid))
             .unwrap_or(0);
-        let head = self.clock.current_frame();
         let cmd = crate::timeline::clipboard::build_collision_free_paste_command(
             &cb,
             &self.document,
-            head,
+            start_frame,
             base_layer,
         )
         .map_err(|e| e.to_string())?;
@@ -1121,6 +1166,7 @@ impl AppController {
         let was_playing = self.playback_state == PlaybackState::Playing;
         self.playback_state = PlaybackState::Seeking;
         self.clock.seek_to_frame(clamped);
+        self.apply_follow_selected_on_seek();
         self.dirty_preview = true;
         self.refresh_preview_now();
         self.playback_state = if was_playing {
@@ -1150,7 +1196,55 @@ impl AppController {
         }
         let now_frame = self.clock.current_frame().get();
         if self.dirty_preview || self.last_rendered_frame != Some(now_frame) {
+            if self.last_rendered_frame != Some(now_frame) {
+                self.apply_follow_selected_on_seek();
+            }
             self.refresh_preview_now();
+        }
+    }
+
+    /// `follow_selected_on_seek` 有効時、現在フレーム上にある最前面のロック外クリップへ選択を追従する。
+    fn apply_follow_selected_on_seek(&mut self) {
+        if !self.follow_selected_on_seek {
+            return;
+        }
+        let head = self.clock.current_frame().get();
+        if let Some(current_id) = &self.selected_clip_id
+            && let Some((layer, clip)) = self.document.find_clip(current_id)
+            && !layer.locked
+        {
+            let start = clip.timeline_start.get();
+            let end = start.saturating_add(clip.duration.get());
+            if start <= head && head < end {
+                return;
+            }
+        }
+        let pick = self
+            .document
+            .layers
+            .iter()
+            .rev()
+            .filter(|l| !l.locked && l.visible)
+            .chain(
+                self.document
+                    .layers
+                    .iter()
+                    .rev()
+                    .filter(|l| !l.locked && !l.visible),
+            )
+            .find_map(|layer| {
+                layer.clips.iter().find(|c| {
+                    let start = c.timeline_start.get();
+                    let end = start.saturating_add(c.duration.get());
+                    start <= head && head < end
+                })
+            })
+            .map(|c| c.id.clone());
+        if let Some(cid) = pick
+            && self.selected_clip_id.as_ref() != Some(&cid)
+        {
+            self.select_single_clip(Some(cid));
+            self.inspector.invalidate_sync();
         }
     }
 
@@ -1356,6 +1450,9 @@ impl AppController {
     /// 再生位置移動時の選択クリップ追従を切り替える。
     pub fn toggle_follow_selected_on_seek(&mut self) {
         self.follow_selected_on_seek = !self.follow_selected_on_seek;
+        if self.follow_selected_on_seek {
+            self.apply_follow_selected_on_seek();
+        }
     }
 
     /// 時間表示単位 (`Timecode` / `Frames`) を切り替える。
@@ -1412,6 +1509,37 @@ impl AppController {
         self.dispatch_command(&EditCommand::SetSelectionRange { range })
     }
 
+    /// 指定フレームを `[`（選択開始点）として設定する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn set_selection_range_start_at(&mut self, start: FrameIndex) -> Result<String, String> {
+        let end = match self.document.selection_range {
+            Some(existing) if existing.end > start => existing.end,
+            _ => FrameIndex::new(start.get().saturating_add(1)),
+        };
+        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+    }
+
+    /// 指定フレームを `]`（選択終了点、当該フレームを含むため `frame + 1`）として設定する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn set_selection_range_end_at(
+        &mut self,
+        frame_inclusive: FrameIndex,
+    ) -> Result<String, String> {
+        let end = FrameIndex::new(frame_inclusive.get().saturating_add(1));
+        let start = match self.document.selection_range {
+            Some(existing) if existing.start < end => existing.start,
+            Some(_) => FrameIndex::new(end.get().saturating_sub(1)),
+            None => FrameIndex::ZERO,
+        };
+        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+    }
+
     /// 現在の再生位置を `[`（選択開始点）として設定する。
     ///
     /// # Errors
@@ -1419,11 +1547,7 @@ impl AppController {
     /// コマンド適用失敗時。
     pub fn set_selection_range_start_at_playhead(&mut self) -> Result<String, String> {
         let start = self.clock.current_frame();
-        let end = match self.document.selection_range {
-            Some(existing) if existing.end > start => existing.end,
-            _ => FrameIndex::new(start.get().saturating_add(1)),
-        };
-        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+        self.set_selection_range_start_at(start)
     }
 
     /// 現在の再生位置を `]`（選択終了点、当該フレームを含むため `playhead + 1`）として設定する。
@@ -1432,13 +1556,8 @@ impl AppController {
     ///
     /// コマンド適用失敗時。
     pub fn set_selection_range_end_at_playhead(&mut self) -> Result<String, String> {
-        let end = FrameIndex::new(self.clock.current_frame().get().saturating_add(1));
-        let start = match self.document.selection_range {
-            Some(existing) if existing.start < end => existing.start,
-            Some(_) => FrameIndex::new(end.get().saturating_sub(1)),
-            None => FrameIndex::ZERO,
-        };
-        self.set_selection_range(Some(crate::timeline::document::FrameRange { start, end }))
+        let frame = self.clock.current_frame();
+        self.set_selection_range_end_at(frame)
     }
 
     /// 指定クリップの指定エフェクト座標へ中間点を追加する。
@@ -1642,6 +1761,246 @@ impl AppController {
         let _ = self.dispatch_command(&cmd)?;
         self.selected_layer_id = Some(new_id.clone());
         Ok(new_id)
+    }
+
+    /// 指定インデックス位置へ新しいトラックレイヤーを挿入する。
+    ///
+    /// # Errors
+    ///
+    /// コマンド適用失敗時。
+    pub fn insert_layer_at(
+        &mut self,
+        insert_index: usize,
+        name: Option<String>,
+    ) -> Result<LayerId, String> {
+        let new_id =
+            LayerId::new(format!("layer-{}", self.next_seq())).map_err(|e| e.to_string())?;
+        let clamped_idx = insert_index.min(self.document.layers.len());
+        let label = name.unwrap_or_else(|| format!("Track {}", self.document.layers.len() + 1));
+        let cmd = EditCommand::AddLayer {
+            temp_id: None,
+            id: Some(new_id.clone()),
+            name: label,
+            insert_index: Some(clamped_idx),
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.selected_layer_id = Some(new_id.clone());
+        Ok(new_id)
+    }
+
+    /// 右クリック位置等の空き領域へ標準長（既存クリップ衝突時はギャップ幅に縮小）のテキストクリップを挿入する。
+    ///
+    /// # Errors
+    ///
+    /// ロックされたレイヤー上または区間が完全に埋まっている場合。
+    pub fn insert_default_subtitle_at(
+        &mut self,
+        layer_id: Option<&LayerId>,
+        start_frame: FrameIndex,
+    ) -> Result<ClipId, String> {
+        let default_frames = u64::from(self.document.fps.numerator().max(1)) * 5;
+        let clamped_frames = if let Some(lid) = layer_id {
+            let layer = self
+                .document
+                .find_layer(lid)
+                .ok_or_else(|| format!("レイヤー `{lid}` が見つかりません"))?;
+            if layer.locked {
+                return Err(format!("レイヤー `{}` はロックされています", layer.name));
+            }
+            let occupied = layer.clips.iter().any(|c| {
+                let s = c.timeline_start.get();
+                let e = s.saturating_add(c.duration.get());
+                s <= start_frame.get() && start_frame.get() < e
+            });
+            if occupied {
+                return Err("指定フレームにはすでにクリップが存在します".to_owned());
+            }
+            let next_start = layer
+                .clips
+                .iter()
+                .map(|c| c.timeline_start.get())
+                .filter(|&s| s > start_frame.get())
+                .min();
+            match next_start {
+                Some(ns) => default_frames
+                    .min(ns.saturating_sub(start_frame.get()))
+                    .max(1),
+                None => default_frames,
+            }
+        } else {
+            default_frames
+        };
+        let dur = FrameCount::new(clamped_frames).map_err(|e| e.to_string())?;
+        self.add_subtitle_clip_at(layer_id, start_frame, dur, "新しいテキスト")
+    }
+
+    /// 指定クリップの開始位置を現在再生位置へ揃える。
+    ///
+    /// # Errors
+    ///
+    /// 移動先でのクリップ重複やレイヤーロック時。
+    pub fn align_clip_start_to_playhead(&mut self, clip_id: &ClipId) -> Result<(), String> {
+        let head = self.clock.current_frame();
+        let cmd = EditCommand::MoveClip {
+            clip_id: ClipRef::Id(clip_id.clone()),
+            target_layer_id: None,
+            new_timeline_start: head,
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        Ok(())
+    }
+
+    /// 指定クリップの終了位置を現在再生位置へ揃える。
+    ///
+    /// # Errors
+    ///
+    /// 再生位置がクリップ長未満、重複、またはレイヤーロック時。
+    pub fn align_clip_end_to_playhead(&mut self, clip_id: &ClipId) -> Result<(), String> {
+        let (_, clip) = self
+            .document
+            .find_clip(clip_id)
+            .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?;
+        let head = self.clock.current_frame().get();
+        let dur = clip.duration.get();
+        if head < dur {
+            return Err("クリップ長より前の再生位置には末尾を揃えられません".to_owned());
+        }
+        let cmd = EditCommand::MoveClip {
+            clip_id: ClipRef::Id(clip_id.clone()),
+            target_layer_id: None,
+            new_timeline_start: FrameIndex::new(head - dur),
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        Ok(())
+    }
+
+    /// 指定クリップ・スロットを既定値へリセットする (1 Undo)。
+    ///
+    /// # Errors
+    ///
+    /// クリップ不在、スロット不正、またはレイヤーロック時。
+    pub fn reset_clip_slot_to_default(
+        &mut self,
+        clip_id: &ClipId,
+        slot: crate::ui::inspector::InspectorParameterSlot,
+    ) -> Result<(), String> {
+        let cmd = {
+            let (_, clip) = self
+                .document
+                .find_clip(clip_id)
+                .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?;
+            crate::ui::inspector::segment_ops::build_reset_slot_command(clip, slot)?
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 指定クリップ・スロットの現在値で全区間を固定値化する (1 Undo)。
+    ///
+    /// # Errors
+    ///
+    /// クリップ不在、スロット不正、またはレイヤーロック時。
+    pub fn flatten_clip_slot_to_constant(
+        &mut self,
+        clip_id: &ClipId,
+        slot: crate::ui::inspector::InspectorParameterSlot,
+    ) -> Result<(), String> {
+        let head = self.clock.current_frame();
+        let cmd = {
+            let (_, clip) = self
+                .document
+                .find_clip(clip_id)
+                .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?;
+            crate::ui::inspector::segment_ops::build_flatten_slot_command(
+                &self.document,
+                clip,
+                slot,
+                head,
+            )?
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 指定クリップ内のカーブ／数式設定を他スロットへコピーする (1 Undo)。
+    ///
+    /// # Errors
+    ///
+    /// コピー元／コピー先スロット不在、同一スロット、またはレイヤーロック時。
+    pub fn copy_clip_slot_curve(
+        &mut self,
+        clip_id: &ClipId,
+        from_slot: crate::ui::inspector::InspectorParameterSlot,
+        to_slot: crate::ui::inspector::InspectorParameterSlot,
+    ) -> Result<(), String> {
+        let cmd = {
+            let (_, clip) = self
+                .document
+                .find_clip(clip_id)
+                .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?;
+            crate::ui::inspector::segment_ops::build_copy_slot_curve_command(
+                clip, from_slot, to_slot,
+            )?
+        };
+        let _ = self.dispatch_command(&cmd)?;
+        self.inspector.invalidate_sync();
+        Ok(())
+    }
+
+    /// 指定スロットの数式 `f(t)` 編集セクションを展開してアクティブにする。
+    ///
+    /// # Errors
+    ///
+    /// クリップ不在または数式適用失敗時。
+    pub fn activate_slot_expression_editor(
+        &mut self,
+        clip_id: &ClipId,
+        slot: crate::ui::inspector::InspectorParameterSlot,
+    ) -> Result<(), String> {
+        self.select_single_clip(Some(clip_id.clone()));
+        self.inspector.active_slot = slot;
+        self.inspector_sections
+            .insert("expression".to_owned(), true);
+        let needs_switch = self
+            .document
+            .find_clip(clip_id)
+            .and_then(|(_, c)| slot.extract_param(c))
+            .is_some_and(|p| {
+                !matches!(
+                    p,
+                    crate::core::animation::AnimatedParameter::Expression { .. }
+                )
+            });
+        if needs_switch {
+            let cmd = {
+                let (_, clip) = self
+                    .document
+                    .find_clip(clip_id)
+                    .ok_or_else(|| format!("クリップ `{clip_id}` が見つかりません"))?;
+                let edit = crate::ui::inspector::MovementModeEdit {
+                    slot,
+                    preset: crate::ui::inspector::MovementModePreset::Expression,
+                    playhead: self.clock.current_frame(),
+                    bezier_curve: crate::core::animation::EasingCurve::CubicBezier {
+                        x1: self.inspector.bezier_draft.0,
+                        y1: self.inspector.bezier_draft.1,
+                        x2: self.inspector.bezier_draft.2,
+                        y2: self.inspector.bezier_draft.3,
+                    },
+                    scale_aspect_locked: self.scale_aspect_locked,
+                };
+                crate::ui::inspector::build_apply_movement_mode_with_options(
+                    &self.document,
+                    clip,
+                    &edit,
+                )?
+            };
+            let _ = self.dispatch_command(&cmd)?;
+        }
+        self.inspector.invalidate_sync();
+        Ok(())
     }
 
     /// 指定レイヤーを削除する。
@@ -2250,15 +2609,12 @@ impl AppController {
             .open_with_registry(registry, base_dir.as_deref());
     }
 
-    /// 書き出しダイアログの現在設定でバックグラウンドエンコードを開始する。
+    /// 現在のダイアログ設定と `export_selection_only` に基づき [`crate::export::runner::ExportJobRequest`] を構築する。
     ///
     /// # Errors
     ///
-    /// プラグイン／プリセット未選択またはジョブ検証違反時にエラー文字列を返す。
-    pub fn start_export_from_dialog(&mut self) -> Result<(), String> {
-        if self.export_dialog.running_job.is_some() {
-            return Err("すでに書き出しを実行中です".to_owned());
-        }
+    /// プラグイン／プリセット未選択時。
+    pub fn build_export_request(&self) -> Result<crate::export::runner::ExportJobRequest, String> {
         let plugin_id = self
             .export_dialog
             .selected_plugin()
@@ -2272,15 +2628,29 @@ impl AppController {
         let (width, height) = self.export_dialog.resolution.0.dimensions(&self.document);
         let options = self.export_dialog.merged_options();
         let out_path = PathBuf::from(self.export_dialog.output_path.trim());
-        let mut request = crate::export::runner::ExportJobRequest::full_project(
+        let mut request = crate::export::runner::ExportJobRequest::for_document_range(
             &self.document,
             plugin_id,
             preset_id,
             out_path,
             options,
+            self.export_selection_only,
         );
         request.width = width;
         request.height = height;
+        Ok(request)
+    }
+
+    /// 書き出しダイアログの現在設定でバックグラウンドエンコードを開始する。
+    ///
+    /// # Errors
+    ///
+    /// プラグイン／プリセット未選択またはジョブ検証違反時にエラー文字列を返す。
+    pub fn start_export_from_dialog(&mut self) -> Result<(), String> {
+        if self.export_dialog.running_job.is_some() {
+            return Err("すでに書き出しを実行中です".to_owned());
+        }
+        let request = self.build_export_request()?;
 
         let project_dir = self
             .project_path

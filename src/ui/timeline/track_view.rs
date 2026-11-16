@@ -166,8 +166,9 @@ fn render_track_header(
     };
 
     let flags = render_track_flag_buttons(layer, layer_idx, cx);
+    let lid_right = layer.id.clone();
 
-    h_flex()
+    let header = h_flex()
         .id(("track-header", layer_idx))
         .w(px(TRACK_HEADER_WIDTH))
         .h_full()
@@ -185,8 +186,24 @@ fn render_track_header(
                 cx.notify();
             }),
         )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, _, _| {
+                crate::ui::timeline::context_menu::record_header_right_click(
+                    this,
+                    lid_right.clone(),
+                );
+            }),
+        )
         .child(title_box)
-        .child(flags)
+        .child(flags);
+
+    crate::ui::timeline::context_menu::attach_track_header_context_menu(
+        header,
+        layer.id.clone(),
+        layer_idx,
+        cx.entity(),
+    )
 }
 
 fn render_track_flag_buttons(
@@ -296,6 +313,7 @@ fn render_track_lane(
         rgba(0x1b1e_24ff)
     };
     let drop_layer_id = layer.id.clone();
+    let lane_lid_rc = layer.id.clone();
 
     let mut lane = div()
         .id(("timeline-track-lane", layer_idx))
@@ -317,6 +335,16 @@ fn render_track_lane(
             MouseButton::Left,
             cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
                 on_empty_lane_mouse_down(this, evt, layer_idx, row_h, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, evt: &MouseDownEvent, _, _| {
+                crate::ui::timeline::context_menu::record_lane_right_click(
+                    this,
+                    lane_lid_rc.clone(),
+                    f32::from(evt.position.x),
+                );
             }),
         );
 
@@ -343,7 +371,8 @@ fn render_track_lane(
     }
 
     lane = append_lane_drag_ghosts(lane, controller, layer_idx, scroll_x, ppf);
-    append_lane_playhead_and_guides(lane, controller, scroll_x, ppf)
+    let lane = append_lane_playhead_and_guides(lane, controller, scroll_x, ppf);
+    crate::ui::timeline::context_menu::attach_lane_context_menu(lane, layer.id.clone(), cx.entity())
 }
 
 fn on_empty_lane_mouse_down(
@@ -545,17 +574,33 @@ fn render_clip_block(
         ClipKind::Subtitle(sub) if !sub.text.is_empty() => format!("{} [{}]", clip.name, sub.text),
         _ => clip.name.clone(),
     };
-    box_el.child(
-        div()
-            .absolute()
-            .top(px(2.))
-            .left(px(6.))
-            .right(px(6.))
-            .overflow_hidden()
-            .text_size(px(10.))
-            .text_color(rgba(0xf8fa_fcff))
-            .child(label),
-    )
+    let clip_id_rc = clip.id.clone();
+    let clip_id_menu = clip.id.clone();
+    let box_el = box_el
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
+                crate::ui::timeline::context_menu::record_clip_right_click(
+                    this,
+                    clip_id_rc.clone(),
+                    f32::from(evt.position.x),
+                    window,
+                    cx,
+                );
+            }),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left(px(6.))
+                .right(px(6.))
+                .overflow_hidden()
+                .text_size(px(10.))
+                .text_color(rgba(0xf8fa_fcff))
+                .child(label),
+        );
+    crate::ui::timeline::context_menu::attach_clip_context_menu(box_el, clip_id_menu, cx.entity())
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
@@ -711,6 +756,53 @@ fn append_clip_midpoints(
         };
         let x = clip_width_px * ((display_rel - b0) as f32 / span);
         let clip_id_mp = clip.id.clone();
+        let clip_id_mp_rc = clip.id.clone();
+
+        let diamond = div()
+            .id(SharedString::from(format!(
+                "clip-midpoint-diamond:{}_{rel}",
+                clip.id.as_str()
+            )))
+            .absolute()
+            .top(px(1.))
+            .left(px(x - 5.0))
+            .w(px(11.))
+            .h(px(11.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_ew_resize()
+            .text_size(px(10.))
+            .text_color(rgba(0xfef0_8aff))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.controller.select_clip_segment(&clip_id_mp, mp_idx);
+                    if !layer_locked
+                        && let Some((_, snap)) = this.controller.document.find_clip(&clip_id_mp)
+                        && let Some(drag) =
+                            MidpointDragState::begin(snap, rel, f32::from(evt.position.x))
+                    {
+                        this.controller.timeline_gesture =
+                            Some(TimelinePointerGesture::MidpointDrag(drag));
+                    }
+                    this.controller.inspector.invalidate_sync();
+                    this.sync_sliders_now(window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, _| {
+                    crate::ui::timeline::context_menu::record_midpoint_right_click(
+                        this,
+                        clip_id_mp_rc.clone(),
+                        rel,
+                    );
+                }),
+            )
+            .child("◆");
 
         box_el = box_el
             .child(
@@ -723,42 +815,12 @@ fn append_clip_midpoints(
                     .bg(rgba(0xfef0_8acc)),
             )
             .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "clip-midpoint-diamond:{}_{rel}",
-                        clip.id.as_str()
-                    )))
-                    .absolute()
-                    .top(px(1.))
-                    .left(px(x - 5.0))
-                    .w(px(11.))
-                    .h(px(11.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_ew_resize()
-                    .text_size(px(10.))
-                    .text_color(rgba(0xfef0_8aff))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, evt: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.controller.select_clip_segment(&clip_id_mp, mp_idx);
-                            if !layer_locked
-                                && let Some((_, snap)) =
-                                    this.controller.document.find_clip(&clip_id_mp)
-                                && let Some(drag) =
-                                    MidpointDragState::begin(snap, rel, f32::from(evt.position.x))
-                            {
-                                this.controller.timeline_gesture =
-                                    Some(TimelinePointerGesture::MidpointDrag(drag));
-                            }
-                            this.controller.inspector.invalidate_sync();
-                            this.sync_sliders_now(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child("◆"),
+                crate::ui::timeline::context_menu::attach_midpoint_context_menu(
+                    diamond,
+                    clip.id.clone(),
+                    rel,
+                    cx.entity(),
+                ),
             );
     }
     box_el

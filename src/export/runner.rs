@@ -138,18 +138,51 @@ impl ExportJobRequest {
         output_path: PathBuf,
         options: serde_json::Value,
     ) -> Self {
+        Self::for_document_range(doc, plugin_id, preset_id, output_path, options, false)
+    }
+
+    /// 選択範囲限定フラグに応じて `[start_frame, end_frame)` を解決した書き出しリクエストを作成する。
+    #[must_use]
+    pub fn for_document_range(
+        doc: &ProjectDocument,
+        plugin_id: String,
+        preset_id: String,
+        output_path: PathBuf,
+        options: serde_json::Value,
+        selection_only: bool,
+    ) -> Self {
+        let (start_frame, end_frame) = resolve_export_frame_range(doc, selection_only);
         Self {
             plugin_id,
             preset_id,
             output_path,
             width: doc.resolution.width.get(),
             height: doc.resolution.height.get(),
-            start_frame: FrameIndex::ZERO,
-            end_frame: FrameIndex::new(doc.total_duration_frames().max(1)),
+            start_frame,
+            end_frame,
             sample_rate: 48_000,
             options,
         }
     }
+}
+
+/// プロジェクトの総尺および `selection_range` から書き出しフレーム範囲 `[start, end)` を決定する。
+#[must_use]
+pub fn resolve_export_frame_range(
+    doc: &ProjectDocument,
+    selection_only: bool,
+) -> (FrameIndex, FrameIndex) {
+    let total = doc.total_duration_frames().max(1);
+    if selection_only && let Some(range) = doc.selection_range {
+        let clamped_start = range.start.get().min(total.saturating_sub(1));
+        let clamped_end = range
+            .end
+            .get()
+            .max(clamped_start.saturating_add(1))
+            .min(total);
+        return (FrameIndex::new(clamped_start), FrameIndex::new(clamped_end));
+    }
+    (FrameIndex::ZERO, FrameIndex::new(total))
 }
 
 /// 書き出しランナー実行時のエラー型。
@@ -1000,6 +1033,7 @@ fn stream_timeline_to_plugin(
         ctx.request.sample_rate,
     );
     let mut audio_state = AudioFlushState {
+        base_sample: audio_start_base,
         cursor_sample: audio_start_base,
         slot_cursor: 0,
         scratch: Vec::new(),
@@ -1059,6 +1093,7 @@ fn stream_timeline_to_plugin(
 }
 
 struct AudioFlushState {
+    base_sample: u64,
     cursor_sample: u64,
     slot_cursor: u32,
     scratch: Vec<f32>,
@@ -1084,9 +1119,10 @@ fn flush_audio_until(
         );
         let slot_idx = audio.slot_cursor % AUDIO_SLOT_COUNT;
         audio.slot_cursor = audio.slot_cursor.wrapping_add(1);
+        let rel_start_sample = audio.cursor_sample.saturating_sub(audio.base_sample);
         ctx.session.submit_audio_chunk(
             slot_idx,
-            audio.cursor_sample,
+            rel_start_sample,
             &audio.scratch,
             AUDIO_CHANNELS,
             ctx.cancel,

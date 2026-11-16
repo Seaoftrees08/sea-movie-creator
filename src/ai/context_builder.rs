@@ -6,7 +6,9 @@ use crate::ai::provider::{AiChatMessage, AiError, AiRequest};
 use crate::core::ids::{ClipId, LayerId};
 use crate::core::schema::edit_command_schema_json;
 use crate::core::time::FrameIndex;
-use crate::timeline::document::{AssetKind, AssetStatus, ClipKind, ProjectDocument};
+use crate::timeline::document::{
+    AssetKind, AssetStatus, ClipKind, ProjectDocument, TimelineLengthMode,
+};
 
 /// AI プロンプトへ渡す素材要約。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,12 +46,28 @@ pub struct ClipSummary {
     pub duration_frames: u64,
     /// エフェクト基準フレームオフセット。
     pub effect_offset_frames: i64,
+    /// クリップ内中間点のエフェクト基準フレーム一覧。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midpoints: Vec<i64>,
     /// 参照素材 ID（字幕は `None`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
     /// 字幕本文の先頭抜粋（字幕クリップのみ）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_excerpt: Option<String>,
+}
+
+/// タイムライン総尺設定の AI 要約表現。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TimelineLengthSummary {
+    /// 最終クリップ末尾へ自動追従。
+    AutoToLastClip,
+    /// 手動指定終了フレーム。
+    Manual {
+        /// 手動終了フレーム番号。
+        end_frame: u64,
+    },
 }
 
 /// AI プロンプトへ渡すレイヤー要約。
@@ -82,6 +100,11 @@ pub struct TimelineContextSummary {
     pub fps: [u32; 2],
     /// タイムライン総フレーム数。
     pub total_duration_frames: u64,
+    /// タイムライン総尺設定 (`auto_to_last_clip` / `manual`)。
+    pub timeline_length: TimelineLengthSummary,
+    /// タイムライン上の選択範囲 `[start, end)`（未設定時は `None`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_range_frames: Option<[u64; 2]>,
     /// 現在再生位置（フレーム）。
     pub playhead_frame: u64,
     /// 現在再生位置（秒）。
@@ -155,11 +178,23 @@ pub fn build_timeline_context(
     #[allow(clippy::cast_precision_loss)]
     let playhead_seconds = (playhead.get() as f64) / doc.fps.as_f64();
 
+    let timeline_length = match doc.timeline_length {
+        TimelineLengthMode::AutoToLastClip => TimelineLengthSummary::AutoToLastClip,
+        TimelineLengthMode::Manual { end_frame } => TimelineLengthSummary::Manual {
+            end_frame: end_frame.get(),
+        },
+    };
+    let selection_range_frames = doc
+        .selection_range
+        .map(|range| [range.start.get(), range.end.get()]);
+
     TimelineContextSummary {
         project_name: doc.name.clone(),
         resolution: [doc.resolution.width.get(), doc.resolution.height.get()],
         fps: [doc.fps.numerator(), doc.fps.denominator()],
         total_duration_frames: doc.total_duration_frames(),
+        timeline_length,
+        selection_range_frames,
         playhead_frame: playhead.get(),
         playhead_seconds,
         selected_layer_id: selected_layer.map(|id| id.as_str().to_owned()),
@@ -189,6 +224,7 @@ fn summarize_clip(clip: &crate::timeline::document::Clip) -> ClipSummary {
         timeline_end_frame: start.saturating_add(dur),
         duration_frames: dur,
         effect_offset_frames: clip.effect_offset_frames,
+        midpoints: clip.midpoints.clone(),
         asset_id,
         subtitle_excerpt,
     }
@@ -218,7 +254,8 @@ pub fn default_editor_system_prompt() -> String {
         "3. When creating items and referencing them in the same turn, wrap steps in {\"type\":\"batch\",\"commands\":[...]} ",
         "using temp_id (e.g. \"$c1\") with ClipRef::Temp ({\"temp\":\"$c1\"}) / LayerRef::Temp.\n",
         "4. Use SetParameter with typed ParameterValue (animated, text, bool, number, color, text_alignment, blend_mode), ",
-        "and use SetPlaybackRate to change playback speed safely.\n",
+        "SetPlaybackRate to change playback speed safely, SetTimelineLength / SetSelectionRange for project range management, ",
+        "and AddMidpoint / MoveMidpoint / RemoveMidpoint (with interior effect_frame) for AviUtl-style clip segment midpoints.\n",
         "5. Only reference asset/layer/clip IDs that exist in the Current Timeline Context or were defined earlier in the same batch.\n",
         "6. For questions, greetings, or checks requiring no timeline edits (such as \"ping\"), ",
         "give a brief answer either before a ```json code block or inside a \"message\" field, paired with {\"type\":\"batch\",\"commands\":[]}."

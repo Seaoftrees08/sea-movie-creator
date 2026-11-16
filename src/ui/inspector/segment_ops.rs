@@ -1883,6 +1883,138 @@ pub(crate) fn set_animated_command(
     }
 }
 
+/// 指定スロットを既定値の固定値へ戻すコマンドを構築する。
+///
+/// # Errors
+///
+/// 指定クリップに該当スロットが存在しない場合。
+pub fn build_reset_slot_command(
+    clip: &Clip,
+    slot: InspectorParameterSlot,
+) -> Result<EditCommand, String> {
+    if slot.extract_param(clip).is_none() {
+        return Err(format!(
+            "クリップに `{}` スロットがありません",
+            slot.label()
+        ));
+    }
+    Ok(set_animated_command(
+        clip,
+        slot,
+        AnimatedParameter::constant(slot.default_internal_value()),
+    ))
+}
+
+/// 指定スロットの現在フレーム評価値を使い、全区間（中間点含む）を同じ固定値にするコマンドを構築する。
+///
+/// # Errors
+///
+/// 指定クリップに該当スロットが存在しないか、現在値評価が非有限になった場合。
+pub fn build_flatten_slot_command(
+    doc: &ProjectDocument,
+    clip: &Clip,
+    slot: InspectorParameterSlot,
+    playhead: FrameIndex,
+) -> Result<EditCommand, String> {
+    let param = slot
+        .extract_param(clip)
+        .ok_or_else(|| format!("クリップに `{}` スロットがありません", slot.label()))?;
+    let local_frame = playhead.get().saturating_sub(clip.timeline_start.get());
+    let max_local = clip.duration.get().saturating_sub(1);
+    let effect_dur = clip.effect_duration_frames.unwrap_or(clip.duration);
+    let ctx = EvaluationContext::new(
+        local_frame.min(max_local),
+        clip.effect_offset_frames,
+        effect_dur,
+        doc.fps,
+    );
+    let evaluated = param
+        .evaluate(ctx)
+        .unwrap_or_else(|_| slot.default_internal_value());
+    if !evaluated.is_finite() {
+        return Err("固定化する評価値が有限値ではありません".to_owned());
+    }
+    Ok(set_animated_command(
+        clip,
+        slot,
+        AnimatedParameter::constant(evaluated),
+    ))
+}
+
+fn remap_param_between_slots(
+    param: &AnimatedParameter,
+    from: InspectorParameterSlot,
+    to: InspectorParameterSlot,
+) -> AnimatedParameter {
+    if from == to {
+        return param.clone();
+    }
+    let convert = |internal: f64| -> f64 {
+        let ui = from.internal_to_ui(internal);
+        let mapped = to.ui_to_internal(ui);
+        if mapped.is_finite() {
+            mapped
+        } else {
+            to.default_internal_value()
+        }
+    };
+    match param {
+        AnimatedParameter::Constant { value } => AnimatedParameter::constant(convert(*value)),
+        AnimatedParameter::Easing {
+            start_value,
+            end_value,
+            curve,
+            extrapolation,
+        } => AnimatedParameter::Easing {
+            start_value: convert(*start_value),
+            end_value: convert(*end_value),
+            curve: *curve,
+            extrapolation: *extrapolation,
+        },
+        AnimatedParameter::Keyframes {
+            keyframes,
+            extrapolation,
+        } => AnimatedParameter::Keyframes {
+            keyframes: keyframes
+                .iter()
+                .map(|kf| Keyframe::with_easing(kf.frame, convert(kf.value), kf.easing))
+                .collect(),
+            extrapolation: *extrapolation,
+        },
+        AnimatedParameter::Expression {
+            expr,
+            base_offset,
+            scale,
+        } => AnimatedParameter::expression_with_tuning(expr.clone(), *base_offset, *scale),
+    }
+}
+
+/// クリップ内の別スロットへカーブ（キーフレーム／イージング／数式）をコピーするコマンドを構築する。
+///
+/// # Errors
+///
+/// コピー元またはコピー先スロットが存在しない、または同一スロットが指定された場合。
+pub fn build_copy_slot_curve_command(
+    clip: &Clip,
+    from_slot: InspectorParameterSlot,
+    to_slot: InspectorParameterSlot,
+) -> Result<EditCommand, String> {
+    if from_slot == to_slot {
+        return Err("同一スロットへはコピーできません".to_owned());
+    }
+    let source = from_slot
+        .extract_param(clip)
+        .ok_or_else(|| format!("クリップに `{}` スロットがありません", from_slot.label()))?;
+    if to_slot.extract_param(clip).is_none() {
+        return Err(format!(
+            "クリップに `{}` スロットがありません",
+            to_slot.label()
+        ));
+    }
+    let mapped = remap_param_between_slots(source, from_slot, to_slot);
+    Ok(set_animated_command(clip, to_slot, mapped))
+}
+
 /// ドラッグ開始前に元の状態から `Keyframes` を含む整合済みドキュメントへ復元するための補助。
 pub fn align_clip_after_transient_edit(clip: &mut Clip, fps: FrameRate) {
     sync_and_align_clip_keyframes(clip, fps);

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement as _,
@@ -409,7 +409,133 @@ pub fn render_trackbar_row(
         wrapper = wrapper.child(render_inline_bezier_row(clip, &view, bank, theme, cx));
     }
 
-    wrapper.into_any_element()
+    attach_trackbar_row_context_menu(wrapper, &clip.id, slot, cx).into_any_element()
+}
+
+fn attach_trackbar_row_context_menu(
+    wrapper: gpui_kit::Div,
+    clip_id: &ClipId,
+    slot: InspectorParameterSlot,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement {
+    let win_entity = cx.entity().clone();
+    let cid = clip_id.clone();
+    let row_key = row_base_id(slot);
+
+    wrapper
+        .id(("tb-row", row_key))
+        .context_menu(move |menu: PopupMenu, window, cx| {
+            let snap = win_entity.read(cx);
+            let Some((layer, clip)) = snap.controller.document.find_clip(&cid) else {
+                return menu;
+            };
+            let locked = layer.locked;
+            let other_slots: Vec<InspectorParameterSlot> =
+                InspectorParameterSlot::available_for(clip)
+                    .into_iter()
+                    .filter(|&s| s != slot)
+                    .collect();
+
+            build_trackbar_context_popup(
+                menu,
+                &cid,
+                slot,
+                locked,
+                &other_slots,
+                &win_entity,
+                window,
+                cx,
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_trackbar_context_popup(
+    menu: PopupMenu,
+    clip_id: &ClipId,
+    slot: InspectorParameterSlot,
+    locked: bool,
+    other_slots: &[InspectorParameterSlot],
+    win: &Entity<SeaEditorWindow>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let cid_reset = clip_id.clone();
+    let cid_flat = clip_id.clone();
+    let cid_expr = clip_id.clone();
+    let cid_copy = clip_id.clone();
+    let w_reset = win.clone();
+    let w_flat = win.clone();
+    let w_expr = win.clone();
+    let w_copy = win.clone();
+    let targets = other_slots.to_vec();
+
+    menu.item(
+        PopupMenuItem::new("既定値に戻す")
+            .disabled(locked)
+            .on_click(move |_, window, cx| {
+                w_reset.update(cx, |this, cx| {
+                    let _ = this.controller.reset_clip_slot_to_default(&cid_reset, slot);
+                    this.sync_sliders_now(window, cx);
+                    cx.notify();
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new("全区間の値を同じにする")
+            .disabled(locked)
+            .on_click(move |_, window, cx| {
+                w_flat.update(cx, |this, cx| {
+                    let _ = this
+                        .controller
+                        .flatten_clip_slot_to_constant(&cid_flat, slot);
+                    this.sync_sliders_now(window, cx);
+                    cx.notify();
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new("数式 f(t) で編集...")
+            .disabled(locked)
+            .on_click(move |_, window, cx| {
+                w_expr.update(cx, |this, cx| {
+                    let _ = this
+                        .controller
+                        .activate_slot_expression_editor(&cid_expr, slot);
+                    this.sync_sliders_now(window, cx);
+                    cx.notify();
+                });
+            }),
+    )
+    .separator()
+    .submenu(
+        "他スロットへカーブをコピー",
+        window,
+        cx,
+        move |mut sub, _, _| {
+            if targets.is_empty() {
+                return sub.item(PopupMenuItem::new("コピー先なし").disabled(true));
+            }
+            for &target_slot in &targets {
+                let cid_c = cid_copy.clone();
+                let w_c = w_copy.clone();
+                sub = sub.item(
+                    PopupMenuItem::new(target_slot.label())
+                        .disabled(locked)
+                        .on_click(move |_, window, cx| {
+                            w_c.update(cx, |this, cx| {
+                                let _ =
+                                    this.controller
+                                        .copy_clip_slot_curve(&cid_c, slot, target_slot);
+                                this.sync_sliders_now(window, cx);
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            sub
+        },
+    )
 }
 
 #[allow(clippy::cast_precision_loss)]

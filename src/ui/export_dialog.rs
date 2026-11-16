@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     Context, Div, InteractiveElement as _, ParentElement as _, Styled as _, div, px, rgba,
 };
@@ -544,15 +544,70 @@ fn render_resolution_selector(
     }
     let (w, h) = state.resolution.0.dimensions(&controller.document);
     let total_frames = controller.document.total_duration_frames().max(1);
+    let (range_start, range_end) = crate::export::runner::resolve_export_frame_range(
+        &controller.document,
+        controller.export_selection_only,
+    );
+    let export_frames = range_end.get().saturating_sub(range_start.get());
     v_flex()
         .gap_1()
+        .child(render_range_selector_row(controller, is_busy, cx))
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(format!("出力解像度: {w}x{h} / 総尺: {total_frames}f")),
+                .child(format!(
+                    "出力解像度: {w}x{h} / 範囲: {}..{} ({export_frames}f / 総尺 {total_frames}f)",
+                    range_start.get(),
+                    range_end.get()
+                )),
         )
         .child(row)
+}
+
+fn render_range_selector_row(
+    controller: &AppController,
+    is_busy: bool,
+    cx: &mut Context<SeaEditorWindow>,
+) -> Div {
+    let has_selection = controller.document.selection_range.is_some();
+    let sel_only = controller.export_selection_only && has_selection;
+
+    let mut full_btn = Button::new("exp-range-full")
+        .xsmall()
+        .label("プロジェクト全体");
+    full_btn = if sel_only {
+        full_btn.outline()
+    } else {
+        full_btn.primary()
+    };
+    if !is_busy {
+        full_btn = full_btn.on_click(cx.listener(|this, _, _, cx| {
+            this.controller.export_selection_only = false;
+            cx.notify();
+        }));
+    }
+
+    let sel_label = match controller.document.selection_range {
+        Some(r) => format!("選択範囲のみ ({}..{})", r.start.get(), r.end.get()),
+        None => "選択範囲のみ (未設定)".to_owned(),
+    };
+    let mut sel_btn = Button::new("exp-range-sel").xsmall().label(sel_label);
+    sel_btn = if sel_only {
+        sel_btn.primary()
+    } else {
+        sel_btn.outline()
+    };
+    if !has_selection || is_busy {
+        sel_btn = sel_btn.disabled(true);
+    } else {
+        sel_btn = sel_btn.on_click(cx.listener(|this, _, _, cx| {
+            this.controller.export_selection_only = true;
+            cx.notify();
+        }));
+    }
+
+    h_flex().gap_2().child(full_btn).child(sel_btn)
 }
 
 fn render_option_fields(
