@@ -30,6 +30,12 @@ use vst3::Steinberg::{
 
 const SPEAKER_STEREO: SpeakerArrangement = 0x3;
 
+/// `vst3` クレートの列挙定数は環境（MSVC と GCC/Clang）により `i32` / `u32` が異なるため、`i32` へ揃える。
+#[inline]
+fn vst3_i32<T: Into<i64>>(value: T) -> i32 {
+    i32::try_from(value.into()).unwrap_or_default()
+}
+
 /// ロード済み `VST3` プラグインインスタンス（シングルワーカースレッド所有）。
 ///
 /// フィールド宣言順により、COM ポインタ群が解放されたあとに `_library` がアンロードされる。
@@ -114,15 +120,15 @@ impl Vst3HostedPlugin {
             if component.initialize(null_mut()) != kResultOk {
                 return Err("VST3 IComponent::initialize failed".to_owned());
             }
-            let _ = component.activateBus(kAudio, kInput, 0, 1);
-            let _ = component.activateBus(kAudio, kOutput, 0, 1);
+            let _ = component.activateBus(vst3_i32(kAudio), vst3_i32(kInput), 0, 1);
+            let _ = component.activateBus(vst3_i32(kAudio), vst3_i32(kOutput), 0, 1);
             let mut in_arr = SPEAKER_STEREO;
             let mut out_arr = SPEAKER_STEREO;
             let _ = processor.setBusArrangements(&raw mut in_arr, 1, &raw mut out_arr, 1);
 
             let mut setup = ProcessSetup {
-                processMode: kRealtime,
-                symbolicSampleSize: kSample32,
+                processMode: vst3_i32(kRealtime),
+                symbolicSampleSize: vst3_i32(kSample32),
                 maxSamplesPerBlock: i32::try_from(max_block_frames.max(1)).unwrap_or(4096),
                 sampleRate: f64::from(sample_rate.max(1)),
             };
@@ -231,8 +237,8 @@ impl Vst3HostedPlugin {
         };
 
         let mut data = ProcessData {
-            processMode: kRealtime,
-            symbolicSampleSize: kSample32,
+            processMode: vst3_i32(kRealtime),
+            symbolicSampleSize: vst3_i32(kSample32),
             numSamples: frames as i32,
             numInputs: 1,
             numOutputs: 1,

@@ -13,7 +13,10 @@ targets = [
 [advisories]
 yanked = "warn"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "Linux AT-SPI 経由 (gpui-kit -> accesskit_unix -> atspi -> zbus_xml 5.1.0) の推移的依存であり、zbus_xml が quick-xml ^0.38 を固定しているため。外部 XML 解析には未使用。" },
+    { id = "RUSTSEC-2026-0195", reason = "Linux AT-SPI 経由 (gpui-kit -> accesskit_unix -> atspi -> zbus_xml 5.1.0) の推移的依存であり、zbus_xml が quick-xml ^0.38 を固定しているため。外部 XML 解析には未使用。" },
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -30,7 +33,6 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "BSL-1.0",
-    "NCSA",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
     "MPL-2.0",
@@ -39,6 +41,7 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
