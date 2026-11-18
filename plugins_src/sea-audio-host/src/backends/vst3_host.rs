@@ -427,11 +427,12 @@ fn encode_tuid_hex(cid: &[i8; 16]) -> String {
 #[cfg(target_os = "windows")]
 fn run_platform_module_init(library: &Library) -> Result<(), String> {
     type InitFn = unsafe extern "system" fn() -> bool;
-    // SAFETY: 任意シンボル `InitDll` が存在する場合のみ呼び出す。
-    if let Ok(init_fn) = unsafe { library.get::<InitFn>(b"InitDll\0") }
-        && !unsafe { init_fn() }
-    {
-        return Err("VST3 InitDll returned false".to_owned());
+    // SAFETY: 任意シンボル `InitDll` が存在する場合のみ取得する。
+    if let Ok(init_fn) = unsafe { library.get::<InitFn>(b"InitDll\0") } {
+        // SAFETY: `library` が生存している間のみ VST3 Windows 初期化エントリポイントを呼び出す。
+        if !unsafe { init_fn() } {
+            return Err("VST3 InitDll returned false".to_owned());
+        }
     }
     Ok(())
 }
@@ -444,11 +445,12 @@ fn run_platform_module_init(library: &Library) -> Result<(), String> {
     } else {
         b"ModuleEntry\0".as_slice()
     };
-    // SAFETY: プラットフォーム標準エントリーが存在する場合のみ NULL/ハンドル相当を適切に渡す。
-    if let Ok(entry) = unsafe { library.get::<EntryFn>(sym) }
-        && !unsafe { entry(null_mut()) }
-    {
-        return Err("VST3 module entry returned false".to_owned());
+    // SAFETY: プラットフォーム標準エントリーシンボルを探索する。
+    if let Ok(entry) = unsafe { library.get::<EntryFn>(sym) } {
+        // SAFETY: プラットフォーム標準エントリーが存在する場合のみ NULL/ハンドル相当を適切に渡して呼び出す。
+        if !unsafe { entry(null_mut()) } {
+            return Err("VST3 module entry returned false".to_owned());
+        }
     }
     Ok(())
 }
@@ -456,8 +458,9 @@ fn run_platform_module_init(library: &Library) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn run_platform_module_exit(library: &Library) {
     type ExitFn = unsafe extern "system" fn() -> bool;
-    // SAFETY: `InitDll` 対応シンボルがあれば終了時に呼ぶ。
+    // SAFETY: `InitDll` 対応シンボルがあれば取得する。
     if let Ok(exit_fn) = unsafe { library.get::<ExitFn>(b"ExitDll\0") } {
+        // SAFETY: `library` がアンロードされる前に終了用 `ExitDll` を呼び出す。
         let _ = unsafe { exit_fn() };
     }
 }
@@ -470,8 +473,9 @@ fn run_platform_module_exit(library: &Library) {
     } else {
         b"ModuleExit\0".as_slice()
     };
-    // SAFETY: 対応終了シンボルがあれば呼ぶ。
+    // SAFETY: 対応終了シンボルがあれば取得する。
     if let Ok(exit_fn) = unsafe { library.get::<ExitFn>(sym) } {
+        // SAFETY: `library` がアンロードされる前にプラットフォーム標準の終了シンボルを呼び出す。
         let _ = unsafe { exit_fn() };
     }
 }

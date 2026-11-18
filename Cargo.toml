@@ -52,6 +52,7 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
 
 [package]

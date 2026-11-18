@@ -321,8 +321,9 @@ mod imp {
         let attrs =
             attrs.ok_or_else(|| "MFCreateAttributes が空ポインタを返しました".to_owned())?;
 
-        // SAFETY: HW MFT 優先フラグと非スロットリング設定を有効化する。
         (|| -> windows::core::Result<()> {
+            // SAFETY: `attrs` は直前の `MFCreateAttributes` で確保した有効な COM オブジェクトであり、
+            // 既知の属性 GUID 参照と `u32` 値を渡している。
             unsafe {
                 attrs.SetUINT32(
                     &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
@@ -418,8 +419,9 @@ mod imp {
         frame_rate: u64,
         aspect_ratio: u64,
     ) -> Result<(), String> {
-        // SAFETY: `IMFMediaType` に有効な映像フォーマット GUID および解像度・FPS を設定する。
         (|| -> windows::core::Result<()> {
+            // SAFETY: `media_type` と `subtype` は呼び出し元から渡された有効な COM/GUID 参照であり、
+            // 映像フォーマット GUID とパック済み解像度・FPS の値を設定する。
             unsafe {
                 media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
                 media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
@@ -442,8 +444,9 @@ mod imp {
         // SAFETY: 出力音声型 (`MFAudioFormat_AAC`) を生成する。
         let out_type = unsafe { MFCreateMediaType() }
             .map_err(|err| format!("出力音声 IMFMediaType 作成失敗: {err}"))?;
-        // SAFETY: Windows AAC MFT が要求する 16bit / raw payload / 許可ビットレート(bytes/sec)を設定する。
         (|| -> windows::core::Result<()> {
+            // SAFETY: `out_type` は直前の `MFCreateMediaType` で確保した有効な COM オブジェクトであり、
+            // Windows AAC MFT が要求する 16bit / raw payload / ビットレート属性を設定する。
             unsafe {
                 out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
                 out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
@@ -466,8 +469,9 @@ mod imp {
             .map_err(|err| format!("入力音声 IMFMediaType 作成失敗: {err}"))?;
         let block_align = channels.saturating_mul(2);
         let avg_bytes_per_sec = sample_rate.saturating_mul(block_align);
-        // SAFETY: 16bit signed PCM 入力属性を設定する。
         (|| -> windows::core::Result<()> {
+            // SAFETY: `in_type` は直前の `MFCreateMediaType` で確保した有効な COM オブジェクトであり、
+            // 16bit signed PCM 入力属性を設定する。
             unsafe {
                 in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
                 in_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
@@ -516,8 +520,9 @@ mod imp {
         // SAFETY: `IMFSample` を作成し、バッファ・時刻・継続時間を割り当てる。
         let sample =
             unsafe { MFCreateSample() }.map_err(|err| format!("MFCreateSample 失敗: {err}"))?;
-        // SAFETY: `sample` は有効な新規 COM オブジェクトである。
         (|| -> windows::core::Result<()> {
+            // SAFETY: `sample` と `buffer` はそれぞれ直前の `MFCreateSample` / `MFCreateMemoryBuffer` で
+            // 確保した有効な COM オブジェクトであり、バッファと時刻・継続時間を割り当てる。
             unsafe {
                 sample.AddBuffer(&buffer)?;
                 sample.SetSampleTime(pts_hns)?;
