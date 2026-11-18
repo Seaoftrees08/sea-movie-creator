@@ -11,6 +11,7 @@
 - **設計ドキュメントとの整合性**:
   - 機能追加や設計変更を行う前に、まず `dev-doc/` 配下の関連設計書および `docs/` を確認すること。
   - 実装と設計に乖離が生じた場合は、コードだけでなく `dev-doc/`（設計意図）や `docs/`（利用者向け説明）の更新も提案・実施すること。
+  - 対象の設計書に基づく実装がすべて完了したら、ステータスを `Implemented` に更新したうえで該当の設計書ファイル（またはフォルダ）を `dev-doc/completed/` へ移動し、`dev-doc/README.md` と設計書内の相対リンクを更新すること。
 
 ## 2. ワークフロー
 
@@ -22,7 +23,7 @@
    - **着手前のブランチ確認・worktree 隔離**: 編集を伴う作業を始める前に現在ブランチを確認し、`main` / `master` 上にいる場合は直接編集せず、`general.instructions.md` の手順に従って `.worktrees/` 配下に `git worktree` と作業ブランチを作成し、以後の編集・テスト・コミットをすべてその worktree 内で完結させること（既に作業ブランチや別 worktree にいる場合はそのまま進める）。
    - 最小限かつ明確な変更を心がけ、既存コメントや無関係なコードへの不要な変更を避ける。
 4. **検証（Verify）**:
-   - プログラムを作成・変更した際は、完了前に必ず「見た目の自動整形（`cargo fmt --check`）」「ミスの自動検出（`cargo clippy`）」「すべてのテスト実行（`cargo test`）」を実行し、警告やエラーがゼロであることを確認する。
+   - プログラムを作成・変更した際は、完了前に必ず `scripts/pre-pr.ps1`（または `scripts/pre-pr.sh`）相当の品質チェック（`cargo fmt --all --check`・`cargo clippy --workspace --all-targets --all-features -- -D warnings`・`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`・`cargo build --workspace --all-targets`・`cargo test --workspace --all-targets --all-features`）を実行し、警告やエラーがゼロであることを確認する。
    - 実際に確認した範囲と結果のみを報告する。未実行のテストを「通過した」と報告しない。
 
 ## 3. コーディング品質基準
@@ -51,11 +52,13 @@
   - ルートの `rustfmt.toml`、`clippy.toml`、および `Cargo.toml` の `[lints]` 設定に従ってコードを維持すること。
   - 理由なく `#[allow(...)]` でリント警告を抑制しないこと（やむを得ず抑制する場合は理由を日本語コメントで明記する）。
 - **作業完了時の必須チェック**:
-  - プログラムを作成・変更した際は、作業完了前に必ず以下のコマンドをすべて実行し、警告・エラーがゼロであることを確認すること（Workspace 導入後は `--workspace` を含める）。
-    1. 見た目の自動整形: `cargo fmt --check`（差分がある場合は `cargo fmt` で整形後に再確認）
-    2. ミスの自動検出: `cargo clippy --all-targets --all-features -- -D warnings`（Workspace 導入後は `--workspace --all-targets --all-features -- -D warnings`、各メンバー `Cargo.toml` には `[lints] workspace = true` を必須設定）
-    3. ビルドおよびすべてのテスト実行: Workspace 導入後はプラグインバイナリ欠損を防ぐため `cargo build --workspace --all-targets` のうえで `cargo test --workspace --all-targets --all-features`（導入前は `cargo test --all-targets --all-features`）
-  - 実 GPU・OS HW エンコーダ・実外部 CLI 等に依存しヘッドレス CI で実行不可なテストには `#[ignore = "理由"]` を付与し、通常の `cargo test --all-targets --all-features` が環境依存なく全通過する状態を維持する（実機検証時は `cargo test -- --ignored` を併用）。
+  - プログラムを作成・変更した際は、PR 作成前・作業完了前に必ず以下のコマンドをすべて実行し、警告・エラーがゼロであることを確認すること（一括実行スクリプト `scripts/pre-pr.ps1` / `scripts/pre-pr.sh` を利用可）。
+    1. 見た目の自動整形: `cargo fmt --all --check`（差分がある場合は `cargo fmt --all` で整形後に再確認）
+    2. ミスの自動検出: `cargo clippy --workspace --all-targets --all-features -- -D warnings`（各メンバー `Cargo.toml` には `[lints] workspace = true` を必須設定）
+    3. ドキュメント警告ゼロ: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
+    4. ビルドおよび全テスト実行: プラグインバイナリ欠損を防ぐため `cargo build --workspace --all-targets` のうえで `cargo test --workspace --all-targets --all-features`（`tests/quality_gates.rs` の規約・整合テストを含む）
+    5. 依存関係・ライセンス監査（導入環境 / CI）: `cargo deny check`（`deny.toml` 準拠）
+  - 実 GPU・OS HW エンコーダ・実外部 CLI 等に依存しヘッドレス CI で実行不可なテストには `#[ignore = "理由"]` を付与し、通常の `cargo test --workspace --all-targets --all-features` が環境依存なく全通過する状態を維持する（実機検証時は `cargo test -- --ignored` を併用）。
 - **テストの配置ルール**:
   - **部品ごとの小さなテスト（単体テスト）**: 各部品の `.rs` ファイル内の最後に `#[cfg(test)] mod tests { ... }` として記述すること。
   - **組み合わせテスト・全体テスト（結合テスト）**: `tests/<実装名>/` フォルダ内に記述し、自動テスト（`cargo test`）および `cargo fmt` で確実に認識されるよう入り口となる `tests/<実装名>.rs` と `tests/<実装名>/mod.rs` をあわせて配置すること。

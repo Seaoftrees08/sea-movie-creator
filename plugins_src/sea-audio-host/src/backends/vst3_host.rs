@@ -30,6 +30,12 @@ use vst3::Steinberg::{
 
 const SPEAKER_STEREO: SpeakerArrangement = 0x3;
 
+/// `vst3` クレートの列挙定数は環境（MSVC と GCC/Clang）により `i32` / `u32` が異なるため、`i32` へ揃える。
+#[inline]
+fn vst3_i32<T: Into<i64>>(value: T) -> i32 {
+    i32::try_from(value.into()).unwrap_or_default()
+}
+
 /// ロード済み `VST3` プラグインインスタンス（シングルワーカースレッド所有）。
 ///
 /// フィールド宣言順により、COM ポインタ群が解放されたあとに `_library` がアンロードされる。
@@ -114,15 +120,15 @@ impl Vst3HostedPlugin {
             if component.initialize(null_mut()) != kResultOk {
                 return Err("VST3 IComponent::initialize failed".to_owned());
             }
-            let _ = component.activateBus(kAudio, kInput, 0, 1);
-            let _ = component.activateBus(kAudio, kOutput, 0, 1);
+            let _ = component.activateBus(vst3_i32(kAudio), vst3_i32(kInput), 0, 1);
+            let _ = component.activateBus(vst3_i32(kAudio), vst3_i32(kOutput), 0, 1);
             let mut in_arr = SPEAKER_STEREO;
             let mut out_arr = SPEAKER_STEREO;
             let _ = processor.setBusArrangements(&raw mut in_arr, 1, &raw mut out_arr, 1);
 
             let mut setup = ProcessSetup {
-                processMode: kRealtime,
-                symbolicSampleSize: kSample32,
+                processMode: vst3_i32(kRealtime),
+                symbolicSampleSize: vst3_i32(kSample32),
                 maxSamplesPerBlock: i32::try_from(max_block_frames.max(1)).unwrap_or(4096),
                 sampleRate: f64::from(sample_rate.max(1)),
             };
@@ -231,8 +237,8 @@ impl Vst3HostedPlugin {
         };
 
         let mut data = ProcessData {
-            processMode: kRealtime,
-            symbolicSampleSize: kSample32,
+            processMode: vst3_i32(kRealtime),
+            symbolicSampleSize: vst3_i32(kSample32),
             numSamples: frames as i32,
             numInputs: 1,
             numOutputs: 1,
@@ -427,11 +433,12 @@ fn encode_tuid_hex(cid: &[i8; 16]) -> String {
 #[cfg(target_os = "windows")]
 fn run_platform_module_init(library: &Library) -> Result<(), String> {
     type InitFn = unsafe extern "system" fn() -> bool;
-    // SAFETY: 任意シンボル `InitDll` が存在する場合のみ呼び出す。
-    if let Ok(init_fn) = unsafe { library.get::<InitFn>(b"InitDll\0") }
-        && !unsafe { init_fn() }
-    {
-        return Err("VST3 InitDll returned false".to_owned());
+    // SAFETY: 任意シンボル `InitDll` が存在する場合のみ取得する。
+    if let Ok(init_fn) = unsafe { library.get::<InitFn>(b"InitDll\0") } {
+        // SAFETY: `library` が生存している間のみ VST3 Windows 初期化エントリポイントを呼び出す。
+        if !unsafe { init_fn() } {
+            return Err("VST3 InitDll returned false".to_owned());
+        }
     }
     Ok(())
 }
@@ -444,11 +451,12 @@ fn run_platform_module_init(library: &Library) -> Result<(), String> {
     } else {
         b"ModuleEntry\0".as_slice()
     };
-    // SAFETY: プラットフォーム標準エントリーが存在する場合のみ NULL/ハンドル相当を適切に渡す。
-    if let Ok(entry) = unsafe { library.get::<EntryFn>(sym) }
-        && !unsafe { entry(null_mut()) }
-    {
-        return Err("VST3 module entry returned false".to_owned());
+    // SAFETY: プラットフォーム標準エントリーシンボルを探索する。
+    if let Ok(entry) = unsafe { library.get::<EntryFn>(sym) } {
+        // SAFETY: プラットフォーム標準エントリーが存在する場合のみ NULL/ハンドル相当を適切に渡して呼び出す。
+        if !unsafe { entry(null_mut()) } {
+            return Err("VST3 module entry returned false".to_owned());
+        }
     }
     Ok(())
 }
@@ -456,8 +464,9 @@ fn run_platform_module_init(library: &Library) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn run_platform_module_exit(library: &Library) {
     type ExitFn = unsafe extern "system" fn() -> bool;
-    // SAFETY: `InitDll` 対応シンボルがあれば終了時に呼ぶ。
+    // SAFETY: `InitDll` 対応シンボルがあれば取得する。
     if let Ok(exit_fn) = unsafe { library.get::<ExitFn>(b"ExitDll\0") } {
+        // SAFETY: `library` がアンロードされる前に終了用 `ExitDll` を呼び出す。
         let _ = unsafe { exit_fn() };
     }
 }
@@ -470,8 +479,9 @@ fn run_platform_module_exit(library: &Library) {
     } else {
         b"ModuleExit\0".as_slice()
     };
-    // SAFETY: 対応終了シンボルがあれば呼ぶ。
+    // SAFETY: 対応終了シンボルがあれば取得する。
     if let Ok(exit_fn) = unsafe { library.get::<ExitFn>(sym) } {
+        // SAFETY: `library` がアンロードされる前にプラットフォーム標準の終了シンボルを呼び出す。
         let _ = unsafe { exit_fn() };
     }
 }

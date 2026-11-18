@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "name": "Legacy Schema v1 Regression Fixture",
+  "fps": {
+    "numerator": 60,
+    "denominator": 1
+  },
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "background_color": {
+    "red": 0,
+    "green": 0,
+    "blue": 0,
+    "alpha": 255
+  },
+  "timeline_length": {
+    "mode": "auto_to_last_clip"
+  },
+  "selection_range": {
+    "start": 10,
+    "end": 180
+  },
+  "assets": [
+    {
+      "id": "asset_video_1",
+      "name": "gameplay.mkv",
+      "path": {
+        "relative": "media/gameplay.mkv"
+      },
+      "kind": {
+        "kind": "video",
+        "has_audio": true,
+        "default_fps": {
+          "numerator": 60,
+          "denominator": 1
+        },
+        "duration_frames": 600,
+        "width": 1920,
+        "height": 1080,
+        "source_duration": {
+          "numerator": 10,
+          "denominator": 1
+        }
+      },
+      "status": {
+        "status": "available"
+      }
+    },
+    {
+      "id": "asset_audio_1",
+      "name": "voice.wav",
+      "path": {
+        "relative": "media/voice.wav"
+      },
+      "kind": {
+        "kind": "audio",
+        "sample_rate_hz": 48000,
+        "channels": 2,
+        "source_duration": {
+          "numerator": 8,
+          "denominator": 1
+        }
+      },
+      "status": {
+        "status": "available"
+      }
+    },
+    {
+      "id": "asset_image_1",
+      "name": "stand.png",
+      "path": {
+        "relative": "media/stand.png"
+      },
+      "kind": {
+        "kind": "image",
+        "width": 800,
+        "height": 1200
+      },
+      "status": {
+        "status": "available"
+      }
+    }
+  ],
+  "layers": [
+    {
+      "id": "layer_video",
+      "name": "Video",
+      "visible": true,
+      "muted": false,
+      "locked": false,
+      "clips": [
+        {
+          "id": "clip_video_1",
+          "name": "Main Gameplay",
+          "timeline_start": 0,
+          "duration": 180,
+          "effect_offset_frames": 0,
+          "midpoints": [60, 120],
+          "kind": {
+            "kind": "video",
+            "asset_id": "asset_video_1",
+            "source_in": {
+              "numerator": 0,
+              "denominator": 1
+            },
+            "playback_rate": {
+              "numerator": 1,
+              "denominator": 1
+            },
+            "preserve_pitch": true,
+            "visual": {
+              "x": {
+                "kind": "keyframes",
+                "keyframes": [
+                  {
+                    "frame": 0,
+                    "value": -40.0,
+                    "easing": {
+                      "kind": "linear"
+                    }
+                  },
+                  {
+                    "frame": 120,
+                    "value": 40.0,
+                    "easing": {
+                      "kind": "ease_in_out"
+                    }
+                  }
+                ],
+                "extrapolation": "clamp"
+              }
+            }
+          }
+        },
+        {
+          "id": "clip_image_1",
+          "name": "Character Stand",
+          "timeline_start": 180,
+          "duration": 120,
+          "kind": {
+            "kind": "image",
+            "asset_id": "asset_image_1",
+            "visual": {
+              "y": {
+                "kind": "expression",
+                "expr": "sin(t * 2 * pi) * 12",
+                "base_offset": 100.0,
+                "scale": 1.0
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "layer_audio",
+      "name": "Audio",
+      "visible": true,
+      "muted": false,
+      "locked": false,
+      "clips": [
+        {
+          "id": "clip_audio_1",
+          "name": "Narration",
+          "timeline_start": 30,
+          "duration": 180,
+          "kind": {
+            "kind": "audio",
+            "asset_id": "asset_audio_1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "layer_sub",
+      "name": "Subtitle",
+      "visible": true,
+      "muted": false,
+      "locked": false,
+      "clips": [
+        {
+          "id": "clip_sub_1",
+          "name": "Opening Subtitle",
+          "timeline_start": 30,
+          "duration": 120,
+          "kind": {
+            "kind": "subtitle",
+            "text": "Hello Sea Movie Creator"
+          }
+        }
+      ]
+    }
+  ]
+}

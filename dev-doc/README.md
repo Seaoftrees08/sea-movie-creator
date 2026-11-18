@@ -41,3 +41,4 @@
 | 007 | Phase P3 設計書：無音カット（機能モジュール：録画下準備用・完全ローカル音量判定） | Draft | [`007-phase-p3-silence-cut-plugin.md`](007-phase-p3-silence-cut-plugin.md) |
 | 008 | Phase P4 設計書：拡張入力（ローカル ASR プラグイン ／ 外部台本インポート機能モジュール） | Draft | [`008-phase-p4-extended-input-plugins.md`](008-phase-p4-extended-input-plugins.md) |
 | 009 | Phase P5 設計書：他ソフト向けプロジェクト書き出しプラグイン（YMM4 → AviUtl サブ機能） | Draft | [`009-phase-p5-external-project-export-plugins.md`](009-phase-p5-external-project-export-plugins.md) |
+| 010 | PR 前コード品質ゲート・自動テスト基盤 | Implemented | [`completed/010-pre-pr-quality-gates.md`](completed/010-pre-pr-quality-gates.md) |

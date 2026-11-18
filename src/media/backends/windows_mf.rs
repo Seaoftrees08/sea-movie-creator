@@ -347,6 +347,7 @@ fn probe_audio_stream(reader: &IMFSourceReader) -> Result<Option<AudioFormatMeta
         return Ok(None);
     }
 
+    // SAFETY: `MFStartup` 済み環境で一時的な出力 `IMFMediaType` COM オブジェクトを生成する。
     let out_type: IMFMediaType = unsafe { MFCreateMediaType() }
         .map_err(|err| MediaError::DecodeFailed(format!("MFCreateMediaType failed: {err}")))?;
     // SAFETY: 音声ストリームの出力形式として非圧縮 32-bit float PCM (`MFAudioFormat_Float`) を要求する。
@@ -366,9 +367,16 @@ fn probe_audio_stream(reader: &IMFSourceReader) -> Result<Option<AudioFormatMeta
 fn read_audio_metadata(reader: &IMFSourceReader, audio_stream: u32) -> Option<AudioFormatMeta> {
     // SAFETY: `SetCurrentMediaType` 後の確定音声フォーマットを取得する。
     let current = unsafe { reader.GetCurrentMediaType(audio_stream) }.ok()?;
-    let sample_rate = unsafe { current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND) }.ok()?;
-    let channels_u32 = unsafe { current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS) }.ok()?;
-    let bits_per_sample = unsafe { current.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE) }.unwrap_or(32);
+    // SAFETY: `current` は有効な `IMFMediaType` COM オブジェクトであり、各音声属性の `UINT32` 値を照会する。
+    let (sample_rate, channels_u32, bits_per_sample) = unsafe {
+        (
+            current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).ok()?,
+            current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok()?,
+            current
+                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
+                .unwrap_or(32),
+        )
+    };
     let channels = u16::try_from(channels_u32).ok()?;
     if sample_rate == 0 || channels == 0 {
         return None;
@@ -386,6 +394,7 @@ fn configure_video_rgb32(reader: &IMFSourceReader, video_stream: u32) -> Result<
         return Ok(false);
     }
 
+    // SAFETY: `MFStartup` 済み環境で映像デコード出力用の `IMFMediaType` COM オブジェクトを生成する。
     let out_type: IMFMediaType = unsafe { MFCreateMediaType() }
         .map_err(|err| MediaError::DecodeFailed(format!("MFCreateMediaType failed: {err}")))?;
     // SAFETY: 先頭映像ストリームのデコード出力形式に非圧縮 `MFVideoFormat_RGB32` (BGRx) を要求する。
@@ -465,10 +474,11 @@ fn read_video_metadata(
     reader: &IMFSourceReader,
     video_stream: u32,
 ) -> Result<(u32, u32, u32, u32, i32), MediaError> {
-    // SAFETY: `SetCurrentMediaType` 後の現在のメディアタイプから解像度・FPS・ストライドを取得する。
+    // SAFETY: `SetCurrentMediaType` 後の現在のメディアタイプを取得する。
     let current = unsafe { reader.GetCurrentMediaType(video_stream) }
         .map_err(|_err| MediaError::NoVideoStream)?;
 
+    // SAFETY: `current` は有効な `IMFMediaType` COM オブジェクトであり、解像度必須属性 `MF_MT_FRAME_SIZE` を取得する。
     let packed_size = unsafe { current.GetUINT64(&MF_MT_FRAME_SIZE) }
         .map_err(|err| MediaError::DecodeFailed(format!("MF_MT_FRAME_SIZE missing: {err}")))?;
     let (width, height) = unpack_u64_pair(packed_size);
@@ -476,11 +486,14 @@ fn read_video_metadata(
         return Err(MediaError::InvalidDimensions { width, height });
     }
 
-    let (fps_num, fps_den) = unsafe { current.GetUINT64(&MF_MT_FRAME_RATE) }
-        .ok()
-        .map_or((30, 1), unpack_u64_pair);
-
-    let stride_u32 = unsafe { current.GetUINT32(&MF_MT_DEFAULT_STRIDE) }.ok();
+    // SAFETY: `current` から任意のフレームレート・デフォルトストライド属性を読み取る。
+    let (fps_raw, stride_u32) = unsafe {
+        (
+            current.GetUINT64(&MF_MT_FRAME_RATE).ok(),
+            current.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok(),
+        )
+    };
+    let (fps_num, fps_den) = fps_raw.map_or((30, 1), unpack_u64_pair);
     let default_stride = i32::try_from(width.saturating_mul(4)).unwrap_or(i32::MAX);
     let stride = stride_u32
         .map(|v| i32::from_ne_bytes(v.to_ne_bytes()))
@@ -495,10 +508,12 @@ fn read_duration_seconds(reader: &IMFSourceReader) -> Option<f64> {
     // SAFETY: `MF_PD_DURATION` を `IMFSourceReader` 経由で取得し、必ず `PropVariantClear` で解放する。
     let mut prop =
         unsafe { reader.GetPresentationAttribute(media_source_idx, &MF_PD_DURATION) }.ok()?;
-    let duration_100ns = unsafe { PropVariantToInt64(&raw const prop) }.ok();
-    unsafe {
+    // SAFETY: `prop` は直前に取得した有効な `PROPVARIANT` であり、直後に `PropVariantClear` で確実に解放する。
+    let duration_100ns = unsafe {
+        let val = PropVariantToInt64(&raw const prop).ok();
         let _ = PropVariantClear(&raw mut prop);
-    }
+        val
+    };
     #[allow(clippy::cast_precision_loss)]
     duration_100ns.map(|d| (d.max(0) as f64) / HNS_PER_SECOND)
 }
