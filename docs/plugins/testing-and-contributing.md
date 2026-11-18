@@ -52,7 +52,7 @@ SEA_EXPORT_PLUGIN_DIR="$HOME/work/my-export-plugins" ./target/release/sea-movie-
 ### 2.1 ディレクトリ配置とワークスペース設定
 
 1. ルート [`Cargo.toml`](../../Cargo.toml) の `[workspace]` `members`（`"plugins_src/*"`）に含まれるよう、`plugins_src/<crate-name>/` へクレートを配置する。
-2. クレートの `Cargo.toml` には必ずワークスペース設定の継承を記述する：
+2. クレートの `Cargo.toml` には必ずワークスペース設定の継承を記述する（[`tests/quality_gates/repository_rules.rs`](../../tests/quality_gates/repository_rules.rs) で自動検査されます）：
    ```toml
    [package]
    name = "sea-export-myformat"
@@ -64,19 +64,20 @@ SEA_EXPORT_PLUGIN_DIR="$HOME/work/my-export-plugins" ./target/release/sea-movie-
    [lints]
    workspace = true
    ```
-3. マニフェストは `plugins/export/<short-name>/plugin.json`（または該当プラグイン種別のディレクトリ）へ配置し、`entrypoint` がクレートのバイナリ名と一致するようにする。
+3. マニフェストは `plugins/export/<short-name>/plugin.json`（または `plugins/ai/<short-name>/ai-plugin.json`）へ配置し、`entrypoint` が `plugins_src/` 内バイナリクレートの `[package] name` と一致するようにする（[`tests/quality_gates/plugin_manifests.rs`](../../tests/quality_gates/plugin_manifests.rs) で全件検査されます）。
 
 ### 2.2 Rust 品質・安全境界ルール（`[workspace.lints]` 準拠）
 
 本リポジトリはルート `Cargo.toml` にて全ワークスペースクレートへ厳格なリントを適用しています。
 
 - **パニック・未実装マクロ禁止**: `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro` はすべて `deny`。`Result` / `Option` で安全にエラー伝播してください。
-- **Pedantic Clippy & 公開ドキュメント必須**: `clippy::pedantic = "deny"` および `missing_docs = "deny"` が有効です。クレートの公開アイテムには `///` ドキュメントコメントを記述してください。
+- **Pedantic Clippy & 公開ドキュメント必須**: `clippy::pedantic = "deny"` および `missing_docs = "deny"` が有効です。クレートの公開アイテムには `///` ドキュメントコメントを記述し、`RUSTDOCFLAGS="-D warnings" cargo doc` で警告ゼロを維持してください。
 - **`unsafe` コード原則禁止と `backends/` 隔離**:
-  - `unsafe_code = "deny"` が既定です。OS API・FFI・`mmap` 等で `unsafe` が不可避な場合は `src/backends/` 等の専用サブモジュールへ隔離し、最小範囲に `#[allow(unsafe_code)]` を付けた上で**直前に `// SAFETY:` コメントで安全不変条件を明記**してください。
+  - `unsafe_code = "deny"` および `undocumented_unsafe_blocks = "deny"` が有効です。
+  - OS API・FFI・`mmap` 等で `unsafe` が不可避な場合は、必ず **`backends/` パス配下**（例: `src/backends/`）の専用モジュールへ隔離し、最小範囲に `#[allow(unsafe_code)]` を付けた上で**直前に `// SAFETY:` コメントで安全不変条件を明記**してください（`backends/` 外での `allow(unsafe_code)` は `tests/quality_gates.rs` で拒否されます）。
 - **ライセンス・特許ポリシー**:
   - コントリビューションは [`README.md`](../../README.md) に記載の **`MIT OR Apache-2.0`** デュアルライセンスで提供されます。
-  - GPLv2 / GPLv3 / AGPL 依存クレートや再配布制限のある特許コーデックバイナリをプラグインの必須依存として同梱しないでください（外部ツール連携はユーザー環境への別プロセス呼び出しとして分離してください）。
+  - GPLv2 / GPLv3 / AGPL 依存クレートや再配布制限のある特許コーデックバイナリをプラグインの必須依存として同梱しないでください（[`deny.toml`](../../deny.toml) の `cargo deny check` およびマニフェスト `license.spdx` 検査でブロックされます。外部ツール連携はユーザー環境への別プロセス呼び出しとして分離してください）。
 
 ### 2.3 テストの配置と PR 前必須チェック
 
@@ -84,11 +85,24 @@ SEA_EXPORT_PLUGIN_DIR="$HOME/work/my-export-plugins" ./target/release/sea-movie-
 - **結合テスト**: `tests/<実装名>.rs`（入り口）＋ `tests/<実装名>/mod.rs` の組で配置します。
 - **重い実機依存テストの分離**: 外部 CLI バイナリ・実 GPU・OS ハードウェアエンコーダ・実オーディオデバイスに依存しヘッドレス CI（Linux / macOS / Windows）で実行できないテストには `#[ignore = "理由"]` を付与し、通常の `cargo test` が環境非依存で全通過する状態を維持してください。
 
-PR 作成前に、ワークスペース全体で以下 4 コマンド（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) と同一基準）が警告・エラーゼロで通ることを確認してください。
+PR 作成前に、統一スクリプト（[`scripts/pre-pr.ps1`](../../scripts/pre-pr.ps1) / [`scripts/pre-pr.sh`](../../scripts/pre-pr.sh)）または以下のチェック群（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) と同一基準）が警告・エラーゼロで通ることを確認してください。
+
+```powershell
+# Windows PowerShell（一括実行）
+powershell -ExecutionPolicy Bypass -File scripts/pre-pr.ps1
+```
 
 ```bash
+# macOS / Linux（一括実行）
+./scripts/pre-pr.sh
+```
+
+```bash
+# 個別コマンド（Rustdoc・品質ゲートテスト・ライセンス監査含む）
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo build --workspace --all-targets
 cargo test --workspace --all-targets --all-features
+cargo deny check
 ```
