@@ -1,10 +1,10 @@
-# [004] Phase P0 設計書：本体前提基盤（キャラプリセット・連続字幕入力・API キーガイド・プラグイン拡張導線）
+# [004] Phase P0 設計書：本体前提基盤機能モジュール（キャラプリセット・連続字幕入力・API キーガイド・プラグイン統合窓口）
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
-  - プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
   - 市場調査・開発戦略レポート: [`loadmap/Market Research.md`](loadmap/Market%20Research.md)
   - ゆっくり実況向け専用モジュール（ドメイン共通設計）: [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md)
   - 全体基本設計書（完了済み）: [`completed/draft.md`](completed/draft.md)
@@ -15,8 +15,9 @@
 ## 1. 概要・目的
 
 - **解決したい課題・達成したいこと**:
-  - 後続の音声作成（Phase P1）・感情連動立ち絵＆演出（Phase P2）・拡張入力（Phase P4）の各プラグインが共通で前提とする **「字幕起点」ワークフローの出発点（キャラクタープリセット＋連続字幕入力 UI）** を本体側へ構築する。
-  - 同時に、一般クリエイターの離脱要因となる **「AI API キー設定の分かりにくさ（ターミナル設定・月額プランとの混同）」** を GUI モーダル＋図解ガイドで解消し、各プラグインを黒い画面なしで実行できる **共通プラグインメニュー導線** を整備する。
+  - 後続の音声作成（Phase P1）・感情連動立ち絵＆演出（Phase P2）・拡張入力（Phase P4）の各機能モジュール／プラグインが共通で前提とする **「字幕起点」ワークフローの出発点（キャラクタープリセット＋連続字幕入力 UI）** を本体側の機能モジュールとして構築する。
+  - 同時に、一般クリエイターの離脱要因となる **「AI API キー設定の分かりにくさ（ターミナル設定・月額プランとの混同）」** を GUI モーダル＋図解ガイドで解消し、既存の別プロセスプラグイン群（書き出し・AI・音声）および今後の拡張プラグインを黒い画面なしで管理・実行できる **共通プラグイン窓口・メニュー導線** を整備する。
+  - ※ 本書における用語区分として、**無くても core 本体（`sea-movie-creator`）が立ち上がる拡張を「プラグイン」**、**core 本体が依存して組み込む機能を「機能モジュール」** として明確に分離する。
 - **対象ユーザー / 利用シーン**:
   - 録画済みゲーム映像をタイムラインに並べたあと、キーボードだけでキャラクターを切り替えながらテンポ良くセリフ字幕を入力したいクリエイター。
   - 初めて Gemini / OpenAI / Anthropic 等の API キーを取得してアプリに接続するクリエイター。
@@ -26,14 +27,14 @@
 ## 2. スコープ
 
 ### 対象（In Scope）
-- **P0-1：キャラクタープリセット（`CharacterPreset`）とキーボード完結の連続字幕入力 UI**
+- **P0-1：キャラクタープリセット（`CharacterPreset`）とキーボード完結の連続字幕入力 UI（本体機能モジュール）**
   - 立ち絵参照・TTS 設定・`SubtitleProperties` テンプレート・既定配置・モーション規則を 1 セットとして管理・永続化する機能。
   - プロジェクトファイル（`.smc.json`）における字幕クリップとキャラクター ID の後方互換紐付け。
   - キーボード操作のみでキャラクター切替→セリフ入力→確定→次枠移動を繰り返せる連続入力バー／ショートカット。
-- **P0-2：GUI 上の API キー設定モーダル＆画像付き取得ガイド**
-  - [`src/ai/providers/credentials.rs`](../src/ai/providers/credentials.rs) の `save_secret_to_keyring` / `resolve_api_key` に接続する GUI モーダル（削除／クリア、疎通テスト、画像付きステップ解説）。
-- **P0-3：プラグイン拡張スロットと GUI メニュー統合**
-  - 既存の `plugins/export/`・`plugins/ai/` パターンを踏襲し、新プラグイン種別（`tts` / `asr` / `project_export` / ワークフローアクション）を扱う共通カタログとメニュー／ツールバー導線を整理する。
+- **P0-2：GUI 上の API キー設定モーダル＆画像付き取得ガイド（本体機能モジュール）**
+  - [`src/ai/providers/credentials.rs`](../src/ai/providers/credentials.rs) に実装済みの `save_secret_to_keyring` / `resolve_api_key`（および [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs) の認証状態表示）に接続する GUI モーダル（削除／クリア、疎通テスト、画像付きステップ解説）。
+- **P0-3：既存プラグイン基盤の横断統合窓口と GUI メニュー導線（本体ホスト層）**
+  - すでに実装済みのプラグイン機構（動画書き出し [`src/export/registry.rs`](../src/export/registry.rs) / `plugins/export/*`、AI CLI [`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs) / `plugins/ai/*`、音声隔離ホスト [`src/audio/plugins/`](../src/audio/plugins/mod.rs) / `plugins/audio/sea-audio-host`）を置き換えず横断参照し、今後のプラグイン種別（`tts` / `asr` / `project_export`）も一貫して状態確認・管理できる共通カタログと `プラグイン` メニュー導線を整理する（本体内蔵の機能モジュール実行導線は各担当メニューへ整理し、プラグインとは混同しない）。
 
 ### 対象外（Out of Scope）
 - 実際の TTS 音声合成処理と尺自動伸縮・リップル処理（Phase P1: [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)）
@@ -48,7 +49,7 @@
   1. **プリセット一括適用**: キャラクタープリセットを選択して字幕を追加すると、そのキャラ用のフォント・文字色・縁取り・配置（`SubtitleProperties`）および `character_id` が自動設定されること。
   2. **キーボード完結の入力テンポ**: 連続入力モード中はマウスクリック不要で、文字入力 → `Enter` で確定 → 再生ヘッドを仮尺分だけ自動前進させ次の入力へ即移行できること。また数字キー＋修飾キーや専用切替キーでキャラプリセットを瞬時に切り替えられること。
   3. **GUI 完結の API キー管理**: 環境変数やコマンドラインを一切使わずに、GUI から API キーを OS 資格情報ストアへ保存・削除・テストでき、月額チャットプランと API 契約の違いが図解で理解できること。
-  4. **プラグイン導線の統一**: メニューバーや AI チャット・タイムラインからプラグイン機能を呼び出せ、未ビルド／未導入の外部ツールがあっても本体がクラッシュせず設定案内を出せること。
+  4. **プラグイン導線の統一と起動非依存性**: メニューバーや AI チャット・書き出し・タイムラインからプラグインおよび本体機能モジュールを呼び出せ、未ビルド／未導入の外部プラグインや外部ツールが欠損していても本体は正常に起動し設定案内を出せること。
 - **非機能要件・互換性・セキュリティ**:
   - 既存の `.smc.json` プロジェクトファイルを破壊しないよう、ドキュメント追加フィールドには `#[serde(default, skip_serializing_if = "...")]` を必ず付与する。
   - API キーは引き続きプロジェクト JSON へ絶対保存せず、OS 資格情報ストア（`sea-movie-creator` サービス）またはメモリ上の一時保持（`runtime_api_key`）のみとする。
@@ -65,14 +66,14 @@
   - [`src/timeline/document.rs`](../src/timeline/document.rs) & [`src/timeline/command.rs`](../src/timeline/command.rs):
     - `SubtitleProperties` または `DialogueMetadata`（`character_id: Option<String>`, `reading_override: Option<String>`, `emotion_tag: Option<String>`）の任意拡張フィールド追加（`#[serde(default)]`）
     - `ProjectDocument` へ `character_presets: Vec<CharacterPreset>`（プロジェクト内スナップショット。別環境へ `.smc.json` を持っていってもフォント・色・キャラ紐付けが保たれる）を任意保持し、`EditCommand::UpsertCharacterPreset` / `RemoveCharacterPreset` を追加、または `SetParameter` を拡張
-- **認証管理層**:
+- **認証管理層（機能モジュール）**:
   - [`src/ai/providers/credentials.rs`](../src/ai/providers/credentials.rs): 既存の `resolve_api_key` / `save_secret_to_keyring` に加え、`delete_secret_from_keyring(account)`・`has_stored_secret(kind)`・簡易接続チェック用非同期ヘルパーを追加
-- **プラグイン共通レジストリ整理**:
-  - `src/plugins/mod.rs`（新規統合窓口。既存の `src/export/registry.rs` と `src/ai/plugin_host.rs` を横断参照・一覧化）: プラグイン種別（`Export` / `Ai` / `Tts` / `Asr` / `ProjectExport`）のメタ情報・導入状態（有効 / 外部依存未設定 / バイナリ欠損）を統一的に取得し、UI メニューやプラグイン管理モーダルへ供給
-- **UI 層（GPUI）**:
+- **プラグイン横断カタログ（既存プラグイン基盤の上位統合窓口）**:
+  - `src/plugins/mod.rs`（新規統合窓口。すでに実装済みの書き出しプラグイン [`src/export/registry.rs`](../src/export/registry.rs)、AI プラグイン [`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs)、音声プラグイン隔離ホスト [`src/audio/plugins/scanner.rs`](../src/audio/plugins/scanner.rs) を置き換えず横断参照する）: 無くても本体起動可能な外部プラグイン種別（`Export` / `Ai` / `AudioHost`、および今後の `Tts` / `Asr` / `ProjectExport`）のメタ情報・導入状態（有効 / 外部依存未設定 / バイナリ欠損）を統一的に取得し、UI メニューやプラグイン管理モーダルへ供給
+- **UI 層（GPUI・機能モジュール）**:
   - `src/ui/subtitle_quick_entry.rs`: タイムライン上部またはプレビュー下部に展開できる「連続字幕入力バー」＋ キャラクタープリセット編集モーダル
   - `src/ui/api_keys_modal.rs`: [`src/ui/external_tools_modal.rs`](../src/ui/external_tools_modal.rs) と同一デザイン方針の API キー設定＆画像付き取得ガイドモーダル
-  - [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs) & [`src/ui/menu_bar.rs`](../src/ui/menu_bar.rs): ヘッダの認証状態ボタンから `api_keys_modal` を直接開く導線、`プラグイン`（または `ツール`）メニュー追加
+  - [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs) & [`src/ui/menu_bar.rs`](../src/ui/menu_bar.rs): 既存のヘッダ認証状態ラベル（`認証: OK` / `未設定`）をボタン化して `api_keys_modal` を直接開く導線、`プラグイン` メニュー（プラグイン一覧・状態管理）と本体機能モジュール用メニュー導線の整理
 
 ### 4.2 データ構造と互換設計
 

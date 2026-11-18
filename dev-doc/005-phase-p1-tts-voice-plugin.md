@@ -1,13 +1,13 @@
-# [005] Phase P1 設計書：音声作成プラグイン（TTS 連携・尺自動伸縮・リップル・間・キャッシュ）
+# [005] Phase P1 設計書：音声作成機能モジュール＆外部 TTS プラグイン（TTS 連携・尺自動伸縮・リップル・間・キャッシュ）
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
-  - プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
   - 市場調査・開発戦略レポート: [`loadmap/Market Research.md`](loadmap/Market%20Research.md)
   - ゆっくり実況向け専用モジュール（ドメイン共通設計）: [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md)
-  - 前提基盤設計（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
+  - 前提基盤機能モジュール（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
 
 ---
 
@@ -15,7 +15,7 @@
 
 - **解決したい課題・達成したいこと**:
   - Phase P0 で入力された字幕（＋`CharacterPreset`）をもとに、外部合成音声エンジンと連携して音声 WAV を一括生成し、**「生成音声の実長に合わせた字幕尺の自動伸縮」「後続クリップの重なりを防ぐ自動スライド（リップル）」「自然な『間』の挿入」「音声データキャッシュ」** をワンアクションで実行する。
-  - 市場調査で判明したライセンス構造を踏まえ、無料で収益化しやすい **VOICEVOX / COEIROINK / AivisSpeech** を標準最優先でサポートし、**AquesTalk（ゆっくりボイス）** 等はアプリ本体へ同梱しない外部アダプタ分離方式で安全に連携できるようにする。
+  - 市場調査で判明したライセンス構造を踏まえ、無料で収益化しやすい **VOICEVOX / COEIROINK / AivisSpeech** を本体側の標準 HTTP アダプタ（機能モジュール）として最優先サポートし、**AquesTalk（ゆっくりボイス）** 等は無くても本体が起動する別プロセス外部プラグイン（`plugins/tts/`）として安全に分離連携する。
 - **対象ユーザー / 利用シーン**:
   - 連続字幕入力や台本読込で並べた仮字幕から、一気に掛け合い音声タイムラインを生成したい個人クリエイター。
   - 1〜2 行の誤字や言い回しを直したあとに、未変更の音声を再合成せず素早く尺と後続タイミングだけ再調整したい編集者。
@@ -25,14 +25,14 @@
 ## 2. スコープ
 
 ### 対象（In Scope）
-- `TtsProvider` 抽象化と以下 3 系統のアダプタ実装：
-  1. **ローカル HTTP 標準アダプタ**（VOICEVOX Engine / COEIROINK / AivisSpeech）
-  2. **別プロセス外部プラグインアダプタ（`plugins/tts/<id>/tts-plugin.json`）**（ユーザー導入の AquesTalk 外部ブリッジ、棒読みちゃん連携、任意ローカル TTS CLI）
-  3. **OS 標準 TTS フォールバック**（外部エンジン未起動時の仮尺生成・動作確認用）
-- 字幕クリップ群を対象とした **一括／選択範囲／差分音声生成ワークフロー（`BatchTtsPlanner`）**
-- 音声キャッシュ管理（`tts_cache/` への WAV 保存とハッシュ管理）
-- 字幕尺自動伸縮・自然な「間」挿入・選択的リップルシフト（`EditCommand::Batch` 生成）
-- プロジェクト内使用話者・エンジンからの **概要欄向けクレジット文字列自動生成＆コピー UI**
+- **本体機能モジュール（`src/yukkuri/tts/`・`src/yukkuri/dialogue/`）**:
+  - `TtsProvider` 抽象化、ローカル HTTP 標準アダプタ（VOICEVOX Engine / COEIROINK / AivisSpeech）、OS 標準 TTS フォールバック
+  - 字幕クリップ群を対象とした **一括／選択範囲／差分音声生成ワークフロー（`BatchTtsPlanner`）**
+  - 音声キャッシュ管理（`tts_cache/` への WAV 保存とハッシュ管理）
+  - 字幕尺自動伸縮・自然な「間」挿入・選択的リップルシフト（`EditCommand::Batch` 生成）
+  - プロジェクト内使用話者・エンジンからの **概要欄向けクレジット文字列自動生成＆コピー UI**
+- **外部プラグイン機構（`plugins/tts/<id>/tts-plugin.json`）**:
+  - 無くても本体が起動できる別プロセス外部アダプタ（ユーザー導入の AquesTalk 外部ブリッジ、棒読みちゃん連携、任意ローカル TTS CLI）
 
 ### 対象外（Out of Scope）
 - AquesTalk 等の商用・再配布制約 DLL のアプリ本体同梱
@@ -60,14 +60,17 @@
 
 ## 4. アーキテクチャ / 設計詳細
 
-### 4.1 モジュール・プラグイン構成
+### 4.1 機能モジュール・外部プラグイン構成
 
-- `src/yukkuri/tts/mod.rs`: `TtsProvider` トレイト、`SynthesisRequest` / `SynthesisOutput` / `PhonemeSpan`、`TtsCache`
-- `src/yukkuri/tts/http_engines.rs`: VOICEVOX Engine互換 API（`/speakers`, `/audio_query`, `/synthesis`）、COEIROINK（v1/v2）、AivisSpeech の HTTP クライアント（既存依存 `ureq` を活用）
-- `src/yukkuri/tts/plugin_host.rs`: `plugins/tts/<id>/tts-plugin.json` の検出・別プロセス起動ホスト（`sea_tts_v1` NDJSON stdio プロトコル）
-- `src/yukkuri/tts/os_fallback.rs`: Windows SAPI / macOS `say` / Linux `speech-dispatcher` 等の非必須フォールバック（ヘッドレス環境や未対応時は安全にエラー返却）
-- `src/yukkuri/dialogue/batch_sync.rs`: 一括音声生成オーケストレータ（対象字幕抽出 → 未キャッシュ合成 → 尺算出 → 選択的リップル位置解決 → `EditCommand::Batch` 構築）
-- `src/yukkuri/tts/credits.rs`: 使用話者・エンジンをドキュメントから集計し、`"VOICEVOX:ずんだもん\nVOICEVOX:四国めたん"` 形式のクレジット文字列を生成
+- **本体側機能モジュール（`src/yukkuri/`）**:
+  - `src/yukkuri/tts/mod.rs`: `TtsProvider` トレイト、`SynthesisRequest` / `SynthesisOutput` / `PhonemeSpan`、`TtsCache`
+  - `src/yukkuri/tts/http_engines.rs`: VOICEVOX Engine互換 API（`/speakers`, `/audio_query`, `/synthesis`）、COEIROINK（v1/v2）、AivisSpeech の HTTP クライアント（既存依存 `ureq` を活用）
+  - `src/yukkuri/tts/plugin_host.rs`: `plugins/tts/<id>/tts-plugin.json` の検出・別プロセス起動ホスト（`sea_tts_v1` NDJSON stdio プロトコル）
+  - `src/yukkuri/tts/os_fallback.rs`: Windows SAPI / macOS `say` / Linux `speech-dispatcher` 等の非必須フォールバック（ヘッドレス環境や未対応時は安全にエラー返却）
+  - `src/yukkuri/dialogue/batch_sync.rs`: 一括音声生成オーケストレータ（対象字幕抽出 → 未キャッシュ合成 → 尺算出 → 選択的リップル位置解決 → `EditCommand::Batch` 構築）
+  - `src/yukkuri/tts/credits.rs`: 使用話者・エンジンをドキュメントから集計し、`"VOICEVOX:ずんだもん\nVOICEVOX:四国めたん"` 形式のクレジット文字列を生成
+- **外部プラグイン（`plugins/tts/<id>/`・無くても本体起動可能）**:
+  - `plugins/tts/<id>/tts-plugin.json` ＋ 別プロセスワーカー（例: `sea-tts-bridge` による AquesTalk / 棒読みちゃん / 任意ローカル TTS CLI 連携）
 
 ### 4.2 キャッシュとリップル調整のデータ構造
 

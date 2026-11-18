@@ -1,14 +1,14 @@
-# [008] Phase P4 設計書：拡張入力プラグイン（肉声実況向け自動字幕 ／ 外部台本インポート）
+# [008] Phase P4 設計書：拡張入力（ローカル ASR プラグイン ／ 外部台本インポート機能モジュール）
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
-  - プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
   - 市場調査・開発戦略レポート: [`loadmap/Market Research.md`](loadmap/Market%20Research.md)
-  - 前提基盤（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
-  - 音声作成プラグイン（Phase P1）: [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)
-  - 感情連動立ち絵・定番演出（Phase P2）: [`006-phase-p2-tachie-ai-effects-plugin.md`](006-phase-p2-tachie-ai-effects-plugin.md)
+  - 前提基盤機能モジュール（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
+  - 音声作成機能モジュール＆外部 TTS プラグイン（Phase P1）: [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)
+  - 感情連動立ち絵・定番演出機能モジュール（Phase P2）: [`006-phase-p2-tachie-ai-effects-plugin.md`](006-phase-p2-tachie-ai-effects-plugin.md)
 
 ---
 
@@ -16,8 +16,8 @@
 
 - **解決したい課題・達成したいこと**:
   - Phase P0〜P3 によって「字幕をキーボード入力して音声・立ち絵・演出を作る」ゆっくり実況ワークフローが確立したあと、**タイムラインへ字幕を流し込む入口をさらに 2 方向へ拡張**する。
-    1. **P4-A：肉声実況向け自動字幕プラグイン（ローカル ASR）**：配信者自身の声が入っている録画・録音から音声認識でタイムスタンプ付き字幕を自動生成する。生成した字幕を起点にそのまま Phase P2（立ち絵・定番演出自動配置）を実行でき、肉声動画へのテロップ入れ＋相槌キャラ解説も高速化できる。
-    2. **P4-B：外部台本インポートプラグイン（GUI ドラッグ＆ドロップ）**：外部エディタやチャット AI 等で作成した台本ファイル（`.txt` / `.csv` / `.srt` 等）を GUI へドラッグ＆ドロップするだけで `CharacterPreset` 付きの字幕群へ展開し、そのまま Phase P1（音声一括作成）へ流せる。
+    1. **P4-A：肉声実況向け自動字幕プラグイン（ローカル ASR・別プロセス分離）**：配信者自身の声が入っている録画・録音から音声認識でタイムスタンプ付き字幕を自動生成する着脱可能な外部プラグイン（無くても本体起動可能）。生成した字幕を起点にそのまま Phase P2（立ち絵・定番演出自動配置）を実行でき、肉声動画へのテロップ入れ＋相槌キャラ解説も高速化できる。
+    2. **P4-B：外部台本インポート機能モジュール（本体内蔵・GUI ドラッグ＆ドロップ）**：外部エディタやチャット AI 等で作成した台本ファイル（`.txt` / `.csv` / `.srt` 等）を GUI へドラッグ＆ドロップするだけで `CharacterPreset` 付きの字幕群へ展開し、そのまま Phase P1（音声一括作成）へ流せる。
 - **対象ユーザー / 利用シーン**:
   - 肉声ゲーム実況のフルテロップ作業を自動化したい個人配信者。
   - メモ帳・スプレッドシート・別ツールで書き溜めたゆっくり解説台本を一括でタイムラインへ展開したい制作者。
@@ -27,11 +27,11 @@
 ## 2. スコープ
 
 ### 対象（In Scope）
-- **P4-A：肉声自動字幕プラグイン（`plugins/asr/<id>/asr-plugin.json` + 隔離ホスト）**
+- **P4-A：肉声自動字幕プラグイン（`plugins/asr/<id>/asr-plugin.json` + 別プロセス隔離ホスト）**
   - 別プロセス起動ワーカー（`sea_asr_v1` NDJSON stdio プロトコル）経由でのローカル音声認識（Whisper 系推論エンジン／ユーザー導入済みローカル ASR CLI）
-  - 選択動画／音声クリップの音声範囲抽出（`source_in`, `playback_rate` 考慮）→ 16kHz モノラル WAV 一時書き出し → ASR ワーカー実行（進捗％通知・キャンセル対応）
+  - 本体側ホストによる選択動画／音声クリップの音声範囲抽出（`source_in`, `playback_rate` 考慮）→ 16kHz モノラル WAV 一時書き出し → ASR ワーカー実行（進捗％通知・キャンセル対応）
   - 認識セグメント（`start_sec`, `end_sec`, `text`）を指定 `CharacterPreset` の `Subtitle` クリップ列（`EditCommand::Batch`）へ変換
-- **P4-B：外部台本インポートプラグイン（`src/yukkuri/script_import.rs` + GUI モーダル／D&D 対応）**
+- **P4-B：外部台本インポート機能モジュール（`src/yukkuri/script_import.rs` + GUI モーダル／D&D 対応）**
   - 対応形式：
     1. プレーンテキスト台本（`キャラ名: セリフ`、`キャラ名「セリフ」`、または単一キャラ連続行 `.txt`）
     2. CSV / TSV 台本（`character,text[,reading_override,emotion,gap_sec]`）

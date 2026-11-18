@@ -5,14 +5,15 @@
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
   - 市場調査・開発戦略レポート: [`loadmap/Market Research.md`](loadmap/Market%20Research.md)
-  - プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
   - 各フェーズ個別設計書: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)（P0）、[`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)（P1）、[`006-phase-p2-tachie-ai-effects-plugin.md`](006-phase-p2-tachie-ai-effects-plugin.md)（P2）
   - 全体基本設計書（Phase A〜C 完了済み）: [`completed/draft.md`](completed/draft.md)
   - 初期実装（前提基盤・完了済み）: [`completed/initial-implementation/PhaseA.md`](completed/initial-implementation/PhaseA.md), [`completed/initial-implementation/PhaseB.md`](completed/initial-implementation/PhaseB.md), [`completed/initial-implementation/PhaseC.md`](completed/initial-implementation/PhaseC.md)
   - AviUtl 準拠 UI 設計書（Phase D-1〜D-6 完了済み）: [`completed/002-aviutl-ui-redesign/README.md`](completed/002-aviutl-ui-redesign/README.md)
 
 > [!NOTE]
-> 本設計書は初期実装（Phase A〜C）および AviUtl 準拠 UI 刷新（`002`: Phase D-1〜D-6）が完了した前提で実装する **ゆっくり／ずんだもん実況ドメイン共通のコア設計（`src/yukkuri/`）** です。各フェーズの具体的なワークフロー・UI・プラグイン仕様は [`004`](004-phase-p0-core-prerequisites.md)（Phase P0）・[`005`](005-phase-p1-tts-voice-plugin.md)（Phase P1）・[`006`](006-phase-p2-tachie-ai-effects-plugin.md)（Phase P2）へ分割されています。
+> 本設計書は初期実装（Phase A〜C）および AviUtl 準拠 UI 刷新（`002`: Phase D-1〜D-6）が完了した前提で実装する **ゆっくり／ずんだもん実況ドメイン共通の機能モジュール群（`src/yukkuri/`）** です。各フェーズの具体的なワークフロー・UI・プラグイン連携仕様は [`004`](004-phase-p0-core-prerequisites.md)（Phase P0）・[`005`](005-phase-p1-tts-voice-plugin.md)（Phase P1）・[`006`](006-phase-p2-tachie-ai-effects-plugin.md)（Phase P2）へ分割されています。
+> なお用語区分として、**無くても core 本体が立ち上がる外部／別プロセス拡張を「プラグイン」**、**core 本体が依存し `src/` へ組み込むものを「機能モジュール」** と定義します。
 
 ---
 
@@ -30,23 +31,23 @@
 ## 2. スコープ
 
 ### 対象（In Scope）
-- **Phase P0（本体側前提）**:
+- **Phase P0（本体前提基盤・機能モジュール）**:
   - キャラクタープリセット管理（音声設定、`SubtitleProperties` ベースの字幕スタイル、立ち絵テンプレート、標準 `VisualProperties`、モーション・非話者減光設定）
   - キーボード完結の連続字幕入力 UI（プリセット切替と次枠入力を高速連続実行し、音声未合成の仮字幕からワークフローを始められる仕組み）
-- **Phase P1（音声作成プラグイン・TTS 連携）**:
-  - 音声合成（TTS）アダプタ基盤（商用無料・要クレジット表記の **VOICEVOX / COEIROINK / AivisSpeech** を最優先標準対応とし、**AquesTalk 外部ブリッジ / 棒読みちゃん等** はユーザー導入外部プラグイン `plugins/tts/` として分離、加えて OS 標準 TTS フォールバック）
-  - **字幕起点の一括＆差分音声合成**：入力済み字幕から音声を生成し、実音声長に合わせて字幕尺を自動伸縮、自然な「間（ま）」の無音挿入、後続クリップの自動リップルシフト、生成音声キャッシュ、概要欄向けクレジット一覧出力補助を提供
-- **Phase P2（感情連動の立ち絵・定番演出自動配置）**:
+- **Phase P1（音声作成機能モジュール ＋ 外部 TTS プラグイン連携）**:
+  - 音声合成（TTS）アダプタ基盤（商用無料・要クレジット表記の **VOICEVOX / COEIROINK / AivisSpeech** を本体機能モジュール側の標準アダプタとして最優先対応し、**AquesTalk 外部ブリッジ / 棒読みちゃん等** は無くても本体が起動する別プロセス外部プラグイン `plugins/tts/` として分離、加えて OS 標準 TTS フォールバック）
+  - **字幕起点の一括＆差分音声合成（本体機能モジュール）**：入力済み字幕から音声を生成し、実音声長に合わせて字幕尺を自動伸縮、自然な「間（ま）」の無音挿入、後続クリップの自動リップルシフト、生成音声キャッシュ、概要欄向けクレジット一覧出力補助を提供
+- **Phase P2（感情連動の立ち絵・定番演出自動配置機能モジュール）**:
   - パーツ分け立ち絵システム（目・口・眉・顔・体・装飾等のレイヤー差分合成、PNG パーツフォルダ＆PSD レイヤー読み込み対応）
   - ローカル自動アニメーション（音量エンベロープ＋母音/音素ベース口パク、約 3 秒周期まばたき、発話中の自動揺れ・跳ね、**非話者を少し暗くする話者強調ディミング演出**）
-  - **AI バッチ感情・定番演出プランナ連携**：動画映像を送信せず字幕テキスト塊のみを LLM へ渡して JSON で一括判定させ（1 本数円以下）、感情表情切替および厳選した定番演出（5〜10 種：集中線・画面揺れ・ズーム・暗転・フラッシュ・モノクロ・字幕ポップ・SE 枠等）を差分プレビュー＋単一 Undo 付きで個別部品として自動配置
+  - **AI バッチ感情・定番演出プランナ連携**：動画映像を送信せず字幕テキスト塊のみを LLM（既存 `AiProvider`／AI プラグイン）へ渡して JSON で一括判定させ（1 本数円以下）、感情表情切替および厳選した定番演出（5〜10 種：集中線・画面揺れ・ズーム・暗転・フラッシュ・モノクロ・字幕ポップ・SE 枠等）を差分プレビュー＋単一 Undo 付きで個別部品として自動配置
 - **単一ダイアログ同期＆統合編集**:
   - 1 行単位の編集・再合成時にも音声・字幕・立ち絵・カット境界計算を追従同期する仕組み（`EditCommand::Batch` へのコンパイル）
 
 ### 対象外（Out of Scope）
-- 特定のプロプライエタリ／有償再配布禁止音声 DLL（例：AquesTalk バイナリ本体）のアプリ本体への同梱・直接組込（YMM4 Lite と同様にユーザーが外部導入してアダプタ連携する）
+- 特定のプロプライエタリ／有償再配布禁止音声 DLL（例：AquesTalk バイナリ本体）のアプリ本体への同梱・直接組込（YMM4 Lite と同様にユーザーが外部導入して `plugins/tts/` プラグイン経由で連携する）
 - 32bit AviUtl 用の既存 `.auf` / `.anm` バイナリ互換実行
-- 無音カット（Phase P3）・肉声自動字幕／外部台本インポート（Phase P4）・YMM4/AviUtl プロジェクト書き出し（Phase P5）の個別仕様（[`Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md) で別プラグインとして設計）
+- 無音カット機能モジュール（Phase P3）・肉声自動字幕プラグイン／外部台本インポート機能モジュール（Phase P4）・YMM4/AviUtl プロジェクト書き出しプラグイン（Phase P5）の個別仕様（[`Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md) で定義）
 
 ---
 
@@ -127,8 +128,8 @@ pub struct DialogueLine {
 sequenceDiagram
     actor User as 編集者（GUI）
     participant Input as 連続字幕入力UI (P0)
-    participant BatchTTS as 音声作成プラグイン (P1)
-    participant TTS as VOICEVOX等 / キャッシュ
+    participant BatchTTS as 音声作成機能モジュール (P1)
+    participant TTS as VOICEVOX等 / 外部TTSプラグイン
     participant Director as AI感情・演出プランナ (P2-B)
     participant Timeline as dry_run & CommandDispatcher
     participant Tachie as TachieAnimator & wgpu (P2-A)

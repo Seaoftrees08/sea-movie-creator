@@ -1,21 +1,21 @@
-# [006] Phase P2 設計書：感情連動立ち絵・定番演出自動配置プラグイン
+# [006] Phase P2 設計書：感情連動立ち絵・定番演出自動配置（機能モジュール）
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
-  - プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
   - 市場調査・開発戦略レポート: [`loadmap/Market Research.md`](loadmap/Market%20Research.md)
   - ゆっくり実況向け専用モジュール（ドメイン共通設計）: [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md)
-  - 前提基盤（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
-  - 音声作成プラグイン（Phase P1）: [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)
+  - 前提基盤機能モジュール（Phase P0）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
+  - 音声作成機能モジュール＆外部 TTS プラグイン（Phase P1）: [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md)
 
 ---
 
 ## 1. 概要・目的
 
 - **解決したい課題・達成したいこと**:
-  - Phase P1 で生成された「字幕＋音声」のタイムラインに対し、編集者の手作業だと 30 分〜1 時間以上かかる **「立ち絵の表情切り替え・口パク・まばたき・話者強調」** と **「実況向け定番演出（集中線・揺れ・ズーム・暗転等）の配置」** を一括で 70〜80 点の完成度まで自動化する。
+  - Phase P1 で生成された「字幕＋音声」のタイムラインに対し、編集者の手作業だと 30 分〜1 時間以上かかる **「立ち絵の表情切り替え・口パク・まばたき・話者強調」** と **「実況向け定番演出（集中線・揺れ・ズーム・暗転等）の配置」** を、本体組み込みの機能モジュール（`src/yukkuri/tachie/`・`src/yukkuri/director/`）として一括で 70〜80 点の完成度まで自動化する。
   - 動画映像を AI に渡さず **字幕テキストの塊（JSON）だけを LLM へ送信** することで 1 動画あたりの API コストを数円以下に抑えつつ、生成結果はすべてタイムライン上の個別クリップ・パラメータとして編集可能にする。
 - **対象ユーザー / 利用シーン**:
   - 字幕と合成音声を並べ終えたあと、立ち絵アニメーションとテンポの良い演出を一気に加えてから細部を手動調整したいクリエイター。
@@ -26,13 +26,13 @@
 ## 2. スコープ
 
 ### 対象（In Scope）
-- **P2-A：ローカル立ち絵リグ＆自動基本モーション（API コスト 0）**
+- **P2-A：ローカル立ち絵リグ＆自動基本モーション（本体機能モジュール・API コスト 0）**
   - PNG パーツフォルダ（`tachie.json`）および PSD レイヤー（純粋 Rust パーサ）読み込み・テクスチャキャッシュ
   - 音声 PCM 音量エンベロープ＋TTS 音素（`PhonemeSpan`）連動の口パク（`LipSyncTrack`）
   - 約 3 秒周期まばたき、発話中揺れ・跳ねアニメーション（`effect_offset_frames` によるカット連続性保持）
   - **非話者の減光制御（話者強調ディミング）**
-- **P2-B：AI 文脈連動「表情・定番演出」自動配置プラグイン（LLM 連携）**
-  - タイムライン上の字幕テキスト塊＋キャラ設定を LLM（既存 `AiProvider`）へバッチ送信し、感情タグ＋定番演出候補を JSON 一括返答させるプロンプト／スキーマ設計
+- **P2-B：AI 文脈連動「表情・定番演出」自動配置（本体機能モジュール・LLM 連携）**
+  - タイムライン上の字幕テキスト塊＋キャラ設定を LLM（既存 `AiProvider`：内蔵 API または AI プラグイン）へバッチ送信し、感情タグ＋定番演出候補を JSON 一括返答させるプロンプト／スキーマ設計
   - 定番演出を **厳選 8 種** に限定した `EditCommand::Batch` コンパイラ（既存の [`VisualProperties`](../src/media/visual_properties.rs)・[`AnimatedParameter`](../src/core/animation.rs)・[`SubtitleProperties`](../src/media/visual_properties.rs) 活用＋不足フィルタの最小拡張）
   - 既存の [`dry_run_validate`](../src/ai/planner.rs) を通した適用前差分カード表示と 1 クリック Undo
 
