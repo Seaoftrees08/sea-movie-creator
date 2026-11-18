@@ -42,3 +42,4 @@
 | 008 | Phase P4 設計書：拡張入力（ローカル ASR プラグイン ／ 外部台本インポート機能モジュール） | Draft | [`008-phase-p4-extended-input-plugins.md`](008-phase-p4-extended-input-plugins.md) |
 | 009 | Phase P5 設計書：他ソフト向けプロジェクト書き出しプラグイン（YMM4 → AviUtl サブ機能） | Draft | [`009-phase-p5-external-project-export-plugins.md`](009-phase-p5-external-project-export-plugins.md) |
 | 010 | PR 前コード品質ゲート・自動テスト基盤 | Implemented | [`completed/010-pre-pr-quality-gates.md`](completed/010-pre-pr-quality-gates.md) |
+| 011 | 外部プラグイン向け SDK・プロトコル互換性ポリシー | Draft | [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md) |
