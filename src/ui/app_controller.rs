@@ -846,6 +846,7 @@ impl AppController {
             .dispatcher
             .dispatch(&mut self.document, cmd)
             .map_err(|err| err.to_string())?;
+        self.sync_available_media_resources();
         self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_selection_after_edit();
         self.sync_shared_state();
@@ -869,6 +870,7 @@ impl AppController {
             self.timeline_gesture = None;
             self.timeline_drag = None;
             self.preview_drag = None;
+            self.sync_available_media_resources();
             self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
             self.sync_selection_after_edit();
             self.sync_shared_state();
@@ -894,6 +896,7 @@ impl AppController {
             self.timeline_gesture = None;
             self.timeline_drag = None;
             self.preview_drag = None;
+            self.sync_available_media_resources();
             self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
             self.sync_selection_after_edit();
             self.sync_shared_state();
@@ -2724,6 +2727,42 @@ impl AppController {
         }
     }
 
+    /// コマンド適用・Undo/Redo 後に未登録の音声リソースを `AudioMixer` へ同期する（画像はオンデマンド確保）。
+    fn sync_available_media_resources(&mut self) {
+        let project_dir = self
+            .project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+
+        let missing_audio_assets: Vec<(AssetId, PathBuf)> = self
+            .document
+            .assets
+            .iter()
+            .filter(|asset| {
+                asset.status == AssetStatus::Available
+                    && matches!(
+                        asset.kind,
+                        AssetKind::Audio { .. }
+                            | AssetKind::Video {
+                                has_audio: true,
+                                ..
+                            }
+                    )
+                    && self.mixer.get_pcm(&asset.id).is_none()
+            })
+            .filter_map(|asset| {
+                resolve_existing_asset_path(&asset.path, project_dir.as_deref())
+                    .map(|p| (asset.id.clone(), p))
+            })
+            .collect();
+
+        for (asset_id, real_path) in missing_audio_assets {
+            self.load_audio_into_mixer(&asset_id, &real_path);
+        }
+    }
+
     fn drain_prefetched_frames(&mut self) -> bool {
         let drained = self.video_prefetcher.drain_completed(&mut self.frame_cache);
         let any = !drained.is_empty();
@@ -2731,6 +2770,28 @@ impl AppController {
             self.last_played_video_frames.insert(asset_id, buf);
         }
         any
+    }
+
+    fn visible_image_assets_at(&self, playhead: FrameIndex) -> Vec<AssetId> {
+        let mut needed = Vec::new();
+        for layer in &self.document.layers {
+            if !layer.visible {
+                continue;
+            }
+            for clip in &layer.clips {
+                let start = clip.timeline_start.get();
+                let end = start.saturating_add(clip.duration.get());
+                if playhead.get() < start || playhead.get() >= end {
+                    continue;
+                }
+                if let ClipKind::Image { asset_id, .. } = &clip.kind
+                    && !needed.contains(asset_id)
+                {
+                    needed.push(asset_id.clone());
+                }
+            }
+        }
+        needed
     }
 
     fn visible_video_sources_at(&self, playhead: FrameIndex) -> Vec<(AssetId, u64)> {
@@ -2828,8 +2889,24 @@ impl AppController {
             .map(Path::to_path_buf);
 
         let needed = self.visible_video_sources_at(playhead);
+        let needed_images = self.visible_image_assets_at(playhead);
         let mut fallback_assets = HashSet::new();
         let is_playing = self.playback_state == PlaybackState::Playing;
+
+        for asset_id in needed_images {
+            let key = FrameCacheKey::new(asset_id.clone(), 0, 100);
+            if self.frame_cache.get(&key).is_some() {
+                continue;
+            }
+            if let Some(asset) = self.document.find_asset(&asset_id)
+                && asset.status == AssetStatus::Available
+                && let Some(real_path) =
+                    resolve_existing_asset_path(&asset.path, project_dir.as_deref())
+                && let Ok(buf) = crate::media::image_loader::load_image_file(&real_path, Some(1920))
+            {
+                self.frame_cache.insert(key, Arc::new(buf));
+            }
+        }
 
         for (asset_id, src_idx) in needed {
             let key = FrameCacheKey::new(asset_id.clone(), src_idx, 100);
@@ -4172,6 +4249,110 @@ mod tests {
         assert!(!controller.has_unsaved_changes());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_command_syncs_new_image_and_audio_resources_on_demand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDirGuard::create("dispatch_media_sync")?;
+        let img_path = temp.path().join("photo.png");
+        let wav_path = temp.path().join("bgm.wav");
+        write_test_png(&img_path)?;
+        write_test_wav_mono_i16(&wav_path, 48_000, 48_000)?;
+
+        let mut controller = AppController::new();
+        let img_id = AssetId::new("ai_img_1")?;
+        let aud_id = AssetId::new("ai_aud_1")?;
+        let layer_id = LayerId::new("ai_layer_1")?;
+
+        let batch = EditCommand::Batch {
+            commands: vec![
+                EditCommand::AddAsset {
+                    temp_id: None,
+                    id: Some(img_id.clone()),
+                    name: "photo.png".to_owned(),
+                    path: AssetPath::from_absolute(img_path.to_string_lossy().into_owned()),
+                    kind: AssetKind::Image {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                EditCommand::AddAsset {
+                    temp_id: None,
+                    id: Some(aud_id.clone()),
+                    name: "bgm.wav".to_owned(),
+                    path: AssetPath::from_absolute(wav_path.to_string_lossy().into_owned()),
+                    kind: AssetKind::Audio {
+                        sample_rate_hz: 48_000,
+                        channels: 1,
+                        source_duration: RationalDuration::from_millis(1_000),
+                    },
+                },
+                EditCommand::AddLayer {
+                    temp_id: None,
+                    id: Some(layer_id.clone()),
+                    name: "AI Photo".to_owned(),
+                    insert_index: None,
+                },
+                EditCommand::AddClip {
+                    temp_id: None,
+                    id: None,
+                    layer_id: LayerRef::Id(layer_id.clone()),
+                    clip: Box::new(NewClipSpec {
+                        name: "photo".to_owned(),
+                        timeline_start: FrameIndex::ZERO,
+                        duration: FrameCount::new(60)?,
+                        effect_offset_frames: 0,
+                        effect_duration_frames: None,
+                        midpoints: Vec::new(),
+                        kind: NewClipKind::Image {
+                            asset_id: AssetRef::Id(img_id.clone()),
+                            visual: crate::media::visual_properties::VisualProperties::default(),
+                        },
+                    }),
+                },
+                EditCommand::AddClip {
+                    temp_id: None,
+                    id: None,
+                    layer_id: LayerRef::Id(layer_id),
+                    clip: Box::new(NewClipSpec {
+                        name: "bgm".to_owned(),
+                        timeline_start: FrameIndex::new(60),
+                        duration: FrameCount::new(60)?,
+                        effect_offset_frames: 0,
+                        effect_duration_frames: None,
+                        midpoints: Vec::new(),
+                        kind: NewClipKind::Audio {
+                            asset_id: AssetRef::Id(aud_id.clone()),
+                            source_in: RationalDuration::ZERO,
+                            playback_rate: PlaybackRate::NORMAL,
+                            preserve_pitch: true,
+                            audio: AudioProperties::default(),
+                        },
+                    }),
+                },
+            ],
+        };
+
+        controller.dispatch_command(&batch)?;
+        assert!(controller.mixer.get_pcm(&aud_id).is_some());
+        assert!(
+            controller
+                .frame_cache
+                .get(&FrameCacheKey::new(img_id.clone(), 0, 100))
+                .is_some()
+        );
+
+        // LRU 追い出し相当でキャッシュが空になっても、refresh_preview_now で再ロードされる
+        controller.frame_cache.clear();
+        controller.refresh_preview_now();
+        assert!(
+            controller
+                .frame_cache
+                .get(&FrameCacheKey::new(img_id, 0, 100))
+                .is_some()
+        );
         Ok(())
     }
 }

@@ -3,11 +3,12 @@
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
-    AiError, AiProvider, AiProviderKind, AiRequest, AiResponse, AiRole, AiStreamEvent,
-    AiThinkingLevel, SecretString,
+    AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiToolCall, AiTurnMessage,
+    SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
-use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync};
+use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
 
 /// Google Gemini API 接続設定。
 #[derive(Debug, Clone)]
@@ -88,14 +89,7 @@ impl GeminiProvider {
             "temperature": 0.1,
             "responseMimeType": "application/json",
         });
-        let lower_model = self.config.model.to_ascii_lowercase();
-        if lower_model.contains("gemini-3") || lower_model.contains("gemini-4") {
-            if let Some(level) = self.config.thinking_level.gemini_thinking_level() {
-                gen_cfg["thinkingConfig"] = json!({ "thinkingLevel": level });
-            }
-        } else if let Some(budget) = self.config.thinking_level.gemini_thinking_budget() {
-            gen_cfg["thinkingConfig"] = json!({ "thinkingBudget": budget });
-        }
+        self.apply_thinking_config(&mut gen_cfg);
 
         json!({
             "systemInstruction": {
@@ -104,6 +98,55 @@ impl GeminiProvider {
             "contents": contents,
             "generationConfig": gen_cfg,
         })
+    }
+
+    fn apply_thinking_config(&self, gen_cfg: &mut Value) {
+        let lower_model = self.config.model.to_ascii_lowercase();
+        if lower_model.contains("gemini-3") || lower_model.contains("gemini-4") {
+            if let Some(level) = self.config.thinking_level.gemini_thinking_level() {
+                gen_cfg["thinkingConfig"] = json!({ "thinkingLevel": level });
+            }
+        } else if let Some(budget) = self.config.thinking_level.gemini_thinking_budget() {
+            gen_cfg["thinkingConfig"] = json!({ "thinkingBudget": budget });
+        }
+    }
+
+    fn build_agent_request_body(&self, request: &AiAgentTurnRequest) -> Value {
+        let contents: Vec<Value> = request
+            .messages
+            .iter()
+            .map(gemini_turn_message_to_json)
+            .collect();
+
+        let temp = request.temperature.unwrap_or(0.2);
+        let mut gen_cfg = json!({ "temperature": temp });
+        if request.tools.is_empty() && request.response_json_schema.is_some() {
+            gen_cfg["responseMimeType"] = json!("application/json");
+        }
+        self.apply_thinking_config(&mut gen_cfg);
+
+        let mut body = json!({
+            "systemInstruction": {
+                "parts": [{ "text": request.system_prompt }]
+            },
+            "contents": contents,
+            "generationConfig": gen_cfg,
+        });
+        if !request.tools.is_empty() {
+            let decls: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": sanitize_gemini_schema(&tool.parameters_schema),
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{ "functionDeclarations": decls }]);
+        }
+        body
     }
 }
 
@@ -114,6 +157,14 @@ impl AiProvider for GeminiProvider {
 
     fn display_name(&self) -> &str {
         &self.label
+    }
+
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
     }
 
     fn send_streaming(
@@ -164,6 +215,152 @@ impl AiProvider for GeminiProvider {
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
     }
+
+    fn send_agent_turn(
+        &self,
+        request: &AiAgentTurnRequest,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        let key = require_api_key(&AiProviderKind::Gemini, self.config.api_key.as_ref())?
+            .ok_or_else(|| AiError::MissingCredentials {
+                provider: "Google Gemini".to_owned(),
+                env_hint: "GEMINI_API_KEY".to_owned(),
+            })?;
+
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base}/models/{}:generateContent", self.config.model);
+        let body = self.build_agent_request_body(request);
+        let headers = [("x-goog-api-key", key.expose())];
+
+        on_event(AiStreamEvent::Status(
+            "Google Gemini エージェント推論中...".to_owned(),
+        ));
+
+        let http_req = HttpJsonRequest {
+            url: &url,
+            headers: &headers,
+            body: &body,
+            timeout_secs: self.config.timeout_secs,
+        };
+        let json_val = post_json_sync(&http_req)?;
+        parse_gemini_agent_response(&json_val, &self.config.model)
+    }
+}
+
+fn gemini_turn_message_to_json(msg: &AiTurnMessage) -> Value {
+    match msg {
+        AiTurnMessage::System { text } => json!({
+            "role": "user",
+            "parts": [{ "text": format!("[System Note]\n{text}") }],
+        }),
+        AiTurnMessage::User { parts } => {
+            let gem_parts: Vec<Value> = parts
+                .iter()
+                .map(|part| match part {
+                    AiContentPart::Text { text } => json!({ "text": text }),
+                    AiContentPart::ImageData {
+                        mime_type,
+                        base64_data,
+                    } => json!({
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_data,
+                        }
+                    }),
+                })
+                .collect();
+            json!({ "role": "user", "parts": gem_parts })
+        }
+        AiTurnMessage::Assistant { text, tool_calls } => {
+            let mut gem_parts = Vec::new();
+            if let Some(txt) = text
+                && !txt.is_empty()
+            {
+                gem_parts.push(json!({ "text": txt }));
+            }
+            for call in tool_calls {
+                gem_parts.push(json!({
+                    "functionCall": {
+                        "name": call.name,
+                        "args": call.arguments,
+                    }
+                }));
+            }
+            if gem_parts.is_empty() {
+                gem_parts.push(json!({ "text": "" }));
+            }
+            json!({ "role": "model", "parts": gem_parts })
+        }
+        AiTurnMessage::ToolResult {
+            name,
+            content_json,
+            is_error,
+            ..
+        } => {
+            let parsed = serde_json::from_str::<Value>(content_json)
+                .unwrap_or_else(|_| Value::String(content_json.clone()));
+            let payload = if *is_error {
+                json!({ "error": parsed })
+            } else {
+                json!({ "result": parsed })
+            };
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": name,
+                        "response": payload,
+                    }
+                }]
+            })
+        }
+    }
+}
+
+fn sanitize_gemini_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if matches!(k.as_str(), "$schema" | "additionalProperties" | "title") {
+                    continue;
+                }
+                out.insert(k.clone(), sanitize_gemini_schema(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_gemini_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnResponse, AiError> {
+    let candidate = &val["candidates"][0];
+    let parts = candidate["content"]["parts"]
+        .as_array()
+        .ok_or_else(|| AiError::ParseFailed("Gemini agent response missing parts".to_owned()))?;
+    let mut text_buf = String::new();
+    let mut tool_calls = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if let Some(txt) = part["text"].as_str() {
+            text_buf.push_str(txt);
+        }
+        if let Some(fc) = part.get("functionCall").filter(|v| v.is_object())
+            && let Some(name) = fc["name"].as_str()
+        {
+            tool_calls.push(AiToolCall {
+                id: format!("gem_call_{idx}"),
+                name: name.to_owned(),
+                arguments: fc.get("args").cloned().unwrap_or_else(|| json!({})),
+            });
+        }
+    }
+    Ok(AiAgentTurnResponse {
+        text: (!text_buf.is_empty()).then_some(text_buf),
+        tool_calls,
+        model: model.to_owned(),
+        finish_reason: candidate["finishReason"].as_str().map(ToOwned::to_owned),
+    })
 }
 
 fn parse_gemini_json_text(payload: &str) -> Result<Option<String>, AiError> {
@@ -234,6 +431,55 @@ mod tests {
             req_thinking["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             json!(24576)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_agent_turn_supports_vision_and_function_calls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resp_body = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"inspect_media_folder","args":{"path":"C:/wedding"}}}]},"finishReason":"STOP"}]}"#;
+        let (addr, server) = spawn_single_response_server("application/json", resp_body)?;
+
+        let mut cfg = GeminiConfig::new(
+            "gemini-2.5-flash",
+            Some(SecretString::new("gem-vision-key")),
+        );
+        cfg.base_url = format!("http://{addr}/v1beta");
+        let provider = GeminiProvider::new(cfg);
+        assert!(provider.supports_vision());
+        assert!(provider.supports_native_tools());
+
+        let turn_req = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("この写真を見て"),
+                    AiContentPart::image_bytes("image/jpeg", b"fakejpeg"),
+                ],
+            }],
+            tools: vec![crate::ai::provider::AiToolDefinition {
+                name: "inspect_media_folder".to_owned(),
+                description: "フォルダ走査".to_owned(),
+                parameters_schema: json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "path": { "type": "string" } }
+                }),
+            }],
+            response_json_schema: None,
+            temperature: Some(0.1),
+        };
+        let res = provider.send_agent_turn(&turn_req, &mut |_| {})?;
+        assert_eq!(res.tool_calls.len(), 1);
+        assert_eq!(res.tool_calls[0].name, "inspect_media_folder");
+        assert_eq!(res.tool_calls[0].arguments["path"], "C:/wedding");
+
+        let captured = server.join().map_err(|_| "server join failed")??;
+        assert!(captured.contains("inlineData"));
+        assert!(captured.contains("functionDeclarations"));
+        assert!(!captured.contains("$schema"));
+        assert!(!captured.contains("additionalProperties"));
         Ok(())
     }
 

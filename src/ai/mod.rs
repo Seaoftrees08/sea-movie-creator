@@ -2,6 +2,7 @@
 
 pub mod context_builder;
 pub mod mcp_server;
+pub mod media_inspector;
 pub mod planner;
 pub mod plugin_host;
 pub mod provider;

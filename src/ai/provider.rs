@@ -711,6 +711,181 @@ pub enum AiStreamEvent {
     Failed(String),
 }
 
+/// エージェント実行時の安全制御・レート制限・Vision バッチ設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRuntimeSettings {
+    /// 1 ターンあたりの自律ステップ（ツール／LLM 呼出）上限。`0` は無制限。
+    #[serde(default)]
+    pub max_steps_per_turn: u32,
+    /// 外部 LLM 呼び出し間の最小待機時間（ミリ秒）。高頻度連続呼び出しによるアカウント制限対策用。
+    #[serde(default)]
+    pub min_llm_interval_ms: u64,
+    /// Vision バッチ解析で 1 リクエストに含める画像枚数。
+    #[serde(default = "default_vision_batch_size")]
+    pub vision_batch_size: usize,
+    /// Vision 送信用サムネイルの長辺上限ピクセル数。
+    #[serde(default = "default_vision_max_edge_px")]
+    pub vision_max_edge_px: u32,
+}
+
+const fn default_vision_batch_size() -> usize {
+    6
+}
+
+const fn default_vision_max_edge_px() -> u32 {
+    512
+}
+
+impl Default for AgentRuntimeSettings {
+    fn default() -> Self {
+        Self {
+            max_steps_per_turn: 0,
+            min_llm_interval_ms: 0,
+            vision_batch_size: default_vision_batch_size(),
+            vision_max_edge_px: default_vision_max_edge_px(),
+        }
+    }
+}
+
+/// マルチモーダル会話メッセージ内の 1 コンテンツパート。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AiContentPart {
+    /// テキストパート。
+    Text {
+        /// 本文テキスト。
+        text: String,
+    },
+    /// Base64 エンコードされた画像データ（長辺縮小済みサムネイル等）。
+    ImageData {
+        /// MIME 種別（例: `"image/jpeg"`, `"image/png"`）。
+        mime_type: String,
+        /// Base64 文字列。
+        base64_data: String,
+    },
+}
+
+impl AiContentPart {
+    /// テキストパートを構築する。
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    /// バイト列を Base64 化して画像パートを構築する。
+    #[must_use]
+    pub fn image_bytes(mime_type: impl Into<String>, bytes: &[u8]) -> Self {
+        Self::ImageData {
+            mime_type: mime_type.into(),
+            base64_data: encode_base64(bytes),
+        }
+    }
+}
+
+/// LLM へ通知するツール定義（Function Calling / JSON フォールバック共通）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiToolDefinition {
+    /// 一意なツール識別名。
+    pub name: String,
+    /// ツール機能・使い方の説明文。
+    pub description: String,
+    /// 引数の JSON Schema オブジェクト。
+    pub parameters_schema: serde_json::Value,
+}
+
+/// LLM 応答から抽出された 1 件のツール呼び出し要求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiToolCall {
+    /// プロバイダまたはホストが割り当てる呼び出し ID。
+    pub id: String,
+    /// 呼び出すツール名。
+    pub name: String,
+    /// ツール引数 JSON。
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// マルチターン・ツール実行を含むエージェント推論用メッセージ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum AiTurnMessage {
+    /// システム追記事項。
+    System {
+        /// 本文。
+        text: String,
+    },
+    /// ユーザー入力（テキストおよび任意画像）。
+    User {
+        /// コンテンツパート列。
+        parts: Vec<AiContentPart>,
+    },
+    /// アシスタントのテキスト応答・ツール呼び出し宣言。
+    Assistant {
+        /// 応答テキスト（ツール呼び出しのみ時は `None`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// 要求されたツール呼び出し一覧。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<AiToolCall>,
+    },
+    /// ツール実行結果のフィードバック。
+    ToolResult {
+        /// 対応する [`AiToolCall::id`]。
+        tool_call_id: String,
+        /// 実行したツール名。
+        name: String,
+        /// JSON 文字列化された実行結果。
+        content_json: String,
+        /// 実行エラーだった場合 `true`。
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+impl AiTurnMessage {
+    /// テキストのみのユーザーメッセージを生成する。
+    #[must_use]
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self::User {
+            parts: vec![AiContentPart::text(text)],
+        }
+    }
+}
+
+/// マルチモーダル・ツール呼び出し対応の AI エージェントターンリクエスト。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiAgentTurnRequest {
+    /// システム指示文。
+    pub system_prompt: String,
+    /// これまでの会話・ツール実行履歴。
+    pub messages: Vec<AiTurnMessage>,
+    /// 今回のターンで利用可能なツール一覧。
+    #[serde(default)]
+    pub tools: Vec<AiToolDefinition>,
+    /// `tools` 未使用時に期待する構造化 JSON Schema（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_json_schema: Option<serde_json::Value>,
+    /// 温度パラメータ（省略時は既定値 `0.2` 相当）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+}
+
+/// マルチモーダル・ツール呼び出し対応の AI エージェントターン応答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAgentTurnResponse {
+    /// テキスト応答（存在する場合）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// モデルが要求したツール呼び出し一覧。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<AiToolCall>,
+    /// 実際に応答したモデル名。
+    pub model: String,
+    /// プロバイダが返した終了理由（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
 /// 組み込み HTTP・Mock・外部プラグインを統一的に扱う AI プロバイダトレイト。
 pub trait AiProvider: Send + Sync {
     /// 識別子文字列。
@@ -718,6 +893,16 @@ pub trait AiProvider: Send + Sync {
 
     /// UI 表示名称。
     fn display_name(&self) -> &str;
+
+    /// 画像（マルチモーダル）入力に対応しているか。
+    fn supports_vision(&self) -> bool {
+        false
+    }
+
+    /// Native Tool Calling / Function Calling に対応しているか。
+    fn supports_native_tools(&self) -> bool {
+        false
+    }
 
     /// プロンプトを送信し、逐次イベントをコールバックへ流しながら完了応答を返す。
     ///
@@ -729,6 +914,218 @@ pub trait AiProvider: Send + Sync {
         request: &AiRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError>;
+
+    /// マルチモーダル・ツール呼び出し対応のエージェントターンを実行する。
+    ///
+    /// 既定実装は Native Tool Calling 非対応プロバイダ向けに `tools` 定義をテキストプロンプトへ
+    /// 埋め込み、[`Self::send_streaming`] 経由で構造化 JSON 応答を解析するフォールバックを提供します。
+    ///
+    /// # Errors
+    ///
+    /// 認証情報欠如・通信失敗・応答解析エラー時に [`AiError`] を返す。
+    fn send_agent_turn(
+        &self,
+        request: &AiAgentTurnRequest,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        fallback_agent_turn_via_streaming(self, request, on_event)
+    }
+}
+
+/// バイト列を標準 Base64（RFC 4648 パディング付き）文字列へエンコードする。
+#[must_use]
+pub fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(char::from(TABLE[((triple >> 18) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 12) & 0x3F) as usize]));
+        if chunk.len() > 1 {
+            out.push(char::from(TABLE[((triple >> 6) & 0x3F) as usize]));
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(TABLE[(triple & 0x3F) as usize]));
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// テキストベースの統一 JSON アクションモード向けツール指示文を生成する。
+#[must_use]
+pub(crate) fn format_tools_fallback_instructions(tools: &[AiToolDefinition]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let tools_json = serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        "\n\n# Available Tools (JSON Action Mode)\n\
+         If you need to invoke tools before answering, reply ONLY with a JSON object:\n\
+         {{\"tool_calls\":[{{\"name\":\"<tool_name>\",\"arguments\":{{...}}}}],\"message\":\"optional status\"}}\n\
+         If no tool calls are needed, reply with your final text or JSON directly.\n\n{tools_json}"
+    )
+}
+
+fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
+    provider: &P,
+    request: &AiAgentTurnRequest,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<AiAgentTurnResponse, AiError> {
+    let mut sys = request.system_prompt.clone();
+    sys.push_str(&format_tools_fallback_instructions(&request.tools));
+
+    let mut history = Vec::new();
+    let mut last_user_prompt = String::new();
+    for (idx, msg) in request.messages.iter().enumerate() {
+        let is_last = idx + 1 == request.messages.len();
+        let (role, content) = render_turn_message_as_text(msg);
+        if is_last && role == AiRole::User {
+            last_user_prompt = content;
+        } else {
+            history.push(AiChatMessage { role, content });
+        }
+    }
+    if last_user_prompt.is_empty() {
+        "Continue based on the tool results above.".clone_into(&mut last_user_prompt);
+    }
+
+    let legacy_req = AiRequest {
+        system_prompt: sys,
+        command_schema_json: request
+            .response_json_schema
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({})),
+        context_summary: serde_json::json!({}),
+        history,
+        user_prompt: last_user_prompt,
+        stream: false,
+    };
+    let resp = provider.send_streaming(&legacy_req, on_event)?;
+    Ok(parse_fallback_agent_response(&resp.raw_text, &resp.model))
+}
+
+fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
+    match msg {
+        AiTurnMessage::System { text } => (AiRole::System, text.clone()),
+        AiTurnMessage::User { parts } => {
+            let mut texts = Vec::new();
+            let mut img_count = 0_usize;
+            for part in parts {
+                match part {
+                    AiContentPart::Text { text } => texts.push(text.clone()),
+                    AiContentPart::ImageData { .. } => img_count += 1,
+                }
+            }
+            if img_count > 0 {
+                texts.push(format!(
+                    "[{img_count} image(s) attached; provider text-fallback]"
+                ));
+            }
+            (AiRole::User, texts.join("\n"))
+        }
+        AiTurnMessage::Assistant { text, tool_calls } => {
+            if tool_calls.is_empty() {
+                (AiRole::Assistant, text.clone().unwrap_or_default())
+            } else {
+                let payload = serde_json::json!({
+                    "message": text,
+                    "tool_calls": tool_calls,
+                });
+                (AiRole::Assistant, payload.to_string())
+            }
+        }
+        AiTurnMessage::ToolResult {
+            tool_call_id,
+            name,
+            content_json,
+            is_error,
+        } => {
+            let status = if *is_error { "ERROR" } else { "OK" };
+            (
+                AiRole::User,
+                format!("[ToolResult {name} id={tool_call_id} status={status}]\n{content_json}"),
+            )
+        }
+    }
+}
+
+pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAgentTurnResponse {
+    if let Some(val) = extract_json_object_for_tools(raw_text)
+        && let Some(calls_arr) = val.get("tool_calls").and_then(serde_json::Value::as_array)
+    {
+        let mut parsed_calls = Vec::new();
+        for (idx, item) in calls_arr.iter().enumerate() {
+            if let Some(name) = item.get("name").and_then(serde_json::Value::as_str)
+                && !name.trim().is_empty()
+            {
+                let id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map_or_else(|| format!("fallback_call_{idx}"), ToOwned::to_owned);
+                let arguments = item
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                parsed_calls.push(AiToolCall {
+                    id,
+                    name: name.to_owned(),
+                    arguments,
+                });
+            }
+        }
+        if !parsed_calls.is_empty() {
+            let note = val
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            return AiAgentTurnResponse {
+                text: note,
+                tool_calls: parsed_calls,
+                model: model.to_owned(),
+                finish_reason: Some("tool_calls".to_owned()),
+            };
+        }
+    }
+
+    AiAgentTurnResponse {
+        text: (!raw_text.trim().is_empty()).then(|| raw_text.to_owned()),
+        tool_calls: Vec::new(),
+        model: model.to_owned(),
+        finish_reason: Some("stop".to_owned()),
+    }
+}
+
+fn extract_json_object_for_tools(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && val.is_object()
+    {
+        return Some(val);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+        .ok()
+        .filter(serde_json::Value::is_object)
 }
 
 #[cfg(test)]
@@ -763,5 +1160,24 @@ mod tests {
         assert_eq!(AiThinkingLevel::Auto.acp_thought_level(), None);
         assert_eq!(AiProviderKind::ui_selectable_providers().len(), 7);
         Ok(())
+    }
+
+    #[test]
+    fn base64_encoding_matches_rfc4648_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn fallback_agent_parser_extracts_tool_calls_from_fenced_json() {
+        let raw = "調べてみます。\n```json\n{\"tool_calls\":[{\"name\":\"inspect_media_folder\",\"arguments\":{\"path\":\"C:/photos\"}}],\"message\":\"スキャン開始\"}\n```";
+        let parsed = parse_fallback_agent_response(raw, "ollama:qwen3");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "inspect_media_folder");
+        assert_eq!(parsed.tool_calls[0].arguments["path"], "C:/photos");
+        assert_eq!(parsed.text.as_deref(), Some("スキャン開始"));
     }
 }

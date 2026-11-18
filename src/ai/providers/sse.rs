@@ -36,6 +36,41 @@ where
     FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
     FSync: FnMut(&Value) -> Result<String, AiError>,
 {
+    let (mut resp, content_type) = send_json_post(request, "text/event-stream, application/json")?;
+
+    if content_type.contains("text/event-stream") {
+        read_sse_lines(resp.body_mut().as_reader(), &mut on_sse_payload, on_event)
+    } else {
+        let json_val: Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))?;
+        let text = on_sync_json(&json_val)?;
+        if !text.is_empty() {
+            on_event(AiStreamEvent::DeltaText(text.clone()));
+        }
+        Ok(text)
+    }
+}
+
+/// 指定 URL へ非ストリーミングの JSON POST を行い、完全な JSON 応答オブジェクトを返す。
+///
+/// マルチモーダルや Native Tool Calling など、完全構造化応答を一括取得するエージェントターン向け。
+///
+/// # Errors
+///
+/// 通信失敗・HTTP 4xx/5xx エラー・JSON 解析エラー時に [`AiError`] を返す。
+pub fn post_json_sync(request: &HttpJsonRequest<'_>) -> Result<Value, AiError> {
+    let (mut resp, _) = send_json_post(request, "application/json")?;
+    resp.body_mut()
+        .read_json()
+        .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))
+}
+
+fn send_json_post(
+    request: &HttpJsonRequest<'_>,
+    accept_header: &str,
+) -> Result<(ureq::http::Response<ureq::Body>, String), AiError> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(request.timeout_secs.max(5))))
         .http_status_as_error(false)
@@ -45,7 +80,7 @@ where
     let mut req = agent
         .post(request.url)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream, application/json");
+        .header("Accept", accept_header);
     for (name, val) in request.headers {
         req = req.header(*name, *val);
     }
@@ -74,19 +109,7 @@ where
         });
     }
 
-    if content_type.contains("text/event-stream") {
-        read_sse_lines(resp.body_mut().as_reader(), &mut on_sse_payload, on_event)
-    } else {
-        let json_val: Value = resp
-            .body_mut()
-            .read_json()
-            .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))?;
-        let text = on_sync_json(&json_val)?;
-        if !text.is_empty() {
-            on_event(AiStreamEvent::DeltaText(text.clone()));
-        }
-        Ok(text)
-    }
+    Ok((resp, content_type))
 }
 
 fn read_sse_lines<R, FChunk>(
