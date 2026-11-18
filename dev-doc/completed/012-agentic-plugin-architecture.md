@@ -1,22 +1,22 @@
 # [012] 自律エージェントプラグイン基盤＆構成コンパイラ設計書（Agentic Movie Creator Plugin）
 
-- **ステータス**: Approved
+- **ステータス**: Implemented
 - **作成日**: 2026-11-18
-- **更新日**: 2026-11-18
+- **更新日**: 2026-11-19
 - **関連ドキュメント**:
-  - 全体基本設計書（完了済み）: [`completed/draft.md`](completed/draft.md)
-  - 初期実装設計書 Phase C（完了済み）: [`completed/initial-implementation/PhaseC.md`](completed/initial-implementation/PhaseC.md)
-  - 機能モジュール・プラグイン開発ロードマップ: [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md)
-  - 将来拡張メモ（本機能群の次期候補）: [`loadmap/Agent-Future-Features.md`](loadmap/Agent-Future-Features.md)
-  - AI 連携・MCP・音声プラグインガイド: [`../docs/ai-and-plugins.md`](../docs/ai-and-plugins.md)
-  - エージェントプラグイン開発ガイド（第三者向け）: [`../docs/plugins/agent-plugins.md`](../docs/plugins/agent-plugins.md)
+  - 全体基本設計書（完了済み）: [`draft.md`](draft.md)
+  - 初期実装設計書 Phase C（完了済み）: [`initial-implementation/PhaseC.md`](initial-implementation/PhaseC.md)
+  - 機能モジュール・プラグイン開発ロードマップ: [`../loadmap/Plugin Loadmap.md`](../loadmap/Plugin%20Loadmap.md)
+  - 将来拡張メモ（本機能群の次期候補）: [`../loadmap/Agent-Future-Features.md`](../loadmap/Agent-Future-Features.md)
+  - AI 連携・MCP・音声プラグインガイド: [`../../docs/ai-and-plugins.md`](../../docs/ai-and-plugins.md)
+  - エージェントプラグイン開発ガイド（第三者向け）: [`../../docs/plugins/agent-plugins.md`](../../docs/plugins/agent-plugins.md)
 
 ---
 
 ## 1. 概要・目的
 
 - **解決したい課題・達成したいこと**:
-  - 従来の `AI Chat` 機能（[`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs) / [`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs)）は、1 回の指示に対して単一の `EditCommand`（または `EditCommand::Batch`）JSON を 1 往復で返す「単発編集モデル」であった。
+  - 従来の `AI Chat` 機能（[`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs) / [`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs)）は、1 回の指示に対して単一の `EditCommand`（または `EditCommand::Batch`）JSON を 1 往復で返す「単発編集モデル」であった。
   - 本設計では、**「このフォルダにある画像を使って結婚式プロフィールムービーを 3 分で、適切な字幕付きで作って」** のような高レベル・複数工程の指示に対し、**VS Code 風のリッチな対話・セッション管理を備え、別プロセス型プラグインとして自律的にタイムラインを構築・詳細調整できるエージェント基盤**を実現する。
   - あわせて、今後本体機能モジュール（Phase P0〜P5 等）やサードパーティ製プラグインが増えた際にも、エージェントプラグイン側の再実装なしで AI が新機能を認識・利用できる **「4 層の自己記述・拡張契約」** を策定・実装する。
 - **対象ユーザー / 利用シーン**:
@@ -46,7 +46,7 @@
 
 ### 対象外（Out of Scope / MVP 後に分離）
 
-- 専用の GPU ガウスぼかし背景シェーダ、装飾フレーム／フィルムグレイン等の特殊映像シェーダ（[`loadmap/Agent-Future-Features.md`](loadmap/Agent-Future-Features.md) へ記録）
+- 専用の GPU ガウスぼかし背景シェーダ、装飾フレーム／フィルムグレイン等の特殊映像シェーダ（[`../loadmap/Agent-Future-Features.md`](../loadmap/Agent-Future-Features.md) へ記録）
 - BGM 波形ビート／サビ自動検出によるトランジション同期（同上）
 - Phase P1（TTS 音声合成）や Phase P2（立ち絵）の本体機能実装そのもの（本設計の `HostToolRegistry` 契約により、実装後に自動接続可能）
 
@@ -136,7 +136,7 @@ flowchart LR
 1. **能力スナップショット契約 (`HostCapabilitySnapshot`)**:
    - `edit_command_schema_json`（`schemars` による `///` 説明付きスキーマ）、利用可能フォント一覧、導入済みプラグイン（有効・未設定・欠損状態と任意 `ai_hints`）を構造化 JSON で供給。
 2. **動的自己記述ツール契約 (`HostToolRegistry` / `AgentTool`)**:
-   - 各ツールが `name`, `category`, `description`, `input_schema`, `safety_class`, `supports_progress` を自己申告し、`host/list_tools` で公開。エージェントは既知ツールの高速パスに加え、未知ツールを LLM ツール呼び出しへそのまま橋渡しできる。[`mcp_server.rs`](../src/ai/mcp_server.rs) とも基盤を共有。
+   - 各ツールが `name`, `category`, `description`, `input_schema`, `safety_class`, `supports_progress` を自己申告し、`host/list_tools` で公開。エージェントは既知ツールの高速パスに加え、未知ツールを LLM ツール呼び出しへそのまま橋渡しできる。[`mcp_server.rs`](../../src/ai/mcp_server.rs) とも基盤を共有。
 3. **プラグインマニフェスト `ai_hints` 後方互換規約**:
    - `plugin.json` / `ai-plugin.json` / `agent-plugin.json` に `#[serde(default)]` の任意 `ai_hints`（`purpose`, `capabilities`, `recommended_scenarios`）を許容。
 4. **`DraftSandbox` ＋ `ToolSafetyClass` ＋ `Manual` / `Autopilot` 統合**:
