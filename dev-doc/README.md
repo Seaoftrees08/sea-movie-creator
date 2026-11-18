@@ -21,14 +21,23 @@
 | --- | --- | --- | --- |
 | - | 設計書テンプレート | Template | [`_template.md`](_template.md) |
 | - | 要件メモ（初期実装の要件定義） | Implemented | [`completed/initial-implementation/draft.md`](completed/initial-implementation/draft.md) |
-| - | 全体基本設計書（アーキテクチャ・AI ネイティブ設計） | Draft | [`draft.md`](draft.md) |
+| - | 全体基本設計書（アーキテクチャ・AI ネイティブ設計） | Implemented | [`completed/draft.md`](completed/draft.md) |
 | - | 初期実装設計書：Phase A（基盤・評価・再生・GPUI 骨格） | Implemented | [`completed/initial-implementation/PhaseA.md`](completed/initial-implementation/PhaseA.md) |
 | - | 初期実装設計書：Phase B（編集 UI・GPU 合成・書き出しプラグイン） | Implemented | [`completed/initial-implementation/PhaseB.md`](completed/initial-implementation/PhaseB.md) |
 | - | 初期実装設計書：Phase C（AI チャット/プラグイン・VST3/CLAP・拡張） | Implemented | [`completed/initial-implementation/PhaseC.md`](completed/initial-implementation/PhaseC.md) |
-| 001 | ゆっくり実況向け専用モジュール（初期設計完了後・将来機能） | Draft | [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md) |
-| 002 | AviUtl 準拠 UI 大幅修正設計書（全体概要・レイアウト設計） | Draft | [`002-aviutl-ui-redesign/README.md`](002-aviutl-ui-redesign/README.md) |
-| 002-01 | ↳ データモデル・編集コマンド・コントローラ拡張仕様 | Draft | [`002-aviutl-ui-redesign/01-data-model-and-commands.md`](002-aviutl-ui-redesign/01-data-model-and-commands.md) |
-| 002-02 | ↳ 拡張編集タイムライン UI/UX 詳細仕様 | Draft | [`002-aviutl-ui-redesign/02-timeline-spec.md`](002-aviutl-ui-redesign/02-timeline-spec.md) |
-| 002-03 | ↳ 設定ダイアログ（Clip インスペクタ）UI/UX 詳細仕様 | Draft | [`002-aviutl-ui-redesign/03-inspector-dialog-spec.md`](002-aviutl-ui-redesign/03-inspector-dialog-spec.md) |
-| 002-04 | ↳ プレビュー直接操作・メニューバー・ショートカット詳細仕様 | Draft | [`002-aviutl-ui-redesign/04-preview-and-shortcuts-spec.md`](002-aviutl-ui-redesign/04-preview-and-shortcuts-spec.md) |
-| 002-05 | ↳ AviUtl 準拠 UI 段階的実装計画（Phase D-1 〜 D-6） | Draft | [`002-aviutl-ui-redesign/05-implementation-plan.md`](002-aviutl-ui-redesign/05-implementation-plan.md) |
+| 001 | ゆっくり実況向け専用モジュール（ドメイン共通基盤設計） | Draft | [`001-yukkuri-live-module.md`](001-yukkuri-live-module.md) |
+| 002 | AviUtl 準拠 UI 大幅修正設計書（全体概要・レイアウト設計） | Implemented | [`completed/002-aviutl-ui-redesign/README.md`](completed/002-aviutl-ui-redesign/README.md) |
+| 002-01 | ↳ データモデル・編集コマンド・コントローラ拡張仕様 | Implemented | [`completed/002-aviutl-ui-redesign/01-data-model-and-commands.md`](completed/002-aviutl-ui-redesign/01-data-model-and-commands.md) |
+| 002-02 | ↳ 拡張編集タイムライン UI/UX 詳細仕様 | Implemented | [`completed/002-aviutl-ui-redesign/02-timeline-spec.md`](completed/002-aviutl-ui-redesign/02-timeline-spec.md) |
+| 002-03 | ↳ 設定ダイアログ（Clip インスペクタ）UI/UX 詳細仕様 | Implemented | [`completed/002-aviutl-ui-redesign/03-inspector-dialog-spec.md`](completed/002-aviutl-ui-redesign/03-inspector-dialog-spec.md) |
+| 002-04 | ↳ プレビュー直接操作・メニューバー・ショートカット詳細仕様 | Implemented | [`completed/002-aviutl-ui-redesign/04-preview-and-shortcuts-spec.md`](completed/002-aviutl-ui-redesign/04-preview-and-shortcuts-spec.md) |
+| 002-05 | ↳ AviUtl 準拠 UI 段階的実装計画（Phase D-1 〜 D-6） | Implemented | [`completed/002-aviutl-ui-redesign/05-implementation-plan.md`](completed/002-aviutl-ui-redesign/05-implementation-plan.md) |
+| 003 | タイムラインクリップ表示・再生FPS・音声再生・プレビュー画質の抜本改修 | Implemented | [`completed/003-playback-audio-quality-and-clip-tile-fix.md`](completed/003-playback-audio-quality-and-clip-tile-fix.md) |
+| - | 市場調査・開発戦略レポート | Reference | [`loadmap/Market Research.md`](loadmap/Market%20Research.md) |
+| - | プラグイン開発ロードマップ（要件・優先順位） | Draft | [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md) |
+| 004 | Phase P0 設計書：本体前提基盤（キャラプリセット・連続字幕入力・APIキーガイド・プラグイン導線） | Draft | [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md) |
+| 005 | Phase P1 設計書：音声作成プラグイン（TTS 連携・尺自動伸縮・リップル・間・キャッシュ） | Draft | [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md) |
+| 006 | Phase P2 設計書：感情連動立ち絵・定番演出自動配置プラグイン | Draft | [`006-phase-p2-tachie-ai-effects-plugin.md`](006-phase-p2-tachie-ai-effects-plugin.md) |
+| 007 | Phase P3 設計書：無音カットプラグイン（録画下準備用・完全ローカル音量判定） | Draft | [`007-phase-p3-silence-cut-plugin.md`](007-phase-p3-silence-cut-plugin.md) |
+| 008 | Phase P4 設計書：拡張入力プラグイン（肉声実況向け自動字幕 ／ 外部台本インポート） | Draft | [`008-phase-p4-extended-input-plugins.md`](008-phase-p4-extended-input-plugins.md) |
+| 009 | Phase P5 設計書：他ソフト向けプロジェクト書き出しプラグイン（YMM4 → AviUtl サブ機能） | Draft | [`009-phase-p5-external-project-export-plugins.md`](009-phase-p5-external-project-export-plugins.md) |
