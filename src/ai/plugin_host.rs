@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::ai::provider::{
     AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiStreamEvent,
 };
+use crate::core::PluginAiHints;
 use crate::export::registry::resolve_plugin_executable;
 
 /// `ai-plugin.json` が宣言できる通信プロトコル種別。
@@ -66,6 +67,9 @@ pub struct AiPluginManifest {
     /// 選択可能なプロファイル一覧（`ACP` 用など）。
     #[serde(default)]
     pub profiles: Vec<AiPluginProfile>,
+    /// AI エージェント向けの任意自己記述ヒント（後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_hints: Option<PluginAiHints>,
 }
 
 /// AI プラグイン検出・実行時のエラー。

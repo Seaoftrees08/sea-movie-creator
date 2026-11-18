@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::core::PluginAiHints;
 use crate::export::protocol::{AudioSampleFormat, PixelFormat};
 
 /// 現在のプラグインマニフェスト仕様バージョン。
@@ -163,6 +164,9 @@ pub struct ExportPluginManifest {
     /// ユーザーが設定変更可能な追加オプション項目定義。
     #[serde(default)]
     pub option_fields: Vec<ExportOptionField>,
+    /// AI エージェント向けの任意自己記述ヒント（後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_hints: Option<PluginAiHints>,
 }
 
 /// マニフェスト解析・検証エラー。

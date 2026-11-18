@@ -1490,6 +1490,7 @@ mod tests {
                     default_options: serde_json::json!({ "speed": 5 }),
                 }],
                 option_fields: Vec::new(),
+                ai_hints: None,
             },
             manifest_path: PathBuf::from("plugin.json"),
             plugin_dir: PathBuf::from("."),
