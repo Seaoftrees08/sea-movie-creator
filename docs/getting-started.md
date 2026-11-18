@@ -91,13 +91,26 @@ cargo build --release --workspace
 ./target/release/sea-movie-creator
 ```
 
-### 開発時の品質チェック・全テスト
+### 開発時の品質チェック・全テスト（PR 前チェック）
 
-コードを変更した場合や動作環境を詳しく確認したい場合は、ワークスペース全体のフォーマット・Clippy・全テストを実行します（テスト実行前にプラグインバイナリのビルドが必要です）。
+コードを変更した場合や PR を作成する前は、ワークスペース全体のフォーマット・Clippy・Rustdoc・ビルド・全テスト（品質ゲート結合テスト `tests/quality_gates.rs` 含む）を実行します。統一スクリプトを使うと一括で確認できます（ローカルに `cargo-deny` を導入している場合はライセンス・脆弱性監査も自動実行されます）。
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File scripts/pre-pr.ps1
+```
+
+```bash
+# macOS / Linux
+./scripts/pre-pr.sh
+```
+
+個別に実行する場合は以下を実行します：
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo build --workspace --all-targets
 cargo test --workspace --all-targets --all-features
 ```

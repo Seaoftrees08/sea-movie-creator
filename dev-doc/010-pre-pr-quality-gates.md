@@ -1,6 +1,6 @@
 # [010] PR 前コード品質ゲート・自動テスト基盤
 
-- **ステータス**: Approved
+- **ステータス**: Implemented
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
@@ -54,10 +54,10 @@
   - ローカルで `pwsh -File scripts/pre-pr.ps1`（または `./scripts/pre-pr.sh`）を実行すれば、PR 前に必要なすべての検査が順序立てて実行され、失敗時に非ゼロ終了コードで即停止すること。
   - `cargo test --workspace --all-targets --all-features` 単独でも、第 2 層の品質ガード結合テスト群が環境依存なく数秒で全通過すること。
 - **非機能要件（ランナー節約・クロスプラットフォーム・誤検知防止）**:
-  - GitHub Actions では OS 非依存の検査（`fmt` / `doc` / `cargo-deny` / シークレットスキャン）を `ubuntu-latest` 単体ジョブのみで実行し、Windows/macOS ランナー消費を抑制する。
+  - GitHub Actions では OS 非依存の検査（`fmt` / `doc` / `cargo-deny`）を `ubuntu-latest` 単体ジョブのみで実行し、Windows/macOS ランナー消費を抑制する。
   - `concurrency` に `cancel-in-progress: true` を設定し、連続プッシュ時の冗長ジョブを自動停止する。
-  - シークレット検査では、テスト用の明らかなプレースホルダ（`test-key`, `dummy`, `example`, `placeholder` 等を含むものや最小長未満）で偽陽性を出さないようにする。
-  - `pre-pr` スクリプトはローカルに `cargo-deny` が未導入でも他の必須検査を完走させ、未導入時は警告・導入手順を出して判断できるようにする（`-RequireDeny` 等のフラグで厳格化可能）。
+  - シークレット検査では、テスト用の明らかなプレースホルダ（`example`, `dummy`, `placeholder`, `your-api-key`, `your_api_key` 等）で偽陽性を出さないようにする。
+  - `pre-pr` スクリプトはローカルに `cargo-deny` が未導入でも他の必須検査を完走させ、未導入時は警告・導入手順を出して判断できるようにする（`-RequireDeny` / `--require-deny` で厳格化可能）。
 
 ---
 
@@ -75,16 +75,15 @@
 ### 4.2 CI ワークフロー分割（`.github/workflows/ci.yml`）
 
 ```text
-push / pull_request
+push / pull_request (concurrency: cancel-in-progress = true)
  ├── quality-gates (ubuntu-latest, 1x)
  │    ├── cargo fmt --all --check
  │    ├── RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
- │    ├── EmbarkStudios/cargo-deny-action@v2 (advisories, licenses, bans, sources)
- │    └── scripts/pre-pr.sh --ci-static-only (秘密情報・規約の追加静的チェック)
+ │    └── EmbarkStudios/cargo-deny-action@v2 (--all-features)
  └── check-and-test (windows-latest / macos-latest / ubuntu-latest)
       ├── cargo clippy --workspace --all-targets --all-features -- -D warnings
       ├── cargo build --workspace --all-targets
-      └── cargo test --workspace --all-targets --all-features
+      └── cargo test --workspace --all-targets --all-features (tests/quality_gates.rs 含む)
 ```
 
 ### 4.3 `tests/quality_gates/` モジュール構成

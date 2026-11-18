@@ -33,7 +33,7 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
 - 境界条件（空入力、不正値、タイムアウト、権限・I/O エラー）を考慮したか
 - `unsafe` が不可避な場合、`backends/` や専用クレートに隔離し、`#[allow(unsafe_code)]` と `// SAFETY:` コメントを付けたか
 - 単体テストは各部品の `.rs` ファイル末尾に、結合テスト・全体テストは `tests/<実装名>/`（`mod.rs` 含む）と入り口の `tests/<実装名>.rs` に配置したか
-- 変更後に worktree 内で `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features`（Workspace 導入後は `--workspace` 付与＋事前に `cargo build --workspace --all-targets`）をすべて実行し、警告・エラーがゼロであることを確認したか
+- 変更後に worktree 内で `scripts/pre-pr.ps1`（または `cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`、`cargo build --workspace --all-targets`、`cargo test --workspace --all-targets --all-features`）をすべて実行し、警告・エラーがゼロであることを確認したか
 - 仕様や使い方が変わる場合、`dev-doc/` と `docs/` の該当箇所を更新したか
 - 完了時に勝手な `main` マージや worktree 削除をせず、ブランチ名・worktree パス・コミット概要・検証結果を報告したか
 
