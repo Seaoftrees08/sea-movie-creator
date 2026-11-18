@@ -4,6 +4,7 @@ use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ai::agent_host::AgentPluginRegistry;
 use crate::ai::blueprint::MovieBlueprint;
 use crate::ai::context_builder::build_command_schema_value;
 use crate::ai::plugin_host::AiPluginRegistry;
@@ -67,36 +68,7 @@ pub fn collect_host_capabilities(include_schemas: bool) -> HostCapabilitySnapsho
         .take(48)
         .collect();
 
-    let mut installed_extensions = Vec::new();
-    let export_reg = PluginRegistry::discover_default();
-    for plugin in export_reg.plugins() {
-        installed_extensions.push(InstalledExtensionSummary {
-            id: plugin.manifest.id.clone(),
-            name: plugin.manifest.name.clone(),
-            category: "export".to_owned(),
-            available: plugin.executable_path.is_some(),
-            status_note: plugin
-                .executable_path
-                .is_none()
-                .then(|| format!("executable `{}` not found", plugin.manifest.entrypoint)),
-            ai_hints: plugin.manifest.ai_hints.clone(),
-        });
-    }
-
-    let ai_reg = AiPluginRegistry::discover_default();
-    for plugin in ai_reg.plugins() {
-        installed_extensions.push(InstalledExtensionSummary {
-            id: plugin.manifest.id.clone(),
-            name: plugin.manifest.name.clone(),
-            category: "ai".to_owned(),
-            available: plugin.executable_path.is_some(),
-            status_note: plugin
-                .executable_path
-                .is_none()
-                .then(|| format!("executable `{}` not found", plugin.manifest.entrypoint)),
-            ai_hints: plugin.manifest.ai_hints.clone(),
-        });
-    }
+    let installed_extensions = collect_installed_extensions();
 
     let edit_command_schema = if include_schemas {
         build_command_schema_value().ok()
@@ -155,6 +127,50 @@ pub fn collect_host_capabilities(include_schemas: bool) -> HostCapabilitySnapsho
         edit_command_schema,
         blueprint_schema,
     }
+}
+
+fn collect_installed_extensions() -> Vec<InstalledExtensionSummary> {
+    let mut installed = Vec::new();
+    for plugin in PluginRegistry::discover_default().plugins() {
+        installed.push(InstalledExtensionSummary {
+            id: plugin.manifest.id.clone(),
+            name: plugin.manifest.name.clone(),
+            category: "export".to_owned(),
+            available: plugin.executable_path.is_some(),
+            status_note: plugin
+                .executable_path
+                .is_none()
+                .then(|| format!("executable `{}` not found", plugin.manifest.entrypoint)),
+            ai_hints: plugin.manifest.ai_hints.clone(),
+        });
+    }
+    for plugin in AiPluginRegistry::discover_default().plugins() {
+        installed.push(InstalledExtensionSummary {
+            id: plugin.manifest.id.clone(),
+            name: plugin.manifest.name.clone(),
+            category: "ai".to_owned(),
+            available: plugin.executable_path.is_some(),
+            status_note: plugin
+                .executable_path
+                .is_none()
+                .then(|| format!("executable `{}` not found", plugin.manifest.entrypoint)),
+            ai_hints: plugin.manifest.ai_hints.clone(),
+        });
+    }
+    for plugin in AgentPluginRegistry::discover_default().plugins() {
+        installed.push(InstalledExtensionSummary {
+            id: plugin.manifest.id.clone(),
+            name: plugin.manifest.name.clone(),
+            category: "agent".to_owned(),
+            available: plugin.executable_path.is_some(),
+            status_note: plugin
+                .executable_path
+                .is_none()
+                .then(|| format!("executable `{}` not found", plugin.manifest.entrypoint)),
+            ai_hints: plugin.manifest.ai_hints.clone(),
+        });
+    }
+    installed
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ rav1e = { version = "0.8.1", default-features = false, features = ["threading"] 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+sea-agent-protocol = { path = "plugins_src/sea-agent-protocol" }
 sea-export-protocol = { path = "plugins_src/sea-export-protocol" }
 webm-iterable = "0.7.1"
 windows = { version = "0.62", features = [
@@ -80,6 +81,7 @@ pollster = "0.4"
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 rubato = "5.1.0"
 schemars = "1.2"
+sea-agent-protocol.workspace = true
 sea-export-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

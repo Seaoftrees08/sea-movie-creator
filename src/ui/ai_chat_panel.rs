@@ -53,35 +53,7 @@ pub struct PendingAiProposal {
     pub plan: AiEditPlan,
 }
 
-/// AI 編集プランの承認・適用モード。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AiApprovalMode {
-    /// 適用前に差分カードを確認し、「承認して適用」押下で反映する（既定）。
-    #[default]
-    Manual,
-    /// ドライラン検証を通過した編集プランを自動でタイムラインへ適用する（1 クリック Undo 可能）。
-    Autopilot,
-}
-
-impl AiApprovalMode {
-    /// UI セレクタに表示する短いモード名を返す。
-    #[must_use]
-    pub const fn display_label(self) -> &'static str {
-        match self {
-            Self::Manual => "Manual",
-            Self::Autopilot => "Autopilot",
-        }
-    }
-
-    /// ドロップダウンメニュー内で表示する説明付きラベルを返す。
-    #[must_use]
-    pub const fn menu_label(self) -> &'static str {
-        match self {
-            Self::Manual => "Manual（承認して適用）",
-            Self::Autopilot => "Autopilot（検証後に自動適用）",
-        }
-    }
-}
+pub use crate::ai::provider::AiApprovalMode;
 
 struct AiChatJobHandle {
     rx: mpsc::Receiver<AiStreamEvent>,
