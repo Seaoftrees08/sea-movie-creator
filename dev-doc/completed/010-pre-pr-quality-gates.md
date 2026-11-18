@@ -4,10 +4,10 @@
 - **作成日**: 2026-11-18
 - **更新日**: 2026-11-18
 - **関連ドキュメント**:
-  - 全体ガイドライン: [`.github/copilot-instructions.md`](../.github/copilot-instructions.md)
-  - 開発・並行作業ルール: [`.github/instructions/general.instructions.md`](../.github/instructions/general.instructions.md)
-  - CI ワークフロー: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-  - Phase P0 設計書（`.smc.json` 後方互換要件）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
+  - 全体ガイドライン: [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md)
+  - 開発・並行作業ルール: [`.github/instructions/general.instructions.md`](../../.github/instructions/general.instructions.md)
+  - CI ワークフロー: [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
+  - Phase P0 設計書（`.smc.json` 後方互換要件）: [`004-phase-p0-core-prerequisites.md`](../004-phase-p0-core-prerequisites.md)
 
 ---
 

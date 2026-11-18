@@ -11,6 +11,7 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
   - 対象読者: 開発者および AI エージェント
   - 内容: 機能設計書、データ構造、API/インターフェース定義、シーケンス、エラー処理、テスト計画、技術選定の意思決定理由
   - 作成ルール: `dev-doc/_template.md` をベースに、機能単位で連番または機能名の Markdown ファイルを作成する
+  - 完了時の移動ルール: 該当設計書の実装がすべて完了したら、ステータスを `Implemented` に更新したうえで設計書ファイル（またはフォルダ）を `dev-doc/completed/` へ移動し、`dev-doc/README.md` および設計書内の相対リンク（階層調整）を更新する
 - `docs/`
   - 対象読者: 人間（プロジェクト参加者・利用者）
   - 内容: プロジェクト概要、環境構築、使い方、運用手順、FAQ
@@ -35,6 +36,7 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
 - 単体テストは各部品の `.rs` ファイル末尾に、結合テスト・全体テストは `tests/<実装名>/`（`mod.rs` 含む）と入り口の `tests/<実装名>.rs` に配置したか
 - 変更後に worktree 内で `scripts/pre-pr.ps1`（または `cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`、`cargo build --workspace --all-targets`、`cargo test --workspace --all-targets --all-features`）をすべて実行し、警告・エラーがゼロであることを確認したか
 - 仕様や使い方が変わる場合、`dev-doc/` と `docs/` の該当箇所を更新したか
+- 対象の `dev-doc/` 設計書の実装が完了した場合、ステータスを `Implemented` に更新して `dev-doc/completed/` へ移動し、`dev-doc/README.md` と相対リンクを更新したか
 - 完了時に勝手な `main` マージや worktree 削除をせず、ブランチ名・worktree パス・コミット概要・検証結果を報告したか
 
 # 並行作業とテストの運用ルール
