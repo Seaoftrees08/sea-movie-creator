@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "sea.agent.director",
+  "name": "ムービー構成エージェント (Director)",
+  "version": "0.1.0",
+  "entrypoint": "sea-agent-director",
+  "args": [],
+  "protocol": "sea_agent_v1",
+  "ai_hints": {
+    "purpose": "複数画像・動画・BGMフォルダから構成案と字幕を対話的に設計しタイムラインを構築する",
+    "capabilities": ["vision_batch", "interactive_planning", "movie_blueprint"],
+    "recommended_scenarios": ["結婚式プロフィールムービー", "旅行Vlog", "スライドショー作成"]
+  }
+}

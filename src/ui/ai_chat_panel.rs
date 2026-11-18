@@ -1,34 +1,53 @@
 //! VS Code 風 AI チャットパネル状態管理、非同期ストリーミングポーリング、差分適用/1クリック Undo UI。
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
-    div, px,
+    Anchor, Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
+use sea_agent_protocol::AgentUserAnswerPayload;
+use serde_json::{Value, json};
 
-use crate::ai::context_builder::{AiSelectionContext, build_ai_request_with_attachments};
+use crate::ai::agent_host::{
+    AgentHostEvent, AgentPluginRegistry, AgentSessionRunner, AgentSessionStartConfig,
+    DiscoveredAgentPlugin,
+};
+use crate::ai::context_builder::{
+    AiSelectionContext, build_ai_request_with_attachments, build_timeline_context,
+};
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::plugin_host::AiPluginRegistry;
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiModelPreset, AiProvider, AiProviderKind, AiRequest, AiRole,
-    AiStreamEvent, AiThinkingLevel, SecretString,
+    AgentRuntimeSettings, AiChatMessage, AiError, AiModelPreset, AiProvider, AiProviderKind,
+    AiRequest, AiRole, AiStreamEvent, AiThinkingLevel, SecretString,
 };
 use crate::ai::providers::anthropic::{AnthropicConfig, AnthropicProvider};
 use crate::ai::providers::credentials::resolve_api_key;
 use crate::ai::providers::gemini::{GeminiConfig, GeminiProvider};
 use crate::ai::providers::mock::MockAiProvider;
 use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::ai::session_store::{
+    AiSessionRecord, AiSessionStore, PendingAgentQuestionSnapshot, StoredChatTurn,
+};
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
+use crate::ui::ai_agent_widgets::{
+    render_agent_mode_menu_button, render_agent_settings_drawer, render_ask_user_card,
+    render_attached_folder_chip, render_folder_attach_button, render_session_history_drawer,
+    render_tool_approval_card,
+};
 use crate::ui::app_controller::AppController;
 use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
@@ -51,6 +70,19 @@ pub struct PendingAiProposal {
     pub model: String,
     /// ドライラン検証を通過した適用待ち計画。
     pub plan: AiEditPlan,
+}
+
+/// `Manual` 承認モード時に確認待ち中の外部副作用ツール実行リクエスト。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingAgentToolApproval {
+    /// リクエスト ID。
+    pub request_id: String,
+    /// 対象ツール名。
+    pub tool_name: String,
+    /// 実行引数 JSON。
+    pub arguments: Value,
+    /// ツールの説明文。
+    pub description: String,
 }
 
 pub use crate::ai::provider::AiApprovalMode;
@@ -103,6 +135,18 @@ pub fn provider_select_index(kind: &AiProviderKind) -> Option<IndexPath> {
         .map(IndexPath::new)
 }
 
+/// チャットパネル上部に開く補助ドロワー種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AiChatDrawer {
+    /// ドロワーを閉じている状態。
+    #[default]
+    None,
+    /// セッション履歴ドロワー。
+    SessionHistory,
+    /// エージェント安全設定ドロワー。
+    AgentSettings,
+}
+
 /// UI 状態と履歴を管理する AI チャットパネル状態。
 pub struct AiChatState {
     /// 選択中 AI プロバイダ種別。
@@ -129,17 +173,51 @@ pub struct AiChatState {
     pub approval_mode: AiApprovalMode,
     /// コンポーザへ添付されたタイムラインクリップ ID 一覧。
     pub attached_clip_ids: Vec<ClipId>,
+    /// 選択中のエージェントプラグイン ID（`None` なら従来の単発編集モード）。
+    pub selected_agent_id: Option<String>,
+    /// コンポーザへ添付・許可されたローカルメディアフォルダ一覧。
+    pub attached_folders: Vec<PathBuf>,
+    /// 現在の会話セッション ID（VS Code 風セッション保存・再開用）。
+    pub session_id: String,
+    /// セッション一覧に表示する見出し。
+    pub session_title: String,
+    /// セッション作成時刻（UNIX 秒）。
+    pub session_created_at_unix_secs: u64,
+    /// エージェントが提示中のリッチ対話質問カード（存在する場合）。
+    pub pending_question: Option<PendingAgentQuestionSnapshot>,
+    /// リッチ対話質問カードの各入力フィールド保持値。
+    pub ask_field_values: BTreeMap<String, String>,
+    /// `Manual` モード時に確認待ちの外部副作用ツール実行リクエスト。
+    pub pending_tool_approval: Option<PendingAgentToolApproval>,
+    /// 常駐エージェントの永続メモリ（画像解析キャッシュ・前回設計等）。
+    pub agent_memory: Value,
+    /// ステップ上限・最小呼出間隔・Vision 設定。
+    pub runtime_settings: AgentRuntimeSettings,
+    /// セッション保存先ストア（ライブウィンドウ起動時に設定、テストでも任意注入可）。
+    pub session_store: Option<AiSessionStore>,
+    /// 上部に開いている補助ドロワー（履歴または安全設定）。
+    pub active_drawer: AiChatDrawer,
+    /// エージェントの現在ステップ進捗 `(step, total_steps)`。
+    pub agent_step_status: Option<(Option<u32>, Option<u32>)>,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
+    pub(crate) active_agent: Option<AgentSessionRunner>,
+    pub(crate) agent_provider_override: Option<Arc<dyn AiProvider>>,
+    pub(crate) agent_busy: bool,
+    pub(crate) agent_active_prompt: String,
+    pub(crate) agent_active_model_label: String,
 }
 
 impl std::fmt::Debug for AiChatState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AiChatState")
             .field("selected_provider", &self.selected_provider)
+            .field("selected_agent_id", &self.selected_agent_id)
+            .field("session_id", &self.session_id)
             .field("model_name", &self.model_name)
             .field("thinking_level", &self.thinking_level)
             .field("turns_len", &self.turns.len())
+            .field("attached_folders_len", &self.attached_folders.len())
             .field("has_runtime_key", &self.runtime_api_key.is_some())
             .finish_non_exhaustive()
     }
@@ -155,15 +233,33 @@ impl Default for AiChatState {
             custom_base_url: default_kind.default_base_url().to_owned(),
             turns: Vec::new(),
             streaming_preview: String::new(),
-            status_banner: "自然言語で編集指示を入力してください（適用前に差分を確認できます）"
+            status_banner: "自然言語で編集指示を入力してください（フォルダ添付で自律構成も可能）"
                 .to_owned(),
             pending_proposal: None,
             last_error: None,
             can_one_click_undo: false,
             approval_mode: AiApprovalMode::Manual,
             attached_clip_ids: Vec::new(),
+            selected_agent_id: None,
+            attached_folders: Vec::new(),
+            session_id: AiSessionStore::generate_session_id(),
+            session_title: "新しいセッション".to_owned(),
+            session_created_at_unix_secs: AiSessionStore::now_unix_secs(),
+            pending_question: None,
+            ask_field_values: BTreeMap::new(),
+            pending_tool_approval: None,
+            agent_memory: json!({}),
+            runtime_settings: AgentRuntimeSettings::default(),
+            session_store: None,
+            active_drawer: AiChatDrawer::None,
+            agent_step_status: None,
             runtime_api_key: None,
             running_job: None,
+            active_agent: None,
+            agent_provider_override: None,
+            agent_busy: false,
+            agent_active_prompt: String::new(),
+            agent_active_model_label: String::new(),
         }
     }
 }
@@ -191,9 +287,136 @@ impl AiChatState {
         self.attached_clip_ids
             .retain(|cid| doc.find_clip(cid).is_some());
     }
+
+    /// ライブウィンドウ起動用：既定のユーザー設定配下セッションストアを有効化し、エージェント設定を読み込む。
+    pub fn enable_user_session_store(&mut self) {
+        if let Some(store) = AiSessionStore::default_user_store() {
+            if let Ok(settings) = store.load_runtime_settings() {
+                self.runtime_settings = settings;
+            }
+            self.session_store = Some(store);
+        }
+    }
+
+    /// 許可メディアフォルダを添付する（ディレクトリのみ受理・正規化重複除去）。
+    pub fn attach_folder(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            return;
+        }
+        let canon = fs::canonicalize(&path).unwrap_or(path);
+        if !self.attached_folders.contains(&canon) {
+            self.attached_folders.push(canon);
+        }
+    }
+
+    /// UI からのフォルダ添付・ドロップ用：初回待機中かつ単発モードなら自動で既定エージェントへ切り替える。
+    pub fn attach_folder_with_auto_agent(&mut self, path: PathBuf) {
+        let had_folders = !self.attached_folders.is_empty();
+        self.attach_folder(path);
+        if !had_folders
+            && !self.attached_folders.is_empty()
+            && self.selected_agent_id.is_none()
+            && self.turns.is_empty()
+        {
+            let reg = AgentPluginRegistry::discover_default();
+            if let Some(director) = reg.find_by_id("sea.agent.director") {
+                self.selected_agent_id = Some(director.manifest.id.clone());
+            } else if let Some(first) = reg.plugins().first() {
+                self.selected_agent_id = Some(first.manifest.id.clone());
+            }
+        }
+    }
+
+    /// 添付済みフォルダを解除する。
+    pub fn detach_folder(&mut self, path: &Path) {
+        let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.attached_folders.retain(|p| p != path && p != &canon);
+    }
+
+    /// 単発チャット (`None`) と自律エージェントプラグイン (`Some(id)`) を切り替える。
+    pub fn select_agent(&mut self, agent_id: Option<String>) {
+        if self.selected_agent_id != agent_id {
+            if let Some(runner) = self.active_agent.take() {
+                runner.cancel();
+            }
+            self.agent_busy = false;
+            self.agent_step_status = None;
+            self.selected_agent_id = agent_id;
+        }
+    }
+
     /// 編集プランの承認モード (`Manual` / `Autopilot`) を切り替える。
-    pub const fn set_approval_mode(&mut self, mode: AiApprovalMode) {
+    pub fn set_approval_mode(&mut self, mode: AiApprovalMode) {
         self.approval_mode = mode;
+        self.sync_active_agent_runtime();
+    }
+
+    /// ステップ上限・呼出間隔設定を更新・保存し、常駐エージェントにも即時反映する。
+    pub fn apply_runtime_settings(&mut self, settings: AgentRuntimeSettings) {
+        self.runtime_settings = settings;
+        if let Some(store) = &self.session_store {
+            let _ = store.save_runtime_settings(&self.runtime_settings);
+        }
+        self.sync_active_agent_runtime();
+    }
+
+    fn sync_active_agent_runtime(&self) {
+        if let Some(runner) = &self.active_agent {
+            let provider = self
+                .agent_provider_override
+                .clone()
+                .unwrap_or_else(|| Arc::from(self.build_provider()));
+            let _ = runner.update_runtime(
+                provider,
+                self.model_name.clone(),
+                self.thinking_level,
+                self.approval_mode,
+                self.runtime_settings.clone(),
+            );
+        }
+    }
+
+    /// 現在のチャット／エージェント状態をセッションストアへ保存する。
+    pub fn persist_session(&self) {
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        if self.turns.is_empty()
+            && self.attached_folders.is_empty()
+            && self.pending_question.is_none()
+        {
+            return;
+        }
+        let now = AiSessionStore::now_unix_secs();
+        let rec = AiSessionRecord {
+            schema_version: 1,
+            session_id: self.session_id.clone(),
+            title: self.session_title.clone(),
+            created_at_unix_secs: self.session_created_at_unix_secs,
+            updated_at_unix_secs: now,
+            provider: Some(self.selected_provider.clone()),
+            agent_plugin_id: self.selected_agent_id.clone(),
+            model_name: self.model_name.clone(),
+            thinking_level: self.thinking_level,
+            approval_mode: self.approval_mode,
+            attached_folders: self
+                .attached_folders
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            turns: self
+                .turns
+                .iter()
+                .map(|t| StoredChatTurn {
+                    role: t.role,
+                    text: t.text.clone(),
+                    timestamp_unix_secs: now,
+                })
+                .collect(),
+            pending_question: self.pending_question.clone(),
+            agent_memory: self.agent_memory.clone(),
+        };
+        let _ = store.save_session(&rec);
     }
 
     /// プロバイダ種別を切り替え、既定モデル・思考レベル・ベース URL を更新する。
@@ -204,7 +427,9 @@ impl AiChatState {
         kind.default_base_url()
             .clone_into(&mut self.custom_base_url);
         self.selected_provider = kind;
+        self.agent_provider_override = None;
         self.last_error = None;
+        self.sync_active_agent_runtime();
     }
 
     /// モデルを選択し、対応していれば `Medium` を標準選択（非対応時はモデル既定）とする。
@@ -221,7 +446,9 @@ impl AiChatState {
             Some(preset) => preset.default_thinking,
             None => thinking,
         };
+        self.agent_provider_override = None;
         self.last_error = None;
+        self.sync_active_agent_runtime();
     }
 
     /// 現在選択中のモデルに対して思考レベルを切り替える。
@@ -235,7 +462,9 @@ impl AiChatState {
             self.active_model_preset()
                 .map_or(AiThinkingLevel::Auto, |preset| preset.default_thinking)
         };
+        self.agent_provider_override = None;
         self.last_error = None;
+        self.sync_active_agent_runtime();
     }
 
     /// 現在選択中モデルに対応するカタログ定義を返す。
@@ -290,21 +519,42 @@ impl AiChatState {
     /// 非同期処理を実行中かどうか。
     #[must_use]
     pub const fn is_busy(&self) -> bool {
-        self.running_job.is_some()
+        self.running_job.is_some() || self.agent_busy
     }
 
-    /// 会話履歴・提案差分・エラー状態をクリアし、新しいチャットを開始する。
+    /// 会話履歴・提案差分・エラー状態をクリアし、新しいチャット／セッションを開始する。
     pub fn clear_conversation(&mut self) {
+        self.new_session();
+    }
+
+    /// 常駐エージェントを含めて現在の会話状態をリセットし、新規セッションを発行する。
+    pub fn new_session(&mut self) {
         if self.is_busy() {
             return;
         }
+        if let Some(runner) = self.active_agent.take() {
+            runner.cancel();
+        }
+        self.agent_busy = false;
+        self.agent_step_status = None;
+        self.agent_active_prompt.clear();
+        self.agent_active_model_label.clear();
+        self.session_id = AiSessionStore::generate_session_id();
+        "新しいセッション".clone_into(&mut self.session_title);
+        self.session_created_at_unix_secs = AiSessionStore::now_unix_secs();
         self.turns.clear();
         self.streaming_preview.clear();
         self.pending_proposal = None;
+        self.pending_question = None;
+        self.ask_field_values.clear();
+        self.pending_tool_approval = None;
+        self.agent_memory = json!({});
         self.last_error = None;
         self.can_one_click_undo = false;
         self.attached_clip_ids.clear();
-        "自然言語で編集指示を入力してください（適用前に差分を確認できます）"
+        self.attached_folders.clear();
+        self.agent_provider_override = None;
+        "自然言語で編集指示を入力してください（フォルダ添付で自律構成も可能）"
             .clone_into(&mut self.status_banner);
     }
 
@@ -471,11 +721,11 @@ impl AppController {
         self.finalize_ai_response(trimmed, &response.model, &response.raw_text)
     }
 
-    /// UI からの指示をバックグラウンドスレッドで非同期開始する。
+    /// UI からの指示をバックグラウンドスレッド（または常駐エージェント）で非同期開始する。
     ///
     /// # Errors
     ///
-    /// 空指示、既存リクエスト実行中、またはリクエスト生成失敗時。
+    /// 空指示、既存リクエスト実行中、エージェント起動失敗、またはリクエスト生成失敗時。
     pub fn start_ai_prompt_async(&mut self, prompt: &str) -> Result<(), String> {
         if self.ai_chat.is_busy() {
             return Err("前の AI リクエストを処理中です".to_owned());
@@ -484,7 +734,27 @@ impl AppController {
         if trimmed.is_empty() {
             return Err("AI への指示文が空です".to_owned());
         }
+
+        if self.ai_chat.selected_agent_id.is_some()
+            || self
+                .ai_chat
+                .active_agent
+                .as_ref()
+                .is_some_and(AgentSessionRunner::is_alive)
+        {
+            let provider = self
+                .ai_chat
+                .agent_provider_override
+                .clone()
+                .unwrap_or_else(|| Arc::from(self.ai_chat.build_provider()));
+            return self.start_agent_prompt_with_provider(&trimmed, provider, None);
+        }
+
         let req = self.prepare_ai_request_and_turn(&trimmed)?;
+        if self.ai_chat.session_title == "新しいセッション" {
+            self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(&trimmed);
+        }
+        self.ai_chat.persist_session();
         "AI へ送信中...".clone_into(&mut self.ai_chat.status_banner);
 
         let provider = self.ai_chat.build_provider();
@@ -511,76 +781,643 @@ impl AppController {
         Ok(())
     }
 
-    /// 実行中の AI リクエストを中断し、再送信できる状態へ戻す（中断時 `true`）。
-    pub fn cancel_ai_prompt(&mut self) -> bool {
-        let Some(handle) = self.ai_chat.running_job.take() else {
-            return false;
-        };
-        handle.cancelled.store(true, Ordering::Release);
-        drop(handle);
-
-        let partial = self.ai_chat.streaming_preview.trim().to_owned();
-        self.ai_chat.streaming_preview.clear();
-        if !partial.is_empty() {
-            self.ai_chat.turns.push(AiChatTurn {
-                role: AiRole::Assistant,
-                text: format!("[停止済み]\n{partial}"),
-            });
+    /// 指定されたプロバイダと任意プラグイン定義を使い、常駐エージェントタスク（またはフォローアップ）を開始する。
+    ///
+    /// # Errors
+    ///
+    /// 空指示、既存実行中、対象プラグイン未検出、またはプロセス起動失敗時にエラー説明文字列を返す。
+    pub fn start_agent_prompt_with_provider(
+        &mut self,
+        prompt: &str,
+        provider: Arc<dyn AiProvider>,
+        plugin_override: Option<DiscoveredAgentPlugin>,
+    ) -> Result<(), String> {
+        if self.ai_chat.is_busy() {
+            return Err("前の AI / エージェントリクエストを処理中です".to_owned());
         }
-        "AI 生成を停止しました".clone_into(&mut self.ai_chat.status_banner);
-        "AI 生成を停止しました".clone_into(&mut self.status_message);
-        true
+        let trimmed = prompt.trim().to_owned();
+        if trimmed.is_empty() {
+            return Err("AI への指示文が空です".to_owned());
+        }
+
+        let plugin = resolve_target_agent_plugin(&self.ai_chat, plugin_override)?;
+        self.ai_chat.agent_provider_override = Some(Arc::clone(&provider));
+        let attached_clips = self.prepare_agent_turn_state(&trimmed, &plugin);
+        let timeline_summary = build_compact_timeline_summary(
+            &self.document,
+            self.clock.current_frame(),
+            self.selected_clip_id.as_ref(),
+            self.selected_layer_id.as_ref(),
+        );
+
+        let alive_matches = self
+            .ai_chat
+            .active_agent
+            .as_ref()
+            .is_some_and(|r| r.is_alive() && r.plugin_id() == plugin.manifest.id);
+        if alive_matches {
+            let runner = self
+                .ai_chat
+                .active_agent
+                .as_ref()
+                .ok_or_else(|| "active agent missing".to_owned())?;
+            runner
+                .update_runtime(
+                    provider,
+                    self.ai_chat.model_name.clone(),
+                    self.ai_chat.thinking_level,
+                    self.ai_chat.approval_mode,
+                    self.ai_chat.runtime_settings.clone(),
+                )
+                .map_err(|e| e.to_string())?;
+            runner
+                .send_follow_up(
+                    trimmed,
+                    self.ai_chat.attached_folders.clone(),
+                    attached_clips,
+                    self.document.clone(),
+                    timeline_summary,
+                )
+                .map_err(|e| e.to_string())?;
+        } else {
+            if let Some(old) = self.ai_chat.active_agent.take() {
+                old.cancel();
+            }
+            let cfg = AgentSessionStartConfig {
+                plugin,
+                session_id: self.ai_chat.session_id.clone(),
+                goal: trimmed,
+                resume: false,
+                attached_folders: self.ai_chat.attached_folders.clone(),
+                attached_clips,
+                base_document: self.document.clone(),
+                timeline_summary,
+                agent_memory: self.ai_chat.agent_memory.clone(),
+                provider,
+                provider_kind: self.ai_chat.selected_provider.clone(),
+                model_name: self.ai_chat.model_name.clone(),
+                thinking_level: self.ai_chat.thinking_level,
+                approval_mode: self.ai_chat.approval_mode,
+                runtime_settings: self.ai_chat.runtime_settings.clone(),
+                tool_registry: None,
+                extra_extensions: Vec::new(),
+            };
+            let runner = AgentSessionRunner::start(cfg).map_err(|e| e.to_string())?;
+            self.ai_chat.active_agent = Some(runner);
+        }
+
+        self.ai_chat.agent_busy = true;
+        "エージェントを起動中...".clone_into(&mut self.ai_chat.status_banner);
+        self.ai_chat.persist_session();
+        Ok(())
     }
 
-    /// 非同期 AI チャット受信キューをポーリングし、UI 更新が必要なら `true` を返す。
-    pub fn poll_ai_chat(&mut self) -> bool {
-        let Some(handle) = self.ai_chat.running_job.take() else {
-            return false;
-        };
-        let mut changed = false;
-        let mut completed = None;
-        let mut failed = None;
-        let mut disconnected = false;
+    fn prepare_agent_turn_state(
+        &mut self,
+        trimmed: &str,
+        plugin: &DiscoveredAgentPlugin,
+    ) -> Vec<String> {
+        self.ai_chat.selected_agent_id = Some(plugin.manifest.id.clone());
+        self.ai_chat.prune_attachments(&self.document);
+        let attached_clips: Vec<String> = self
+            .ai_chat
+            .attached_clip_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
 
-        loop {
-            match handle.rx.try_recv() {
-                Ok(evt) => {
-                    changed = true;
-                    match evt {
-                        AiStreamEvent::Status(msg) => self.ai_chat.status_banner = msg,
-                        AiStreamEvent::DeltaText(delta) => {
-                            self.ai_chat.streaming_preview.push_str(&delta);
-                        }
-                        AiStreamEvent::Completed(resp) => completed = Some(resp),
-                        AiStreamEvent::Failed(err) => failed = Some(err),
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
+        let mut tags = Vec::new();
+        if !self.ai_chat.attached_folders.is_empty() {
+            tags.push(format!(
+                "フォルダ {} 件",
+                self.ai_chat.attached_folders.len()
+            ));
+        }
+        if !attached_clips.is_empty() {
+            tags.push(format!("クリップ {} 件", attached_clips.len()));
+        }
+        let display_turn = if tags.is_empty() {
+            trimmed.to_owned()
+        } else {
+            format!("[添付: {}]\n{trimmed}", tags.join(", "))
+        };
+        if self.ai_chat.turns.is_empty() && self.ai_chat.session_title == "新しいセッション"
+        {
+            self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(trimmed);
+        }
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::User,
+            text: display_turn,
+        });
+        self.ai_chat.attached_clip_ids.clear();
+        self.ai_chat.pending_proposal = None;
+        self.ai_chat.pending_question = None;
+        self.ai_chat.ask_field_values.clear();
+        self.ai_chat.pending_tool_approval = None;
+        self.ai_chat.last_error = None;
+        self.ai_chat.can_one_click_undo = false;
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.agent_step_status = None;
+        trimmed.clone_into(&mut self.ai_chat.agent_active_prompt);
+        self.ai_chat.agent_active_model_label =
+            format!("{} ({})", plugin.manifest.name, self.ai_chat.model_name);
+        attached_clips
+    }
+
+    /// 現在表示中の `ask_user` リッチ質問カードへ回答を返送し、エージェントを続行させる。
+    ///
+    /// # Errors
+    ///
+    /// 保留中質問がない、常駐エージェントが終了済み、または IPC 送信失敗時。
+    pub fn answer_pending_agent_question(
+        &mut self,
+        choice_id: Option<String>,
+        field_values: BTreeMap<String, String>,
+        free_text: Option<String>,
+        skipped: bool,
+    ) -> Result<(), String> {
+        let q = self
+            .ai_chat
+            .pending_question
+            .take()
+            .ok_or_else(|| "回答待ちの質問カードはありません".to_owned())?;
+        let runner = self
+            .ai_chat
+            .active_agent
+            .as_ref()
+            .filter(|r| r.is_alive())
+            .ok_or_else(|| "常駐エージェントプロセスが終了しています".to_owned())?;
+
+        let answer_summary = if skipped {
+            "[質問応答] おまかせで続行".to_owned()
+        } else {
+            let filled: Vec<String> = field_values
+                .iter()
+                .filter(|(_, v)| !v.trim().is_empty())
+                .map(|(k, v)| format!("{k}={}", v.trim()))
+                .collect();
+            let choice_txt = choice_id.as_deref().unwrap_or("submit");
+            if filled.is_empty() {
+                format!("[選択] {choice_txt}")
+            } else {
+                format!("[選択: {choice_txt}] {}", filled.join(", "))
+            }
+        };
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::User,
+            text: answer_summary,
+        });
+        self.ai_chat.ask_field_values.clear();
+
+        let payload = AgentUserAnswerPayload {
+            choice_id,
+            field_values,
+            free_text,
+            skipped,
+        };
+        runner
+            .send_user_answer(q.request_id, payload)
+            .map_err(|e| e.to_string())?;
+        self.ai_chat.agent_busy = true;
+        "回答を受けて構成を設計中...".clone_into(&mut self.ai_chat.status_banner);
+        self.ai_chat.persist_session();
+        Ok(())
+    }
+
+    /// `Manual` モードで確認待ち中の外部副作用ツール実行を許可または拒否する。
+    ///
+    /// # Errors
+    ///
+    /// 保留中の承認要求がない、またはエージェントプロセスへ送信できない場合。
+    pub fn answer_agent_tool_approval(
+        &mut self,
+        approved: bool,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        let pending = self
+            .ai_chat
+            .pending_tool_approval
+            .take()
+            .ok_or_else(|| "承認待ちのツール実行はありません".to_owned())?;
+        let runner = self
+            .ai_chat
+            .active_agent
+            .as_ref()
+            .filter(|r| r.is_alive())
+            .ok_or_else(|| "常駐エージェントプロセスが終了しています".to_owned())?;
+
+        runner
+            .send_tool_approval(pending.request_id, approved, reason)
+            .map_err(|e| e.to_string())?;
+        self.ai_chat.agent_busy = true;
+        let msg = if approved {
+            format!("外部ツール `{}` を実行中...", pending.tool_name)
+        } else {
+            format!("外部ツール `{}` の実行を拒否しました", pending.tool_name)
+        };
+        self.ai_chat.status_banner = msg;
+        Ok(())
+    }
+
+    /// 保存済みセッション ID を読み込み、UI・履歴・常駐エージェントを再開する。
+    ///
+    /// # Errors
+    ///
+    /// ストア未初期化、指定セッション読込失敗、または再開起動失敗時。
+    pub fn open_saved_ai_session(&mut self, session_id: &str) -> Result<(), String> {
+        let provider: Arc<dyn AiProvider> = Arc::from(self.ai_chat.build_provider());
+        self.open_saved_ai_session_with_provider(session_id, provider, None)?;
+        self.ai_chat.agent_provider_override = None;
+        Ok(())
+    }
+
+    /// 指定プロバイダ・任意プラグインを使って保存済みセッションを読み込み復元する（テスト兼用）。
+    ///
+    /// # Errors
+    ///
+    /// ストア未設定またはセッション読込・復元失敗時。
+    pub fn open_saved_ai_session_with_provider(
+        &mut self,
+        session_id: &str,
+        provider: Arc<dyn AiProvider>,
+        plugin_override: Option<DiscoveredAgentPlugin>,
+    ) -> Result<(), String> {
+        if self.ai_chat.is_busy() {
+            return Err("実行中の処理を停止してからセッションを切り替えてください".to_owned());
+        }
+        let store = self
+            .ai_chat
+            .session_store
+            .clone()
+            .ok_or_else(|| "セッションストアが初期化されていません".to_owned())?;
+        let rec = store.load_session(session_id).map_err(|e| e.to_string())?;
+
+        if let Some(runner) = self.ai_chat.active_agent.take() {
+            runner.cancel();
+        }
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
+        self.ai_chat.pending_proposal = None;
+        self.ai_chat.pending_tool_approval = None;
+        self.ai_chat.last_error = None;
+        self.ai_chat.can_one_click_undo = false;
+
+        self.ai_chat.session_id = rec.session_id;
+        self.ai_chat.session_title = rec.title;
+        self.ai_chat.session_created_at_unix_secs = rec.created_at_unix_secs;
+        if let Some(p) = rec.provider {
+            self.ai_chat.selected_provider = p;
+        }
+        if !rec.model_name.is_empty() {
+            self.ai_chat.model_name = rec.model_name;
+        }
+        self.ai_chat.thinking_level = rec.thinking_level;
+        self.ai_chat.approval_mode = rec.approval_mode;
+        self.ai_chat
+            .selected_agent_id
+            .clone_from(&rec.agent_plugin_id);
+        self.ai_chat.attached_folders = rec
+            .attached_folders
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        self.ai_chat.turns = rec
+            .turns
+            .into_iter()
+            .map(|t| AiChatTurn {
+                role: t.role,
+                text: t.text,
+            })
+            .collect();
+        self.ai_chat.pending_question = rec.pending_question;
+        self.ai_chat.ask_field_values.clear();
+        self.ai_chat.agent_memory = rec.agent_memory;
+        self.ai_chat.active_drawer = AiChatDrawer::None;
+        self.ai_chat.agent_provider_override = Some(Arc::clone(&provider));
+
+        if let Some(ref agent_id) = rec.agent_plugin_id {
+            let plugin = plugin_override.or_else(|| {
+                AgentPluginRegistry::discover_default()
+                    .find_by_id(agent_id)
+                    .cloned()
+            });
+            if let Some(p) = plugin
+                && p.executable_path.is_some()
+            {
+                let timeline_summary = build_compact_timeline_summary(
+                    &self.document,
+                    self.clock.current_frame(),
+                    self.selected_clip_id.as_ref(),
+                    self.selected_layer_id.as_ref(),
+                );
+                let cfg = AgentSessionStartConfig {
+                    plugin: p,
+                    session_id: self.ai_chat.session_id.clone(),
+                    goal: String::new(),
+                    resume: true,
+                    attached_folders: self.ai_chat.attached_folders.clone(),
+                    attached_clips: Vec::new(),
+                    base_document: self.document.clone(),
+                    timeline_summary,
+                    agent_memory: self.ai_chat.agent_memory.clone(),
+                    provider,
+                    provider_kind: self.ai_chat.selected_provider.clone(),
+                    model_name: self.ai_chat.model_name.clone(),
+                    thinking_level: self.ai_chat.thinking_level,
+                    approval_mode: self.ai_chat.approval_mode,
+                    runtime_settings: self.ai_chat.runtime_settings.clone(),
+                    tool_registry: None,
+                    extra_extensions: Vec::new(),
+                };
+                if let Ok(runner) = AgentSessionRunner::start(cfg) {
+                    self.ai_chat.active_agent = Some(runner);
                 }
             }
         }
+        "セッションを復元しました（続けて調整指示を出せます）"
+            .clone_into(&mut self.ai_chat.status_banner);
+        Ok(())
+    }
 
-        if let Some(resp) = completed {
-            let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
-            return true;
+    /// 保存済みセッションを削除する（現在開いているセッションを消した場合は新規セッションへ移行）。
+    ///
+    /// # Errors
+    ///
+    /// ストア未初期化または削除失敗時。
+    pub fn delete_saved_ai_session(&mut self, session_id: &str) -> Result<(), String> {
+        let store = self
+            .ai_chat
+            .session_store
+            .as_ref()
+            .ok_or_else(|| "セッションストアが初期化されていません".to_owned())?;
+        store
+            .delete_session(session_id)
+            .map_err(|e| e.to_string())?;
+        if self.ai_chat.session_id == session_id {
+            self.ai_chat.new_session();
         }
-        if let Some(err_msg) = failed {
-            self.ai_chat.last_error = Some(err_msg.clone());
-            self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
-            return true;
-        }
-        if disconnected {
-            let err_msg = "AI プロバイダが応答を返さず終了しました".to_owned();
-            self.ai_chat.last_error = Some(err_msg.clone());
-            self.ai_chat.status_banner = err_msg;
+        Ok(())
+    }
+
+    /// 実行中の AI リクエストまたは常駐エージェントを中断し、再送信できる状態へ戻す（中断時 `true`）。
+    pub fn cancel_ai_prompt(&mut self) -> bool {
+        if let Some(handle) = self.ai_chat.running_job.take() {
+            handle.cancelled.store(true, Ordering::Release);
+            drop(handle);
+
+            let partial = self.ai_chat.streaming_preview.trim().to_owned();
+            self.ai_chat.streaming_preview.clear();
+            if !partial.is_empty() {
+                self.ai_chat.turns.push(AiChatTurn {
+                    role: AiRole::Assistant,
+                    text: format!("[停止済み]\n{partial}"),
+                });
+            }
+            "AI 生成を停止しました".clone_into(&mut self.ai_chat.status_banner);
+            "AI 生成を停止しました".clone_into(&mut self.status_message);
             return true;
         }
 
-        self.ai_chat.running_job = Some(handle);
+        if let Some(runner) = self.ai_chat.active_agent.take() {
+            let was_busy = self.ai_chat.agent_busy
+                || self.ai_chat.pending_question.is_some()
+                || self.ai_chat.pending_tool_approval.is_some();
+            runner.cancel();
+            self.ai_chat.agent_busy = false;
+            self.ai_chat.agent_step_status = None;
+            self.ai_chat.pending_question = None;
+            self.ai_chat.pending_tool_approval = None;
+            if was_busy {
+                "エージェント実行を停止しました".clone_into(&mut self.ai_chat.status_banner);
+                "エージェント実行を停止しました".clone_into(&mut self.status_message);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 非同期 AI チャットおよび常駐エージェント受信キューをポーリングし、UI 更新が必要なら `true` を返す。
+    pub fn poll_ai_chat(&mut self) -> bool {
+        let mut changed = false;
+
+        if let Some(handle) = self.ai_chat.running_job.take() {
+            let mut completed = None;
+            let mut failed = None;
+            let mut disconnected = false;
+
+            loop {
+                match handle.rx.try_recv() {
+                    Ok(evt) => {
+                        changed = true;
+                        match evt {
+                            AiStreamEvent::Status(msg) => self.ai_chat.status_banner = msg,
+                            AiStreamEvent::DeltaText(delta) => {
+                                self.ai_chat.streaming_preview.push_str(&delta);
+                            }
+                            AiStreamEvent::Completed(resp) => completed = Some(resp),
+                            AiStreamEvent::Failed(err) => failed = Some(err),
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            if let Some(resp) = completed {
+                let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
+                self.ai_chat.persist_session();
+                return true;
+            }
+            if let Some(err_msg) = failed {
+                self.ai_chat.last_error = Some(err_msg.clone());
+                self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
+                self.ai_chat.persist_session();
+                return true;
+            }
+            if disconnected {
+                let err_msg = "AI プロバイダが応答を返さず終了しました".to_owned();
+                self.ai_chat.last_error = Some(err_msg.clone());
+                self.ai_chat.status_banner = err_msg;
+                return true;
+            }
+            self.ai_chat.running_job = Some(handle);
+        }
+
+        if let Some(runner) = self.ai_chat.active_agent.take() {
+            let events = runner.poll_events();
+            let mut exited = false;
+            if !events.is_empty() {
+                changed = true;
+                for evt in events {
+                    if self.handle_agent_host_event(evt) {
+                        exited = true;
+                    }
+                }
+                self.ai_chat.persist_session();
+            }
+            if !exited && runner.is_alive() {
+                self.ai_chat.active_agent = Some(runner);
+            }
+        }
+
         changed
+    }
+
+    fn handle_agent_host_event(&mut self, evt: AgentHostEvent) -> bool {
+        match evt {
+            AgentHostEvent::Status {
+                message,
+                step,
+                total_steps,
+            } => {
+                self.ai_chat.status_banner = message;
+                self.ai_chat.agent_step_status = Some((step, total_steps));
+                false
+            }
+            AgentHostEvent::ToolActivity {
+                tool_name,
+                ok,
+                summary,
+            } => {
+                self.ai_chat.status_banner = if ok {
+                    format!("ツール実行完了: {tool_name}")
+                } else {
+                    format!("ツール失敗 ({tool_name}): {summary}")
+                };
+                false
+            }
+            AgentHostEvent::MemoryUpdated { agent_memory } => {
+                self.ai_chat.agent_memory = agent_memory;
+                false
+            }
+            AgentHostEvent::AskUser {
+                request_id,
+                title,
+                message,
+                fields,
+                choices,
+                allow_skip,
+            } => {
+                self.handle_agent_ask_user_event(PendingAgentQuestionSnapshot {
+                    request_id,
+                    title,
+                    message,
+                    fields,
+                    choices,
+                    allow_skip,
+                });
+                false
+            }
+            AgentHostEvent::ToolApprovalRequired {
+                request_id,
+                tool_name,
+                arguments,
+                description,
+            } => {
+                self.ai_chat.agent_busy = false;
+                self.ai_chat.pending_tool_approval = Some(PendingAgentToolApproval {
+                    request_id,
+                    tool_name: tool_name.clone(),
+                    arguments,
+                    description,
+                });
+                self.ai_chat.status_banner =
+                    format!("Manual 承認待ち: ツール `{tool_name}` の実行許可が必要です");
+                false
+            }
+            AgentHostEvent::Proposal {
+                summary_markdown,
+                plan,
+                agent_memory,
+                ..
+            } => {
+                self.handle_agent_proposal_event(summary_markdown, *plan, agent_memory);
+                false
+            }
+            AgentHostEvent::AgentError {
+                code,
+                message,
+                recoverable,
+            } => {
+                self.ai_chat.agent_busy = false;
+                self.ai_chat.agent_step_status = None;
+                let formatted = format!("[{code}] {message}");
+                self.ai_chat.last_error = Some(formatted.clone());
+                self.ai_chat.turns.push(AiChatTurn {
+                    role: AiRole::Assistant,
+                    text: format!("エラー: {formatted}"),
+                });
+                self.ai_chat.status_banner = if recoverable {
+                    format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
+                } else {
+                    format!("致命的エラー: {formatted}")
+                };
+                !recoverable
+            }
+            AgentHostEvent::Exited { reason } => {
+                self.ai_chat.agent_busy = false;
+                self.ai_chat.agent_step_status = None;
+                if reason != "cancelled" {
+                    self.ai_chat.status_banner = format!("エージェントプロセス終了: {reason}");
+                }
+                true
+            }
+        }
+    }
+
+    fn handle_agent_ask_user_event(&mut self, snap: PendingAgentQuestionSnapshot) {
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
+        self.ai_chat.ask_field_values.clear();
+        for field in &snap.fields {
+            if let Some(def) = &field.default_value {
+                self.ai_chat
+                    .ask_field_values
+                    .insert(field.id.clone(), def.clone());
+            }
+        }
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::Assistant,
+            text: format!("[確認] {}\n{}", snap.title, snap.message),
+        });
+        self.ai_chat.pending_question = Some(snap);
+        "エージェントが確認事項を送りました（カードから入力または選択してください）"
+            .clone_into(&mut self.ai_chat.status_banner);
+    }
+
+    fn handle_agent_proposal_event(
+        &mut self,
+        summary_markdown: String,
+        plan: AiEditPlan,
+        agent_memory: Value,
+    ) {
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
+        self.ai_chat.last_error = None;
+        self.ai_chat.agent_memory = agent_memory;
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::Assistant,
+            text: summary_markdown,
+        });
+        if plan.is_no_op() {
+            self.ai_chat.pending_proposal = None;
+            "応答を受信しました（タイムライン変更なし）"
+                .clone_into(&mut self.ai_chat.status_banner);
+        } else if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
+            self.ai_chat.pending_proposal = None;
+            let _ = self.apply_ai_plan(&plan, true);
+        } else {
+            self.ai_chat.pending_proposal = Some(PendingAiProposal {
+                prompt: self.ai_chat.agent_active_prompt.clone(),
+                model: self.ai_chat.agent_active_model_label.clone(),
+                plan,
+            });
+            "構成案の準備完了: 「承認して適用」またはチャットで続けて修正できます"
+                .clone_into(&mut self.ai_chat.status_banner);
+        }
     }
 
     /// 承認待ちの編集提案をタイムラインへ 1 ステップ（単一 Undo 単位）で適用する。
@@ -630,6 +1467,7 @@ impl AppController {
             role: AiRole::Assistant,
             text: format!("{prefix} {}", plan.summary_lines.join(" / ")),
         });
+        self.ai_chat.persist_session();
         Ok(())
     }
 
@@ -711,6 +1549,43 @@ impl AppController {
     }
 }
 
+fn resolve_target_agent_plugin(
+    chat: &AiChatState,
+    plugin_override: Option<DiscoveredAgentPlugin>,
+) -> Result<DiscoveredAgentPlugin, String> {
+    if let Some(explicit) = plugin_override {
+        return Ok(explicit);
+    }
+    let reg = AgentPluginRegistry::discover_default();
+    let target_id = chat
+        .selected_agent_id
+        .as_deref()
+        .unwrap_or("sea.agent.director");
+    reg.find_by_id(target_id)
+        .or_else(|| reg.plugins().first())
+        .cloned()
+        .ok_or_else(|| {
+            format!("エージェントプラグイン `{target_id}` が見つかりません（cargo build --workspace でビルドされているか確認してください）")
+        })
+}
+
+fn build_compact_timeline_summary(
+    doc: &ProjectDocument,
+    playhead: crate::core::time::FrameIndex,
+    selected_clip: Option<&ClipId>,
+    selected_layer: Option<&crate::core::ids::LayerId>,
+) -> String {
+    let ctx = build_timeline_context(doc, playhead, selected_clip, selected_layer);
+    serde_json::to_string(&ctx).unwrap_or_else(|_| {
+        format!(
+            "project={}, tracks={}, assets={}",
+            doc.name,
+            doc.layers.len(),
+            doc.assets.len()
+        )
+    })
+}
+
 fn format_ai_error(err: &AiError) -> String {
     err.to_string()
 }
@@ -750,22 +1625,51 @@ impl AiProvider for FailedPluginProvider {
 
 /// 右側 AI Chat タブの VS Code 風チャットパネルを描画する。
 ///
-/// 上部はプロバイダ切替と認証状態のみのシンプルなヘッダとし、会話領域を下側へ伸縮させ、
-/// モデル／思考レベル選択を内包した単一の入力コンポーザーを最下部に固定配置する。
+/// 上部はプロバイダ切替・セッション履歴・設定のみのシンプルなヘッダとし、
+/// 会話領域・リッチ対話カード・承認差分カードを下側へ伸縮させ、
+/// モデル／エージェント／フォルダ添付を内包したコンポーザーを最下部に固定配置する。
 pub fn render_ai_chat_panel(
     controller: &AppController,
     ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
     ai_chat_input: &Entity<TextareaState>,
+    ai_ask_inputs: &[(String, Entity<InputState>)],
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let chat = &controller.ai_chat;
+    let theme = cx.theme().clone();
 
     v_flex()
         .size_full()
         .min_h(px(0.))
         .text_xs()
+        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+            style.border_1().border_color(theme.primary)
+        })
+        .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+            let mut attached = false;
+            for p in paths.paths() {
+                if p.is_dir() {
+                    this.controller
+                        .ai_chat
+                        .attach_folder_with_auto_agent(p.clone());
+                    attached = true;
+                }
+            }
+            if attached {
+                cx.notify();
+            }
+        }))
         .child(render_compact_header(chat, ai_provider_select, cx))
-        .child(render_chat_body(chat, cx))
+        .children(match chat.active_drawer {
+            AiChatDrawer::SessionHistory => {
+                Some(render_session_history_drawer(chat, cx).into_any_element())
+            }
+            AiChatDrawer::AgentSettings => {
+                Some(render_agent_settings_drawer(chat, cx).into_any_element())
+            }
+            AiChatDrawer::None => None,
+        })
+        .child(render_chat_body(chat, ai_ask_inputs, cx))
         .child(render_prompt_composer(controller, ai_chat_input, cx))
 }
 
@@ -791,12 +1695,47 @@ fn render_compact_header(
         theme.danger
     };
 
+    let mut history_btn = Button::new("ai-session-history-toggle")
+        .xsmall()
+        .label(tr("ai.history"));
+    history_btn = if chat.active_drawer == AiChatDrawer::SessionHistory {
+        history_btn.primary()
+    } else {
+        history_btn.ghost()
+    };
+
+    let mut settings_btn = Button::new("ai-agent-settings-toggle").xsmall().label("⚙");
+    settings_btn = if chat.active_drawer == AiChatDrawer::AgentSettings {
+        settings_btn.primary()
+    } else {
+        settings_btn.ghost()
+    };
+
     let mut right_actions = h_flex()
         .items_center()
-        .gap_1()
+        .gap_0p5()
         .flex_shrink_0()
-        .child(div().text_color(cred_color).child(format_cred_label(chat)));
-    if !chat.turns.is_empty() {
+        .child(div().text_color(cred_color).child(format_cred_label(chat)))
+        .child(history_btn.on_click(cx.listener(|this, _, _, cx| {
+            this.controller.ai_chat.active_drawer =
+                if this.controller.ai_chat.active_drawer == AiChatDrawer::SessionHistory {
+                    AiChatDrawer::None
+                } else {
+                    AiChatDrawer::SessionHistory
+                };
+            cx.notify();
+        })))
+        .child(settings_btn.on_click(cx.listener(|this, _, _, cx| {
+            this.controller.ai_chat.active_drawer =
+                if this.controller.ai_chat.active_drawer == AiChatDrawer::AgentSettings {
+                    AiChatDrawer::None
+                } else {
+                    AiChatDrawer::AgentSettings
+                };
+            cx.notify();
+        })));
+
+    if !chat.turns.is_empty() || chat.active_agent.is_some() {
         right_actions = right_actions.child(
             Button::new("ai-new-chat")
                 .ghost()
@@ -804,7 +1743,8 @@ fn render_compact_header(
                 .disabled(chat.is_busy())
                 .label("+")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller.ai_chat.clear_conversation();
+                    this.controller.ai_chat.new_session();
+                    this.sync_widgets_from_controller(cx);
                     cx.notify();
                 })),
         );
@@ -815,13 +1755,13 @@ fn render_compact_header(
         .flex_shrink_0()
         .items_center()
         .justify_between()
-        .gap_2()
+        .gap_1p5()
         .px_2()
         .py_1p5()
         .border_b_1()
         .border_color(theme.border)
         .child(
-            div().flex_1().min_w(px(90.)).child(
+            div().flex_1().min_w(px(80.)).child(
                 Select::new(ai_provider_select)
                     .menu_width(px(230.))
                     .with_size(Size::XSmall),
@@ -830,73 +1770,38 @@ fn render_compact_header(
         .child(right_actions)
 }
 
-fn render_chat_body(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> gpui_kit::AnyElement {
+fn render_chat_body(
+    chat: &AiChatState,
+    ai_ask_inputs: &[(String, Entity<InputState>)],
+    cx: &mut Context<SeaEditorWindow>,
+) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
 
     let theme = cx.theme().clone();
     let is_idle_empty = chat.turns.is_empty()
         && !chat.is_busy()
         && chat.pending_proposal.is_none()
+        && chat.pending_question.is_none()
+        && chat.pending_tool_approval.is_none()
         && chat.last_error.is_none()
         && !chat.can_one_click_undo;
 
     if is_idle_empty {
-        let mut welcome = v_flex()
-            .flex_1()
-            .w_full()
-            .min_h(px(0.))
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .px_4()
-            .py_4()
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(theme.foreground)
-                    .child("AI 編集アシスタント"),
-            )
-            .child(
-                div()
-                    .text_center()
-                    .text_color(theme.muted_foreground)
-                    .child(chat.status_banner.clone()),
-            );
-        if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
-            welcome = welcome.child(
-                div()
-                    .mt_2()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.secondary)
-                    .text_color(theme.muted_foreground)
-                    .child(notice),
-            );
-        }
-        return welcome.into_any_element();
+        return render_welcome_empty_state(chat, &theme).into_any_element();
     }
 
     let mut thread = v_flex().w_full().gap_2().px_2().py_2();
-    for turn in chat.turns.iter().rev().take(12).rev() {
+    for turn in chat.turns.iter().rev().take(16).rev() {
         thread = thread.child(render_chat_turn(turn, &theme));
     }
     if chat.is_busy() {
-        let label = if chat.streaming_preview.is_empty() {
-            "受信中...".to_owned()
-        } else {
-            let snippet: String = chat
-                .streaming_preview
-                .chars()
-                .rev()
-                .take(180)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            format!("受信中: {snippet}")
-        };
-        thread = thread.child(div().px_1().text_color(theme.muted_foreground).child(label));
+        thread = thread.child(render_busy_indicator(chat, &theme));
+    }
+    if let Some(approval) = &chat.pending_tool_approval {
+        thread = thread.child(render_tool_approval_card(approval, cx));
+    }
+    if let Some(question) = &chat.pending_question {
+        thread = thread.child(render_ask_user_card(question, ai_ask_inputs, cx));
     }
     if let Some(proposal) = &chat.pending_proposal {
         thread = thread.child(render_diff_card(proposal, cx));
@@ -933,6 +1838,73 @@ fn render_chat_body(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> gp
         .overflow_y_scrollbar()
         .child(thread)
         .into_any_element()
+}
+
+fn render_welcome_empty_state(
+    chat: &AiChatState,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let mut welcome = v_flex()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.))
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_4()
+        .py_4()
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child("AI 編集アシスタント"),
+        )
+        .child(
+            div()
+                .text_center()
+                .text_color(theme.muted_foreground)
+                .child(chat.status_banner.clone()),
+        );
+    if let Some(notice) = provider_safety_notice(&chat.selected_provider) {
+        welcome = welcome.child(
+            div()
+                .mt_2()
+                .p_2()
+                .rounded_md()
+                .bg(theme.secondary)
+                .text_color(theme.muted_foreground)
+                .child(notice),
+        );
+    }
+    welcome
+}
+
+fn render_busy_indicator(
+    chat: &AiChatState,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let label = if chat.agent_busy {
+        match chat.agent_step_status {
+            Some((Some(s), Some(t))) => format!("[{s}/{t}] {}", chat.status_banner),
+            Some((Some(s), None)) => format!("[ステップ {s}] {}", chat.status_banner),
+            _ => chat.status_banner.clone(),
+        }
+    } else if chat.streaming_preview.is_empty() {
+        "受信中...".to_owned()
+    } else {
+        let snippet: String = chat
+            .streaming_preview
+            .chars()
+            .rev()
+            .take(180)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("受信中: {snippet}")
+    };
+    div().px_1().text_color(theme.muted_foreground).child(label)
 }
 
 fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
@@ -1378,8 +2350,14 @@ fn render_composer_context_strip(
         .items_center()
         .gap_1()
         .flex_wrap()
+        .child(render_agent_mode_menu_button(&controller.ai_chat, cx))
+        .child(render_folder_attach_button(cx))
         .child(render_attach_context_button(controller, cx))
         .child(render_at_mention_button(controller, ai_chat_input, cx));
+
+    for (idx, folder) in controller.ai_chat.attached_folders.iter().enumerate() {
+        row = row.child(render_attached_folder_chip(idx, folder, cx));
+    }
 
     for (idx, cid) in controller.ai_chat.attached_clip_ids.iter().enumerate() {
         let Some((_, clip)) = controller.document.find_clip(cid) else {

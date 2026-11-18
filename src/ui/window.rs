@@ -113,6 +113,10 @@ pub struct SeaEditorWindow {
     pub(crate) ai_provider_select: Entity<SelectState<Vec<AiProviderSelectItem>>>,
     /// AI チャット欄のテキスト入力状態。
     pub(crate) ai_chat_input: Entity<TextareaState>,
+    /// エージェントからの `ask_user` 質問カード入力状態（`request_id` とフィールド一覧）。
+    pub(crate) ai_ask_inputs: Option<crate::ui::ai_agent_widgets::AskFieldInputs>,
+    /// `ai_ask_inputs` のフォーカス監視購読リスト。
+    pub(crate) ai_ask_subs: Vec<Subscription>,
     pub(crate) timeline_scroll: VirtualListScrollHandle,
     /// インライン名前変更中の対象レイヤー ID。
     pub(crate) layer_rename_target: Option<LayerId>,
@@ -153,6 +157,7 @@ impl SeaEditorWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut controller = AppController::new();
+        controller.ai_chat.enable_user_session_store();
         controller.try_start_audio_output();
         if let Some(path) = open_project
             && let Err(err) = controller.open_project_file(&path)
@@ -215,6 +220,8 @@ impl SeaEditorWindow {
             inspector_widgets,
             ai_provider_select,
             ai_chat_input,
+            ai_ask_inputs: None,
+            ai_ask_subs: Vec::new(),
             timeline_scroll: VirtualListScrollHandle::new(),
             layer_rename_target: None,
             layer_rename_input: None,
@@ -387,6 +394,7 @@ impl SeaEditorWindow {
             window,
             cx,
         );
+        self.sync_ai_ask_inputs(window, cx);
         self.syncing_widgets = false;
     }
 
@@ -697,6 +705,11 @@ impl SeaEditorWindow {
                 .external_tools_modal
                 .as_ref()
                 .is_some_and(|m| m.input.read(cx).focus_handle(cx).is_focused(window))
+            || self.ai_ask_inputs.as_ref().is_some_and(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(_, entity)| entity.read(cx).focus_handle(cx).is_focused(window))
+            })
             || self.inspector_widgets.is_any_input_focused(window, cx)
     }
 
@@ -878,6 +891,10 @@ impl SeaEditorWindow {
                             inspector_bank: &self.inspector_widgets,
                             ai_provider_select: &self.ai_provider_select,
                             ai_chat_input: &self.ai_chat_input,
+                            ai_ask_inputs: self
+                                .ai_ask_inputs
+                                .as_ref()
+                                .map_or(&[][..], |(_, list)| list.as_slice()),
                         },
                         cx,
                     )),

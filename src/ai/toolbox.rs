@@ -677,22 +677,36 @@ impl AgentTool for ValidateDraftPlanTool {
             description: "現在 DraftSandbox に蓄積された編集バッチがライブタイムライン上で安全に適用できるか dry_run_validate で検証し差分要約を返します。".to_owned(),
             safety_class: ToolSafetyClass::ReadOnly,
             supports_progress: false,
-            input_schema: json!({ "type": "object", "properties": {} }),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "include_command": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true の場合、Proposal 送信用に蓄積された EditCommand::Batch JSON (`command`) も返却する"
+                    }
+                }
+            }),
         }
     }
 
-    fn execute(&self, _args: &Value, ctx: &mut ToolExecutionContext<'_>) -> Result<Value, String> {
+    fn execute(&self, args: &Value, ctx: &mut ToolExecutionContext<'_>) -> Result<Value, String> {
         let batch = ctx.sandbox.to_batch_command();
         let raw = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
         let plan =
             dry_run_validate(ctx.sandbox.base_document(), &raw).map_err(|e| e.to_string())?;
-        Ok(json!({
+        let include_command = args["include_command"].as_bool().unwrap_or(false);
+        let mut resp = json!({
             "valid": true,
             "is_no_op": plan.is_no_op(),
             "summary_lines": plan.summary_lines,
             "affected_targets_count": plan.affected_targets.len(),
             "draft_total_duration_frames": ctx.sandbox.draft_document().total_duration_frames(),
-        }))
+        });
+        if include_command && let Ok(cmd_val) = serde_json::to_value(&batch) {
+            resp["command"] = cmd_val;
+        }
+        Ok(resp)
     }
 }
 
