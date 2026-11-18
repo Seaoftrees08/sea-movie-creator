@@ -2,6 +2,9 @@
 
 このガイドでは、`sea-movie-creator` Alpha 版が備えている **AI チャット編集支援**、**ローカル MCP サーバー / CLI**、および **外部 VST3 / CLAP 音声プラグインの別プロセス隔離ホスト** の設定と使い方を解説します。
 
+> [!TIP]
+> **自作プラグインの開発や外部ツールとの詳細なプロトコル連携を行いたい場合**は、開発者向けの [プラグイン開発ガイド](plugin-development.md)（[AI 連携・MCP 開発仕様](plugins/ai-and-mcp.md)・[VST3 / CLAP 互換仕様](plugins/audio-vst3-clap.md)）を参照してください。
+
 ---
 
 ## 1. AI チャットによる編集支援（`AI Chat` タブ）
