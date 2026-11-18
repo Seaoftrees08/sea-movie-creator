@@ -34,6 +34,9 @@ temp/
 *.tmp
 *.bak
 
+# Git worktrees (parallel development workspaces)
+/.worktrees/
+
 # Rust build artifacts
 /target/
 **/*.rs.bk
