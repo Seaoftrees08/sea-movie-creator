@@ -7,8 +7,9 @@ mod director;
 mod protocol_io;
 
 use std::io;
+use std::ops::ControlFlow;
 
-use sea_agent_protocol::HostToAgentMessage;
+use sea_agent_protocol::{HostToAgentMessage, PROTOCOL_VERSION};
 
 use crate::director::DirectorSession;
 use crate::protocol_io::AgentTransport;
@@ -33,71 +34,110 @@ fn main() {
             }
         };
 
-        match msg {
-            HostToAgentMessage::StartTask {
-                goal,
-                attached_folders,
-                capabilities,
-                tools,
-                timeline_summary,
-                agent_memory,
-                ..
-            } => {
-                transport.available_tools = tools;
-                let mut ctx =
-                    DirectorSession::from_host_init(capabilities, agent_memory, timeline_summary);
-                ctx.handle_start_task(&mut transport, &goal, &attached_folders);
-                session = Some(ctx);
-            }
-            HostToAgentMessage::ResumeSession {
-                capabilities,
-                tools,
-                timeline_summary,
-                agent_memory,
-                ..
-            } => {
-                transport.available_tools = tools;
-                let ctx =
-                    DirectorSession::from_host_init(capabilities, agent_memory, timeline_summary);
-                session = Some(ctx);
-                transport.status(
-                    "保存済みセッションを復元しました。続けて調整指示を入力できます。",
-                    None,
-                    None,
-                );
-            }
-            HostToAgentMessage::FollowUp {
-                prompt,
-                attached_folders,
-                timeline_summary,
-                ..
-            } => {
-                if let Some(ref mut ctx) = session {
-                    ctx.handle_follow_up(
-                        &mut transport,
-                        &prompt,
-                        &attached_folders,
-                        timeline_summary,
-                    );
-                } else {
-                    transport.send_error(
-                        "session_not_initialized",
-                        "StartTask または ResumeSession より前に FollowUp が送信されました。",
-                        true,
-                    );
-                }
-            }
-            HostToAgentMessage::Cancel { .. } => {
-                break;
-            }
-            HostToAgentMessage::UserAnswer { .. }
-            | HostToAgentMessage::ToolResult { .. }
-            | HostToAgentMessage::LlmResponse { .. } => {
-                let _ = io::Write::write_all(
-                    &mut io::stderr(),
-                    b"[sea-agent-director] ignored orphan reply at idle loop\n",
-                );
-            }
+        if matches!(
+            dispatch_host_message(&mut transport, &mut session, msg),
+            ControlFlow::Break(())
+        ) {
+            break;
         }
     }
+}
+
+fn dispatch_host_message(
+    transport: &mut AgentTransport<'_>,
+    session: &mut Option<DirectorSession>,
+    msg: HostToAgentMessage,
+) -> ControlFlow<()> {
+    match msg {
+        HostToAgentMessage::StartTask {
+            protocol_version,
+            goal,
+            attached_folders,
+            attached_clips,
+            capabilities,
+            tools,
+            timeline_summary,
+            agent_memory,
+            ..
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                transport.send_error(
+                    "unsupported_protocol",
+                    format!(
+                        "プロトコルバージョン不一致: 期待 `{PROTOCOL_VERSION}`, 受信 `{protocol_version}`"
+                    ),
+                    false,
+                );
+                return ControlFlow::Break(());
+            }
+            transport.available_tools = tools;
+            let mut ctx =
+                DirectorSession::from_host_init(capabilities, agent_memory, timeline_summary);
+            let flow = ctx.handle_start_task(transport, &goal, &attached_folders, &attached_clips);
+            if matches!(flow, ControlFlow::Break(())) {
+                return ControlFlow::Break(());
+            }
+            *session = Some(ctx);
+        }
+        HostToAgentMessage::ResumeSession {
+            protocol_version,
+            capabilities,
+            tools,
+            timeline_summary,
+            agent_memory,
+            ..
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                transport.send_error(
+                    "unsupported_protocol",
+                    format!(
+                        "プロトコルバージョン不一致: 期待 `{PROTOCOL_VERSION}`, 受信 `{protocol_version}`"
+                    ),
+                    false,
+                );
+                return ControlFlow::Break(());
+            }
+            transport.available_tools = tools;
+            let ctx = DirectorSession::from_host_init(capabilities, agent_memory, timeline_summary);
+            *session = Some(ctx);
+            transport.status(
+                "保存済みセッションを復元しました。続けて調整指示を入力できます。",
+                None,
+                None,
+            );
+        }
+        HostToAgentMessage::FollowUp {
+            prompt,
+            attached_folders,
+            attached_clips,
+            timeline_summary,
+        } => {
+            if let Some(ctx) = session.as_mut() {
+                return ctx.handle_follow_up(
+                    transport,
+                    &prompt,
+                    &attached_folders,
+                    &attached_clips,
+                    timeline_summary,
+                );
+            }
+            transport.send_error(
+                "session_not_initialized",
+                "StartTask または ResumeSession より前に FollowUp が送信されました。",
+                true,
+            );
+        }
+        HostToAgentMessage::Cancel { .. } => {
+            return ControlFlow::Break(());
+        }
+        HostToAgentMessage::UserAnswer { .. }
+        | HostToAgentMessage::ToolResult { .. }
+        | HostToAgentMessage::LlmResponse { .. } => {
+            let _ = io::Write::write_all(
+                &mut io::stderr(),
+                b"[sea-agent-director] ignored orphan reply at idle loop\n",
+            );
+        }
+    }
+    ControlFlow::Continue(())
 }

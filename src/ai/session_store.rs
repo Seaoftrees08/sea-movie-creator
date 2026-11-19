@@ -237,14 +237,13 @@ impl AiSessionStore {
     /// ID 不正、未存在、ファイル読取失敗、または JSON パース失敗時に [`SessionStoreError`] を返す。
     pub fn load_session(&self, session_id: &str) -> Result<AiSessionRecord, SessionStoreError> {
         let path = self.session_file_path(session_id)?;
-        if !path.is_file() {
-            return Err(SessionStoreError::NotFound(session_id.to_owned()));
+        let raw = read_regular_session_file(&path, session_id)?;
+        let rec: AiSessionRecord = serde_json::from_str(&raw)?;
+        validate_session_id(&rec.session_id)?;
+        if rec.session_id != session_id {
+            return Err(SessionStoreError::InvalidSessionId(rec.session_id));
         }
-        let raw = fs::read_to_string(&path).map_err(|err| SessionStoreError::Io {
-            path: path.display().to_string(),
-            reason: err.to_string(),
-        })?;
-        Ok(serde_json::from_str(&raw)?)
+        Ok(rec)
     }
 
     /// 保存済みセッション一覧を更新日時の新しい順で返す。破損ファイルはスキップし他の読込を妨げない。
@@ -266,20 +265,29 @@ impl AiSessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(raw) = fs::read_to_string(&path) else {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Ok(rec) = serde_json::from_str::<AiSessionRecord>(&raw) else {
+            if validate_session_id(stem).is_err() {
+                continue;
+            }
+            let Ok(raw) = read_regular_session_file(&path, stem) else {
                 continue;
             };
+            let Ok(header) = serde_json::from_str::<AiSessionSummaryHeader>(&raw) else {
+                continue;
+            };
+            if header.session_id != stem || validate_session_id(&header.session_id).is_err() {
+                continue;
+            }
             list.push(AiSessionSummary {
-                session_id: rec.session_id,
-                title: rec.title,
-                created_at_unix_secs: rec.created_at_unix_secs,
-                updated_at_unix_secs: rec.updated_at_unix_secs,
-                turn_count: rec.turns.len(),
-                folder_count: rec.attached_folders.len(),
-                agent_plugin_id: rec.agent_plugin_id,
+                session_id: header.session_id,
+                title: header.title,
+                created_at_unix_secs: header.created_at_unix_secs,
+                updated_at_unix_secs: header.updated_at_unix_secs,
+                turn_count: header.turns.len(),
+                folder_count: header.attached_folders.len(),
+                agent_plugin_id: header.agent_plugin_id,
             });
         }
         list.sort_by(|a, b| {
@@ -302,9 +310,10 @@ impl AiSessionStore {
     ) -> Result<AiSessionRecord, SessionStoreError> {
         let mut rec = self.load_session(session_id)?;
         let trimmed = new_title.trim();
-        if !trimmed.is_empty() {
-            trimmed.clone_into(&mut rec.title);
+        if trimmed.is_empty() {
+            return Ok(rec);
         }
+        trimmed.clone_into(&mut rec.title);
         rec.updated_at_unix_secs = Self::now_unix_secs();
         self.save_session(&rec)?;
         Ok(rec)
@@ -317,7 +326,10 @@ impl AiSessionStore {
     /// ID 不正・未存在・削除 I/O エラー時に [`SessionStoreError`] を返す。
     pub fn delete_session(&self, session_id: &str) -> Result<(), SessionStoreError> {
         let path = self.session_file_path(session_id)?;
-        if !path.is_file() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return Err(SessionStoreError::NotFound(session_id.to_owned()));
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
             return Err(SessionStoreError::NotFound(session_id.to_owned()));
         }
         fs::remove_file(&path).map_err(|err| SessionStoreError::Io {
@@ -332,7 +344,10 @@ impl AiSessionStore {
     ///
     /// ファイル存在時の読込・パース失敗時に [`SessionStoreError`] を返す。
     pub fn load_runtime_settings(&self) -> Result<AgentRuntimeSettings, SessionStoreError> {
-        if !self.settings_path.is_file() {
+        let Ok(meta) = fs::symlink_metadata(&self.settings_path) else {
+            return Ok(AgentRuntimeSettings::default());
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_SESSION_FILE_BYTES {
             return Ok(AgentRuntimeSettings::default());
         }
         let raw = fs::read_to_string(&self.settings_path).map_err(|err| SessionStoreError::Io {
@@ -361,8 +376,43 @@ impl AiSessionStore {
     }
 }
 
+const MAX_SESSION_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct AiSessionSummaryHeader {
+    session_id: String,
+    title: String,
+    created_at_unix_secs: u64,
+    updated_at_unix_secs: u64,
+    #[serde(default)]
+    turns: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    attached_folders: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    agent_plugin_id: Option<String>,
+}
+
 const fn default_schema_version() -> u32 {
     1
+}
+
+fn read_regular_session_file(path: &Path, session_id: &str) -> Result<String, SessionStoreError> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Err(SessionStoreError::NotFound(session_id.to_owned()));
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(SessionStoreError::NotFound(session_id.to_owned()));
+    }
+    if meta.len() > MAX_SESSION_FILE_BYTES {
+        return Err(SessionStoreError::Io {
+            path: path.display().to_string(),
+            reason: format!("session file exceeds {MAX_SESSION_FILE_BYTES} bytes limit"),
+        });
+    }
+    fs::read_to_string(path).map_err(|err| SessionStoreError::Io {
+        path: path.display().to_string(),
+        reason: err.to_string(),
+    })
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), SessionStoreError> {
@@ -371,10 +421,40 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionStoreError> {
         || !session_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        || is_windows_reserved_device_name(session_id)
     {
         return Err(SessionStoreError::InvalidSessionId(session_id.to_owned()));
     }
     Ok(())
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn atomic_write_text(path: &Path, text: &str) -> Result<(), SessionStoreError> {
@@ -384,18 +464,25 @@ fn atomic_write_text(path: &Path, text: &str) -> Result<(), SessionStoreError> {
             reason: err.to_string(),
         })?;
     }
-    let tmp_path = path.with_extension("json.tmp");
+    let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("session");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp.{pid}.{seq}"));
     fs::write(&tmp_path, text.as_bytes()).map_err(|err| SessionStoreError::Io {
         path: tmp_path.display().to_string(),
         reason: err.to_string(),
     })?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(SessionStoreError::Io {
+            path: path.display().to_string(),
+            reason: err.to_string(),
+        });
     }
-    fs::rename(&tmp_path, path).map_err(|err| SessionStoreError::Io {
-        path: path.display().to_string(),
-        reason: err.to_string(),
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -478,6 +565,20 @@ mod tests {
         };
         store.save_runtime_settings(&settings)?;
         assert_eq!(store.load_runtime_settings()?, settings);
+
+        // 空タイトルのリネームは更新せず早期リターン、Windows 予約デバイス名は拒否される
+        let before_rename = rec1.updated_at_unix_secs;
+        let unchanged = store.rename_session("sess_alpha", "   ")?;
+        assert_eq!(unchanged.title, "太郎・花子 結婚式");
+        assert_eq!(unchanged.updated_at_unix_secs, before_rename);
+        assert!(matches!(
+            store.load_session("CON"),
+            Err(SessionStoreError::InvalidSessionId(_))
+        ));
+        assert!(matches!(
+            store.load_session("nul"),
+            Err(SessionStoreError::InvalidSessionId(_))
+        ));
         Ok(())
     }
 }

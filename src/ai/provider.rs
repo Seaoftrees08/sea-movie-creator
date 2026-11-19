@@ -145,8 +145,7 @@ impl AiThinkingLevel {
             Self::Auto => None,
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
-            Self::High => Some("high"),
-            Self::Extra => Some("xhigh"),
+            Self::High | Self::Extra => Some("high"),
         }
     }
 

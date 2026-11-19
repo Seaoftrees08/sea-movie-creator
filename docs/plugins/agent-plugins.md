@@ -303,12 +303,17 @@ plugins/
 
 #### `error`（エラー通知）
 
+429/403 等の中断時でもそれまでに完了した解析キャッシュ等を失わないよう、任意の `agent_memory_patch` を同梱できます。
+
 ```json
 {
   "type": "error",
   "code": "no_media",
   "message": "添付フォルダ内に画像ファイルが見つかりませんでした。",
-  "recoverable": true
+  "recoverable": true,
+  "agent_memory_patch": {
+    "analyzed_count": 4
+  }
 }
 ```
 

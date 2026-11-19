@@ -1,5 +1,7 @@
 //! 動的自己記述ツールレジストリ (`HostToolRegistry`) および軽量 `DraftSandbox` 実行環境。
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use schemars::schema_for;
@@ -12,15 +14,17 @@ use crate::ai::context_builder::build_timeline_context;
 use crate::ai::media_inspector::{
     AllowedFolderScope, encode_thumbnail_jpeg_base64, inspect_media_folder,
 };
-use crate::ai::planner::dry_run_validate;
+use crate::ai::planner::dry_run_validate_command;
 use crate::ai::provider::{
-    AgentRuntimeSettings, AiAgentTurnRequest, AiContentPart, AiProvider, AiToolDefinition,
+    AgentRuntimeSettings, AiAgentTurnRequest, AiContentPart, AiError, AiProvider, AiToolDefinition,
     AiTurnMessage,
 };
 use crate::core::time::FrameIndex;
 use crate::timeline::command::EditCommand;
 use crate::timeline::dispatcher::CommandDispatcher;
 use crate::timeline::document::ProjectDocument;
+
+const MAX_VISION_INPUT_PATHS: usize = 100;
 
 /// ツールが引き起こす副作用と承認方針の安全分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,8 +165,10 @@ pub struct ToolExecutionContext<'a> {
     pub llm_provider: Option<&'a dyn AiProvider>,
     /// ランタイム設定（スロットリング・バッチ上限等）。
     pub runtime_settings: &'a AgentRuntimeSettings,
-    /// 前回 LLM 呼び出し完了時刻（`min_llm_interval_ms` 制御用）。
-    pub last_llm_call_at: Option<Instant>,
+    /// 前回 LLM 呼び出し完了時刻への可変参照（`min_llm_interval_ms` 制御用）。
+    pub last_llm_call_at: &'a mut Option<Instant>,
+    /// 中断・キャンセル要求フラグ（任意）。
+    pub cancelled: Option<&'a AtomicBool>,
     /// 進捗通知コールバック。
     pub on_progress: &'a mut dyn FnMut(&str),
     /// 登録済み外部拡張を自己申告一覧に含めるための追加リスト（任意）。
@@ -170,18 +176,36 @@ pub struct ToolExecutionContext<'a> {
 }
 
 impl ToolExecutionContext<'_> {
+    /// キャンセル要求が立っているか確認する。
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     /// 設定された `min_llm_interval_ms` を満たすよう必要に応じて待機し、最終呼出時刻を更新する。
-    pub fn throttle_before_llm_call(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// 待機中にキャンセルが要求された場合はエラーを返す。
+    pub fn throttle_before_llm_call(&mut self) -> Result<(), String> {
         let min_ms = self.runtime_settings.min_llm_interval_ms;
         if min_ms > 0
-            && let Some(prev) = self.last_llm_call_at
+            && let Some(prev) = *self.last_llm_call_at
         {
             let target = Duration::from_millis(min_ms);
-            if let Some(remaining) = target.checked_sub(prev.elapsed()) {
-                std::thread::sleep(remaining);
+            while let Some(remaining) = target.checked_sub(prev.elapsed()) {
+                if self.is_cancelled() {
+                    return Err("tool execution cancelled".to_owned());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
             }
         }
-        self.last_llm_call_at = Some(Instant::now());
+        if self.is_cancelled() {
+            return Err("tool execution cancelled".to_owned());
+        }
+        *self.last_llm_call_at = Some(Instant::now());
+        Ok(())
     }
 }
 
@@ -201,12 +225,12 @@ pub trait AgentTool: Send + Sync {
 /// 本体の標準ツールおよび将来拡張ツールを動的管理するレジストリ。
 #[derive(Default)]
 pub struct HostToolRegistry {
-    tools: Vec<Box<dyn AgentTool>>,
+    tools: Vec<(AgentToolDescriptor, Box<dyn AgentTool>)>,
 }
 
 impl std::fmt::Debug for HostToolRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<String> = self.tools.iter().map(|t| t.descriptor().name).collect();
+        let names: Vec<&str> = self.tools.iter().map(|(d, _)| d.name.as_str()).collect();
         f.debug_struct("HostToolRegistry")
             .field("tools", &names)
             .finish()
@@ -237,18 +261,18 @@ impl HostToolRegistry {
 
     /// 新しいツールを登録する（同名ツールが存在する場合は上書き置換）。
     pub fn register(&mut self, tool: Box<dyn AgentTool>) {
-        let name = tool.descriptor().name;
-        if let Some(pos) = self.tools.iter().position(|t| t.descriptor().name == name) {
-            self.tools[pos] = tool;
+        let desc = tool.descriptor();
+        if let Some(pos) = self.tools.iter().position(|(d, _)| d.name == desc.name) {
+            self.tools[pos] = (desc, tool);
         } else {
-            self.tools.push(tool);
+            self.tools.push((desc, tool));
         }
     }
 
     /// 登録済み全ツールの自己記述仕様一覧を返す。
     #[must_use]
     pub fn list_descriptors(&self) -> Vec<AgentToolDescriptor> {
-        self.tools.iter().map(|t| t.descriptor()).collect()
+        self.tools.iter().map(|(d, _)| d.clone()).collect()
     }
 
     /// 指定名ツールの自己記述仕様を検索する。
@@ -256,8 +280,8 @@ impl HostToolRegistry {
     pub fn find_descriptor(&self, name: &str) -> Option<AgentToolDescriptor> {
         self.tools
             .iter()
-            .map(|t| t.descriptor())
-            .find(|d| d.name == name)
+            .find(|(d, _)| d.name == name)
+            .map(|(d, _)| d.clone())
     }
 
     /// 指定ツールを実行して JSON 結果を返す。
@@ -271,10 +295,10 @@ impl HostToolRegistry {
         args: &Value,
         ctx: &mut ToolExecutionContext<'_>,
     ) -> Result<Value, String> {
-        let tool = self
+        let (_, tool) = self
             .tools
             .iter()
-            .find(|t| t.descriptor().name == name)
+            .find(|(d, _)| d.name == name)
             .ok_or_else(|| format!("unknown host tool `{name}`"))?;
         tool.execute(args, ctx)
     }
@@ -407,6 +431,12 @@ impl AgentTool for InspectImagesVisionTool {
             .iter()
             .filter_map(|v| v.as_str().map(ToOwned::to_owned))
             .collect();
+        if paths.len() > MAX_VISION_INPUT_PATHS {
+            return Err(format!(
+                "inspect_images_vision paths limit exceeded ({}; max {MAX_VISION_INPUT_PATHS})",
+                paths.len()
+            ));
+        }
         if paths.is_empty() {
             return Ok(json!({ "analyses": [], "used_vision": false }));
         }
@@ -414,9 +444,11 @@ impl AgentTool for InspectImagesVisionTool {
         let theme_hint = args["theme_hint"]
             .as_str()
             .unwrap_or("思い出フォトムービー");
-        let max_edge = ctx.runtime_settings.vision_max_edge_px.clamp(128, 1024);
-        let batch_size = ctx.runtime_settings.vision_batch_size.clamp(1, 12);
-
+        let language = args["language"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ja");
         let Some(provider) = ctx.llm_provider.filter(|p| p.supports_vision()) else {
             // Vision 非対応時はファイル名ベースの安全フォールバックを返す
             let fallback: Vec<Value> = paths
@@ -430,23 +462,155 @@ impl AgentTool for InspectImagesVisionTool {
             }));
         };
 
-        let mut all_analyses = Vec::with_capacity(paths.len());
-        let total = paths.len();
-        for (chunk_idx, chunk) in paths.chunks(batch_size).enumerate() {
-            let done_so_far = (chunk_idx * batch_size).min(total);
-            (ctx.on_progress)(&format!(
-                "写真を Vision 解析中 ({done_so_far}/{total} 枚)..."
+        execute_vision_batches(provider, &paths, theme_hint, language, ctx)
+    }
+}
+
+fn execute_vision_batches(
+    provider: &dyn AiProvider,
+    paths: &[String],
+    theme_hint: &str,
+    language: &str,
+    ctx: &mut ToolExecutionContext<'_>,
+) -> Result<Value, String> {
+    let max_edge = ctx.runtime_settings.vision_max_edge_px.clamp(128, 1024);
+    let batch_size = ctx.runtime_settings.vision_batch_size.clamp(1, 12);
+    let mut all_analyses = Vec::with_capacity(paths.len());
+    let total = paths.len();
+    let mut used_vision_ok = true;
+    let mut fallback_note: Option<String> = None;
+
+    for (chunk_idx, chunk) in paths.chunks(batch_size).enumerate() {
+        let done_so_far = (chunk_idx * batch_size).min(total);
+        if ctx.is_cancelled() {
+            return Ok(partial_vision_json(
+                &all_analyses,
+                false,
+                total,
+                "cancelled",
+                "vision analysis cancelled by user",
             ));
-            ctx.throttle_before_llm_call();
-            let batch_items =
-                run_single_vision_batch(provider, ctx.folder_scope, chunk, max_edge, theme_hint)?;
-            all_analyses.extend(batch_items);
+        }
+        (ctx.on_progress)(&format!(
+            "写真を Vision 解析中 ({done_so_far}/{total} 枚)..."
+        ));
+        if let Err(cancel_msg) = ctx.throttle_before_llm_call() {
+            return Ok(partial_vision_json(
+                &all_analyses,
+                false,
+                total,
+                "cancelled",
+                &cancel_msg,
+            ));
         }
 
-        Ok(json!({
-            "analyses": all_analyses,
-            "used_vision": true,
-        }))
+        match run_single_vision_batch(
+            provider,
+            ctx.folder_scope,
+            chunk,
+            max_edge,
+            theme_hint,
+            language,
+        ) {
+            VisionBatchOutcome::Parsed(items) => all_analyses.extend(items),
+            VisionBatchOutcome::ParseFallback(items) => {
+                used_vision_ok = false;
+                fallback_note.get_or_insert_with(|| "vision JSON parse fallback used".to_owned());
+                all_analyses.extend(items);
+            }
+            VisionBatchOutcome::VisionUnsupported(reason) => {
+                used_vision_ok = false;
+                fallback_note = Some(reason);
+                for remaining_path in &paths[done_so_far..] {
+                    all_analyses.push(build_filename_fallback_analysis(remaining_path));
+                }
+                break;
+            }
+            VisionBatchOutcome::Failed { code, message } => {
+                if !all_analyses.is_empty() || matches!(code, "rate_limited" | "forbidden") {
+                    return Ok(partial_vision_json(
+                        &all_analyses,
+                        used_vision_ok && !all_analyses.is_empty(),
+                        total,
+                        code,
+                        &message,
+                    ));
+                }
+                return Err(message);
+            }
+        }
+    }
+
+    let mut out = json!({
+        "analyses": all_analyses,
+        "used_vision": used_vision_ok,
+    });
+    if let Some(note) = fallback_note {
+        out["note"] = Value::String(note);
+    }
+    Ok(out)
+}
+
+fn partial_vision_json(
+    analyses: &[Value],
+    used_vision: bool,
+    total_count: usize,
+    error_code: &str,
+    error: &str,
+) -> Value {
+    json!({
+        "analyses": analyses,
+        "used_vision": used_vision,
+        "partial": true,
+        "processed_count": analyses.len(),
+        "total_count": total_count,
+        "error_code": error_code,
+        "error": error,
+    })
+}
+
+enum VisionBatchOutcome {
+    Parsed(Vec<Value>),
+    ParseFallback(Vec<Value>),
+    VisionUnsupported(String),
+    Failed { code: &'static str, message: String },
+}
+
+fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
+    let msg = err.to_string();
+    match err {
+        AiError::HttpStatus { status: 429, .. } => ("rate_limited", false, msg),
+        AiError::HttpStatus { status: 403, .. } => ("forbidden", false, msg),
+        AiError::HttpStatus {
+            status: 400 | 404 | 422,
+            body,
+        } => {
+            let lower = body.to_ascii_lowercase();
+            let unsupported = [
+                "vision",
+                "image",
+                "multimodal",
+                "does not support",
+                "not supported",
+                "unknown variant",
+            ]
+            .iter()
+            .any(|kw| lower.contains(kw));
+            if unsupported {
+                ("vision_unsupported", true, msg)
+            } else {
+                ("llm_error", false, msg)
+            }
+        }
+        _ => ("llm_error", false, msg),
+    }
+}
+
+fn describe_target_language(code: &str) -> String {
+    match code.trim().to_ascii_lowercase().as_str() {
+        "ja" | "jpn" | "japanese" => "natural Japanese".to_owned(),
+        "en" | "eng" | "english" => "natural English".to_owned(),
+        other => other.chars().take(24).collect(),
     }
 }
 
@@ -456,14 +620,22 @@ fn run_single_vision_batch(
     paths: &[String],
     max_edge: u32,
     theme_hint: &str,
-) -> Result<Vec<Value>, String> {
+    language: &str,
+) -> VisionBatchOutcome {
     let mut parts = Vec::new();
     let mut manifest_lines = Vec::new();
     let mut valid_paths = Vec::new();
 
     for (idx, p) in paths.iter().enumerate() {
-        let thumb = encode_thumbnail_jpeg_base64(scope, std::path::Path::new(p), max_edge)
-            .map_err(|e| e.to_string())?;
+        let thumb = match encode_thumbnail_jpeg_base64(scope, std::path::Path::new(p), max_edge) {
+            Ok(t) => t,
+            Err(err) => {
+                return VisionBatchOutcome::Failed {
+                    code: "media_error",
+                    message: err.to_string(),
+                };
+            }
+        };
         let fname = std::path::Path::new(&thumb.path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -477,11 +649,12 @@ fn run_single_vision_batch(
         valid_paths.push(thumb.path);
     }
 
+    let lang_desc = describe_target_language(language);
     let prompt_head = format!(
         "Analyze the attached photos for the video theme: \"{theme_hint}\".\n\
          Return ONLY a valid JSON object of the form:\n\
          {{\"analyses\":[{{\"index\":0,\"path\":\"...\",\"scene_description\":\"...\",\"suggested_chapter\":\"...\",\"suggested_subtitle\":\"...\",\"mood\":\"warm|joyful|nostalgic|calm\",\"recommended_motion\":\"zoom_in|zoom_out|pan_left|pan_right\"}}]}}\n\
-         Keep `suggested_subtitle` warm, natural Japanese (12-26 chars) matching what is actually visible in the photo.\n\
+         Keep `suggested_subtitle` warm, {lang_desc} (12-26 chars) matching what is actually visible in the photo.\n\
          Images:\n{}",
         manifest_lines.join("\n")
     );
@@ -503,17 +676,27 @@ fn run_single_vision_batch(
         temperature: Some(0.2),
     };
 
-    let resp = provider
-        .send_agent_turn(&req, &mut |_| {})
-        .map_err(|e| e.to_string())?;
+    let resp = match provider.send_agent_turn(&req, &mut |_| {}) {
+        Ok(r) => r,
+        Err(err) => {
+            let (code, is_unsupported, message) = classify_vision_api_error(&err);
+            return if is_unsupported {
+                VisionBatchOutcome::VisionUnsupported(message)
+            } else {
+                VisionBatchOutcome::Failed { code, message }
+            };
+        }
+    };
     let raw_text = resp.text.unwrap_or_default();
     if let Some(parsed) = parse_vision_analyses_json(&raw_text, &valid_paths) {
-        return Ok(parsed);
+        return VisionBatchOutcome::Parsed(parsed);
     }
-    Ok(valid_paths
-        .iter()
-        .map(|p| build_filename_fallback_analysis(p))
-        .collect())
+    VisionBatchOutcome::ParseFallback(
+        valid_paths
+            .iter()
+            .map(|p| build_filename_fallback_analysis(p))
+            .collect(),
+    )
 }
 
 fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<Value>> {
@@ -530,13 +713,13 @@ fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<V
         let matched = arr
             .iter()
             .find(|item| item["index"].as_u64() == Some(idx as u64))
-            .or_else(|| arr.get(idx));
-        if let Some(item) = matched {
-            let mut obj = item.clone();
-            if obj.get("path").and_then(Value::as_str).is_none() {
-                obj["path"] = Value::String(default_path.clone());
-            }
-            out.push(obj);
+            .or_else(|| arr.get(idx))
+            .and_then(Value::as_object);
+        if let Some(item_map) = matched {
+            let mut obj_map = item_map.clone();
+            // LLM がハルシネーションやインジェクションで別パスを返しても正規実パスで上書きする
+            obj_map.insert("path".to_owned(), Value::String(default_path.clone()));
+            out.push(Value::Object(obj_map));
         } else {
             out.push(build_filename_fallback_analysis(default_path));
         }
@@ -563,8 +746,13 @@ struct CompileMovieBlueprintTool;
 
 impl AgentTool for CompileMovieBlueprintTool {
     fn descriptor(&self) -> AgentToolDescriptor {
-        let blueprint_schema = serde_json::to_value(schema_for!(MovieBlueprint))
-            .unwrap_or_else(|_| json!({ "type": "object" }));
+        static BLUEPRINT_SCHEMA: OnceLock<Value> = OnceLock::new();
+        let blueprint_schema = BLUEPRINT_SCHEMA
+            .get_or_init(|| {
+                serde_json::to_value(schema_for!(MovieBlueprint))
+                    .unwrap_or_else(|_| json!({ "type": "object" }))
+            })
+            .clone();
         AgentToolDescriptor {
             name: "compile_movie_blueprint".to_owned(),
             category: "composition".to_owned(),
@@ -691,11 +879,15 @@ impl AgentTool for ValidateDraftPlanTool {
     }
 
     fn execute(&self, args: &Value, ctx: &mut ToolExecutionContext<'_>) -> Result<Value, String> {
-        let batch = ctx.sandbox.to_batch_command();
-        let raw = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
-        let plan =
-            dry_run_validate(ctx.sandbox.base_document(), &raw).map_err(|e| e.to_string())?;
         let include_command = args["include_command"].as_bool().unwrap_or(false);
+        let batch = ctx.sandbox.to_batch_command();
+        let command_json = if include_command {
+            Some(serde_json::to_value(&batch).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let plan = dry_run_validate_command(ctx.sandbox.base_document(), batch, None)
+            .map_err(|e| e.to_string())?;
         let mut resp = json!({
             "valid": true,
             "is_no_op": plan.is_no_op(),
@@ -703,7 +895,7 @@ impl AgentTool for ValidateDraftPlanTool {
             "affected_targets_count": plan.affected_targets.len(),
             "draft_total_duration_frames": ctx.sandbox.draft_document().total_duration_frames(),
         });
-        if include_command && let Ok(cmd_val) = serde_json::to_value(&batch) {
+        if let Some(cmd_val) = command_json {
             resp["command"] = cmd_val;
         }
         Ok(resp)
@@ -813,12 +1005,14 @@ mod tests {
 
         let mut logs = Vec::new();
         let mut progress = |msg: &str| logs.push(msg.to_owned());
+        let mut last_llm_call_at = None;
         let mut ctx = ToolExecutionContext {
             folder_scope: &scope,
             sandbox: &mut sandbox,
             llm_provider: Some(&mock_vision),
             runtime_settings: &settings,
-            last_llm_call_at: None,
+            last_llm_call_at: &mut last_llm_call_at,
+            cancelled: None,
             on_progress: &mut progress,
             extra_extensions: Vec::new(),
         };
@@ -867,6 +1061,29 @@ mod tests {
 
         // 本番ライブドキュメントは DraftSandbox 操作中も一切変更されていない
         assert_eq!(live_doc.layers.len(), 0);
+
+        // parse_vision_analyses_json が LLM の不正パスを正規パスで上書きすることを検証
+        let canonical = p1.canonicalize()?.to_string_lossy().into_owned();
+        let parsed = parse_vision_analyses_json(
+            r#"{"analyses":[{"index":0,"path":"C:/Windows/System32/evil.exe","suggested_subtitle":"ok"}]}"#,
+            std::slice::from_ref(&canonical),
+        )
+        .ok_or("parse_vision_analyses_json returned None")?;
+        assert_eq!(parsed[0]["path"], canonical);
+
+        // paths 上限超過が拒否されること
+        let too_many: Vec<String> = (0..=MAX_VISION_INPUT_PATHS)
+            .map(|i| format!("C:/fake/{i}.png"))
+            .collect();
+        assert!(
+            registry
+                .execute(
+                    "inspect_images_vision",
+                    &json!({ "paths": too_many }),
+                    &mut ctx
+                )
+                .is_err()
+        );
         assert_ne!(logs.len(), 0);
         Ok(())
     }

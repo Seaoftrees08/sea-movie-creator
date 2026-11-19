@@ -111,23 +111,57 @@ impl GeminiProvider {
         }
     }
 
+    fn validate_model_id(&self) -> Result<(), AiError> {
+        let model = self.config.model.trim();
+        if model.is_empty() || model.contains(['/', '?', '#', '\\', ' ']) || model.contains("..") {
+            return Err(AiError::Transport(format!(
+                "invalid Gemini model identifier: {}",
+                self.config.model
+            )));
+        }
+        Ok(())
+    }
+
     fn build_agent_request_body(&self, request: &AiAgentTurnRequest) -> Value {
-        let contents: Vec<Value> = request
-            .messages
-            .iter()
-            .map(gemini_turn_message_to_json)
-            .collect();
+        let mut system_parts = vec![json!({ "text": request.system_prompt })];
+        let mut contents: Vec<Value> = Vec::new();
+        for turn in &request.messages {
+            if let AiTurnMessage::System { text } = turn {
+                if !text.is_empty() {
+                    system_parts.push(json!({ "text": text }));
+                }
+                continue;
+            }
+            let (role, mut parts) = gemini_turn_message_to_parts(turn);
+            if parts.is_empty() {
+                continue;
+            }
+            if let Some(last) = contents.last_mut()
+                && last["role"].as_str() == Some(role)
+                && let Some(existing_parts) = last["parts"].as_array_mut()
+            {
+                existing_parts.append(&mut parts);
+                continue;
+            }
+            contents.push(json!({
+                "role": role,
+                "parts": parts,
+            }));
+        }
 
         let temp = request.temperature.unwrap_or(0.2);
         let mut gen_cfg = json!({ "temperature": temp });
-        if request.tools.is_empty() && request.response_json_schema.is_some() {
+        if request.tools.is_empty()
+            && let Some(schema) = &request.response_json_schema
+        {
             gen_cfg["responseMimeType"] = json!("application/json");
+            gen_cfg["responseJsonSchema"] = schema.clone();
         }
         self.apply_thinking_config(&mut gen_cfg);
 
         let mut body = json!({
             "systemInstruction": {
-                "parts": [{ "text": request.system_prompt }]
+                "parts": system_parts,
             },
             "contents": contents,
             "generationConfig": gen_cfg,
@@ -140,7 +174,7 @@ impl GeminiProvider {
                     json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": sanitize_gemini_schema(&tool.parameters_schema),
+                        "parametersJsonSchema": tool.parameters_schema,
                     })
                 })
                 .collect();
@@ -172,6 +206,7 @@ impl AiProvider for GeminiProvider {
         request: &AiRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
+        self.validate_model_id()?;
         let key = require_api_key(&AiProviderKind::Gemini, self.config.api_key.as_ref())?
             .ok_or_else(|| AiError::MissingCredentials {
                 provider: "Google Gemini".to_owned(),
@@ -221,6 +256,7 @@ impl AiProvider for GeminiProvider {
         request: &AiAgentTurnRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiAgentTurnResponse, AiError> {
+        self.validate_model_id()?;
         let key = require_api_key(&AiProviderKind::Gemini, self.config.api_key.as_ref())?
             .ok_or_else(|| AiError::MissingCredentials {
                 provider: "Google Gemini".to_owned(),
@@ -247,12 +283,9 @@ impl AiProvider for GeminiProvider {
     }
 }
 
-fn gemini_turn_message_to_json(msg: &AiTurnMessage) -> Value {
+fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value>) {
     match msg {
-        AiTurnMessage::System { text } => json!({
-            "role": "user",
-            "parts": [{ "text": format!("[System Note]\n{text}") }],
-        }),
+        AiTurnMessage::System { text } => ("user", vec![json!({ "text": text })]),
         AiTurnMessage::User { parts } => {
             let gem_parts: Vec<Value> = parts
                 .iter()
@@ -269,7 +302,7 @@ fn gemini_turn_message_to_json(msg: &AiTurnMessage) -> Value {
                     }),
                 })
                 .collect();
-            json!({ "role": "user", "parts": gem_parts })
+            ("user", gem_parts)
         }
         AiTurnMessage::Assistant { text, tool_calls } => {
             let mut gem_parts = Vec::new();
@@ -289,7 +322,7 @@ fn gemini_turn_message_to_json(msg: &AiTurnMessage) -> Value {
             if gem_parts.is_empty() {
                 gem_parts.push(json!({ "text": "" }));
             }
-            json!({ "role": "model", "parts": gem_parts })
+            ("model", gem_parts)
         }
         AiTurnMessage::ToolResult {
             name,
@@ -304,33 +337,16 @@ fn gemini_turn_message_to_json(msg: &AiTurnMessage) -> Value {
             } else {
                 json!({ "result": parsed })
             };
-            json!({
-                "role": "user",
-                "parts": [{
+            (
+                "user",
+                vec![json!({
                     "functionResponse": {
                         "name": name,
                         "response": payload,
                     }
-                }]
-            })
+                })],
+            )
         }
-    }
-}
-
-fn sanitize_gemini_schema(schema: &Value) -> Value {
-    match schema {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if matches!(k.as_str(), "$schema" | "additionalProperties" | "title") {
-                    continue;
-                }
-                out.insert(k.clone(), sanitize_gemini_schema(v));
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_gemini_schema).collect()),
-        other => other.clone(),
     }
 }
 
@@ -342,7 +358,8 @@ fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
     let mut text_buf = String::new();
     let mut tool_calls = Vec::new();
     for (idx, part) in parts.iter().enumerate() {
-        if let Some(txt) = part["text"].as_str() {
+        let is_thought = part["thought"].as_bool() == Some(true);
+        if !is_thought && let Some(txt) = part["text"].as_str() {
             text_buf.push_str(txt);
         }
         if let Some(fc) = part.get("functionCall").filter(|v| v.is_object())
@@ -378,6 +395,9 @@ fn extract_candidate_text(val: &Value) -> Option<String> {
     let parts = val["candidates"][0]["content"]["parts"].as_array()?;
     let mut joined = String::new();
     for part in parts {
+        if part["thought"].as_bool() == Some(true) {
+            continue;
+        }
         if let Some(txt) = part["text"].as_str() {
             joined.push_str(txt);
         }
@@ -478,8 +498,69 @@ mod tests {
         let captured = server.join().map_err(|_| "server join failed")??;
         assert!(captured.contains("inlineData"));
         assert!(captured.contains("functionDeclarations"));
-        assert!(!captured.contains("$schema"));
-        assert!(!captured.contains("additionalProperties"));
+        assert!(captured.contains("parametersJsonSchema"));
+
+        // 並列 ToolResult の単一 user ターン統合、System -> systemInstruction、responseJsonSchema、thought 除外を検証
+        let multi_req = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![
+                AiTurnMessage::System {
+                    text: "System note".to_owned(),
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "c1".to_owned(),
+                    name: "inspect_media_folder".to_owned(),
+                    content_json: "{\"count\":10}".to_owned(),
+                    is_error: false,
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "c2".to_owned(),
+                    name: "get_capabilities".to_owned(),
+                    content_json: "{\"fps\":60}".to_owned(),
+                    is_error: false,
+                },
+            ],
+            tools: Vec::new(),
+            response_json_schema: Some(json!({"type": "object"})),
+            temperature: Some(0.1),
+        };
+        let multi_body = provider.build_agent_request_body(&multi_req);
+        assert_eq!(
+            multi_body["systemInstruction"]["parts"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(multi_body["contents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(multi_body["contents"][0]["role"], json!("user"));
+        assert_eq!(
+            multi_body["contents"][0]["parts"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            multi_body["generationConfig"]["responseJsonSchema"],
+            json!({"type": "object"})
+        );
+
+        let thought_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "internal thought", "thought": true },
+                        { "text": "{\"ok\":true}" }
+                    ]
+                }
+            }]
+        });
+        let parsed = parse_gemini_agent_response(&thought_resp, "gemini-2.5-pro")?;
+        assert_eq!(parsed.text.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(
+            extract_candidate_text(&thought_resp).as_deref(),
+            Some("{\"ok\":true}")
+        );
+
+        let bad_model = GeminiProvider::new(GeminiConfig::new("gemini-2.5/../../evil", None));
+        assert!(bad_model.validate_model_id().is_err());
         Ok(())
     }
 

@@ -394,6 +394,13 @@ impl SeaEditorWindow {
             window,
             cx,
         );
+        let desired_provider_idx =
+            provider_select_index(&self.controller.ai_chat.selected_provider);
+        if self.ai_provider_select.read(cx).selected_index(cx) != desired_provider_idx {
+            self.ai_provider_select.update(cx, |select, cx| {
+                select.set_selected_index(desired_provider_idx, window, cx);
+            });
+        }
         self.sync_ai_ask_inputs(window, cx);
         self.syncing_widgets = false;
     }
@@ -407,6 +414,7 @@ impl SeaEditorWindow {
         if self.close_prompt == ClosePromptState::ConfirmedExit
             || !self.controller.has_unsaved_changes()
         {
+            self.controller.shutdown_ai_agent();
             return true;
         }
         self.close_prompt = ClosePromptState::ConfirmModal;
@@ -420,6 +428,7 @@ impl SeaEditorWindow {
             match self.controller.save_project_file(&existing) {
                 Ok(()) => {
                     self.close_prompt = ClosePromptState::ConfirmedExit;
+                    self.controller.shutdown_ai_agent();
                     cx.quit();
                 }
                 Err(err) => {
@@ -440,6 +449,7 @@ impl SeaEditorWindow {
                     match view.controller.save_project_file(&path) {
                         Ok(()) => {
                             view.close_prompt = ClosePromptState::ConfirmedExit;
+                            view.controller.shutdown_ai_agent();
                             should_quit = true;
                         }
                         Err(err) => {
@@ -525,6 +535,9 @@ impl SeaEditorWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.syncing_widgets {
+            return;
+        }
         if let SelectEvent::Confirm(Some(kind)) = event
             && &self.controller.ai_chat.selected_provider != kind
         {
@@ -1587,6 +1600,7 @@ fn render_unsaved_close_modal_overlay(cx: &mut Context<SeaEditorWindow>) -> impl
                                 .label(tr("unsaved.discard_and_close"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.close_prompt = ClosePromptState::ConfirmedExit;
+                                    this.controller.shutdown_ai_agent();
                                     cx.quit();
                                 })),
                         )

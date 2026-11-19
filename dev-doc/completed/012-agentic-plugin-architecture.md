@@ -85,7 +85,7 @@ flowchart TB
     subgraph HOST["本体ホスト基盤・機能モジュール (src/ai/, src/media/)"]
         SESS["AiSessionStore<br/>・履歴 & AgentMemory 永続化"]
         RUNNER["AgentSessionRunner<br/>・常駐プロセス管理 / レジューム<br/>・ステップ上限 & LLM呼出間隔制御"]
-        TOOLS["HostToolRegistry + DraftSandbox<br/>1. inspect_media_folder (解像度/EXIF/メモ)<br/>2. inspect_images_vision (512px 使い捨て縮小)<br/>3. probe_media_duration (BGM/動画尺)<br/>4. compile_movie_blueprint (決定論的コンパイラ)<br/>5. dry_run_validate / 拡張ツール群"]
+        TOOLS["HostToolRegistry + DraftSandbox<br/>1. inspect_media_folder (解像度/EXIF/音声動画尺/メモ)<br/>2. inspect_images_vision (512px 使い捨て縮小)<br/>3. compile_movie_blueprint (決定論的コンパイラ)<br/>4. apply_draft_edit_command / reset_draft_to_live<br/>5. validate_draft_plan / get_capabilities / 拡張ツール群"]
         LLM["Hybrid Multimodal AiProvider<br/>・Native Tool Calling (Gemini/OpenAI/Claude)<br/>・JSON Action フォールバック (Ollama/Mock)"]
     end
 
@@ -96,8 +96,8 @@ flowchart TB
     CHAT <--> SESS
     CHAT -->|"目標 / 回答 / フォローアップ"| RUNNER
     RUNNER <-->|"stdin/stdout NDJSON (sea_agent_v1)"| AGENT
-    AGENT -->|"host/call_tool"| TOOLS
-    AGENT -->|"host/llm_chat (ツール定義 + 画像)"| LLM
+    AGENT -->|"call_tool"| TOOLS
+    AGENT -->|"llm_chat (ツール定義 + 画像)"| LLM
     TOOLS -->|"EditCommand::Batch"| RUNNER
     RUNNER -->|"質問カード / 適用差分カード"| CHAT
     CHAT -->|"承認して適用 (単一 Undo)"| CTRL
@@ -127,16 +127,16 @@ flowchart LR
     CMD --> CAT
     MOD --> REG
     PLG --> CAT
-    CAT -->|"start_task / host/get_capabilities"| AGENT
-    REG -->|"host/list_tools"| AGENT
-    AGENT -->|"host/call_tool"| REG
+    CAT -->|"start_task / get_capabilities"| AGENT
+    REG -->|"start_task.tools / tool_result.updated_tools"| AGENT
+    AGENT -->|"call_tool"| REG
     REG -->|"ドラフト編集系ツール"| SANDBOX
 ```
 
 1. **能力スナップショット契約 (`HostCapabilitySnapshot`)**:
-   - `edit_command_schema_json`（`schemars` による `///` 説明付きスキーマ）、利用可能フォント一覧、導入済みプラグイン（有効・未設定・欠損状態と任意 `ai_hints`）を構造化 JSON で供給。
+   - `edit_command_schema`（`schemars` による `///` 説明付きスキーマ）・`blueprint_schema`、利用可能フォント一覧、`BlendMode` / `ParameterPath` 一覧、導入済みプラグイン（有効・未設定・欠損状態と任意 `ai_hints`）を構造化 JSON で供給（`start_task` / `resume_session` 時の初期同梱および `get_capabilities` ツールで取得）。
 2. **動的自己記述ツール契約 (`HostToolRegistry` / `AgentTool`)**:
-   - 各ツールが `name`, `category`, `description`, `input_schema`, `safety_class`, `supports_progress` を自己申告し、`host/list_tools` で公開。エージェントは既知ツールの高速パスに加え、未知ツールを LLM ツール呼び出しへそのまま橋渡しできる。[`mcp_server.rs`](../../src/ai/mcp_server.rs) とも基盤を共有。
+   - 各ツールが `name`, `category`, `description`, `input_schema`, `safety_class`, `supports_progress` を自己申告し、`start_task.tools` / `tool_result.updated_tools` で公開。エージェントは既知ツールの高速パスに加え、未知ツールを LLM ツール呼び出しへそのまま橋渡しできる。[`mcp_server.rs`](../../src/ai/mcp_server.rs) とも基盤を共有。
 3. **プラグインマニフェスト `ai_hints` 後方互換規約**:
    - `plugin.json` / `ai-plugin.json` / `agent-plugin.json` に `#[serde(default)]` の任意 `ai_hints`（`purpose`, `capabilities`, `recommended_scenarios`）を許容。
 4. **`DraftSandbox` ＋ `ToolSafetyClass` ＋ `Manual` / `Autopilot` 統合**:
@@ -228,7 +228,7 @@ sequenceDiagram
   - `llm_chat`: `request_id`, `messages`（テキスト＋任意画像参照）, `tools`, `response_json_schema`
   - `ask_user`: `request_id`, `title`, `message`, `fields`（入力欄定義）, `choices`（選択肢ボタン）, `allow_skip`
   - `proposal`: `summary_markdown`, `command` (`EditCommand::Batch`), `agent_memory_patch`
-  - `error`: `code`, `message`, `recoverable`
+  - `error`: `code`, `message`, `recoverable`, `agent_memory_patch`（任意）
 
 ### 5.3 決定論的構成コンパイラ (`MovieBlueprint`)
 

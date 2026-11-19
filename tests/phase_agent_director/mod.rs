@@ -277,9 +277,13 @@ fn verify_session_reload_and_followup(
 
     controller2.open_saved_ai_session_with_provider(
         session_id,
-        followup_provider,
+        Some(followup_provider),
         Some(director),
     )?;
+    assert!(
+        controller2.ai_chat.pending_question.is_none(),
+        "restoring a saved session must reset pending_question so idle agent won't hang UI"
+    );
     assert_ne!(controller2.ai_chat.turns.len(), 0);
     assert!(
         controller2
@@ -564,5 +568,115 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
     assert!(executed.load(Ordering::SeqCst));
     // 2回の LLM 呼び出し間に min_llm_interval_ms (120ms) 以上経過していることを確認
     assert!(started.elapsed() >= Duration::from_millis(100));
+    Ok(())
+}
+
+#[test]
+fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_question()
+-> Result<(), Box<dyn std::error::Error>> {
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let guard = TempDirGuard::new("partial_429")?;
+    let media_dir = guard.0.join("photos");
+    let store_dir = guard.0.join("sessions");
+    fs::create_dir_all(&media_dir)?;
+
+    let mut paths = Vec::new();
+    for i in 0..8_u32 {
+        let file = media_dir.join(format!("p_{i:02}.png"));
+        write_test_png(&file, 640, 480)?;
+        paths.push(fs::canonicalize(&file)?.to_string_lossy().into_owned());
+    }
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_ref = Arc::clone(&call_count);
+    let paths_for_mock = paths.clone();
+    let provider = Arc::new(MockAiProvider::with_agent_handler(move |req| {
+        let call_idx = call_ref.fetch_add(1, Ordering::SeqCst);
+        if call_idx == 0 {
+            return Ok(mock_vision_batch_reply(req, &paths_for_mock));
+        }
+        Err(sea_movie_creator::ai::provider::AiError::HttpStatus {
+            status: 429,
+            body: "rate limit exceeded".to_owned(),
+        })
+    }));
+
+    let store = AiSessionStore::new(&store_dir);
+    let mut controller = AppController::new();
+    controller.ai_chat.session_store = Some(store.clone());
+    controller.ai_chat.runtime_settings.vision_batch_size = 4;
+    controller.ai_chat.attach_folder_with_auto_agent(media_dir);
+    let sid = controller.ai_chat.session_id.clone();
+
+    controller.start_agent_prompt_with_provider(
+        "写真を整理してムービーにして",
+        provider,
+        Some(director.clone()),
+    )?;
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        let _ = controller.poll_ai_chat();
+        if controller.ai_chat.last_error.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        controller
+            .ai_chat
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rate_limited")),
+        "expected rate_limited error on second batch, got {:?}",
+        controller.ai_chat.last_error
+    );
+
+    // 429 中断時点でも最初のバッチで解析済みの画像記憶がセッションファイルに永続化されていること
+    let saved = store.load_session(&sid)?;
+    let analyzed = saved
+        .agent_memory
+        .get("analyzed_images")
+        .and_then(Value::as_array)
+        .ok_or("analyzed_images missing from saved session memory")?;
+    assert_eq!(analyzed.len(), 8);
+    let vision_done = analyzed
+        .iter()
+        .filter(|item| item["vision_analyzed"].as_bool() == Some(true))
+        .count();
+    assert!(
+        vision_done >= 4,
+        "expected first batch of 4 images preserved despite 429 on batch 2, got {vision_done}"
+    );
+    let _ = controller.cancel_ai_prompt();
+
+    // 仮に未回答の pending_question が保存されていても復元時にはクリアされ UI がハングしないこと
+    let mut poisoned = saved;
+    poisoned.pending_question = Some(
+        sea_movie_creator::ai::session_store::PendingAgentQuestionSnapshot {
+            request_id: "stale_q".to_owned(),
+            title: "古い質問".to_owned(),
+            message: "msg".to_owned(),
+            fields: Vec::new(),
+            choices: Vec::new(),
+            allow_skip: true,
+        },
+    );
+    store.save_session(&poisoned)?;
+
+    let mut controller2 = AppController::new();
+    controller2.ai_chat.session_store = Some(store);
+    controller2.open_saved_ai_session_with_provider(
+        &sid,
+        Some(Arc::new(MockAiProvider::new())),
+        Some(director),
+    )?;
+    assert!(controller2.ai_chat.pending_question.is_none());
+    let _ = controller2.cancel_ai_prompt();
     Ok(())
 }

@@ -23,6 +23,29 @@ pub enum BlendMode {
     Overlay,
 }
 
+impl BlendMode {
+    /// サポートしている全ブレンドモード定義一覧。
+    pub const ALL: [Self; 5] = [
+        Self::Normal,
+        Self::Add,
+        Self::Multiply,
+        Self::Screen,
+        Self::Overlay,
+    ];
+
+    /// JSON シリアライズ名 (`snake_case`) を返す。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Add => "add",
+            Self::Multiply => "multiply",
+            Self::Screen => "screen",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
 /// キャンバス中心 `(0, 0)`（+X 右, +Y 下）座標系での 2D アフィン変換行列。
 ///
 /// 行優先レイアウト `[ [a, b, tx], [c, d, ty], [0, 0, 1] ]` に対応する。

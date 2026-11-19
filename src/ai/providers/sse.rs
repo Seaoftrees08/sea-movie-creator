@@ -1,11 +1,18 @@
 //! `OpenAI` 互換 / Gemini / Anthropic 間で共有する `ureq` HTTP POST・SSE ストリーム受信ヘルパー。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::ai::provider::{AiError, AiStreamEvent};
+
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_COLLECTED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_AGENTS: usize = 8;
 
 /// JSON POST 要求パラメータ。
 pub struct HttpJsonRequest<'a> {
@@ -67,15 +74,80 @@ pub fn post_json_sync(request: &HttpJsonRequest<'_>) -> Result<Value, AiError> {
         .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))
 }
 
+fn validate_http_url_and_headers(url: &str, headers: &[(&str, &str)]) -> Result<(), AiError> {
+    if url.bytes().any(|b| b < b' ' || b == 0x7F) {
+        return Err(AiError::Transport(
+            "HTTP URL contains forbidden control characters".to_owned(),
+        ));
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return Err(AiError::Transport(
+            "only https:// or http:// URLs are permitted for AI providers".to_owned(),
+        ));
+    };
+    let has_sensitive_auth = headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("x-api-key")
+            || name.eq_ignore_ascii_case("x-goog-api-key")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+    });
+    if has_sensitive_auth && !is_loopback_http_authority(rest) {
+        return Err(AiError::Transport(
+            "refusing to transmit API credentials over plaintext non-loopback http://".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_loopback_http_authority(url_after_scheme: &str) -> bool {
+    let authority = url_after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, right)| right);
+    let host = if let Some(after_open) = host_port.strip_prefix('[') {
+        after_open.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn cached_ureq_agent(timeout_secs: u64) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<HashMap<u64, ureq::Agent>>> = OnceLock::new();
+    let clamped = timeout_secs.max(5);
+    let cache = AGENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(existing) = guard.get(&clamped) {
+            return existing.clone();
+        }
+        if guard.len() >= MAX_CACHED_AGENTS {
+            guard.clear();
+        }
+        let created = build_ureq_agent(clamped);
+        guard.insert(clamped, created.clone());
+        return created;
+    }
+    build_ureq_agent(clamped)
+}
+
+fn build_ureq_agent(timeout_secs: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 fn send_json_post(
     request: &HttpJsonRequest<'_>,
     accept_header: &str,
 ) -> Result<(ureq::http::Response<ureq::Body>, String), AiError> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(request.timeout_secs.max(5))))
-        .http_status_as_error(false)
-        .build();
-    let agent: ureq::Agent = config.into();
+    validate_http_url_and_headers(request.url, request.headers)?;
+    let agent = cached_ureq_agent(request.timeout_secs);
 
     let mut req = agent
         .post(request.url)
@@ -123,36 +195,105 @@ where
 {
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut event_name: Option<String> = None;
+    let mut event_data = String::new();
     let mut collected = String::new();
+    let line_limit = u64::try_from(MAX_SSE_LINE_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
 
     loop {
         line.clear();
-        let read = buf_reader.read_line(&mut line)?;
+        let read = std::io::Read::take(&mut buf_reader, line_limit).read_line(&mut line)?;
         if read == 0 {
+            if !event_data.is_empty() {
+                let _ = flush_sse_event(
+                    &mut event_name,
+                    &mut event_data,
+                    &mut collected,
+                    on_sse_payload,
+                    on_event,
+                )?;
+            }
             break;
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(':') || trimmed.starts_with("event:") {
-            continue;
+        if read > MAX_SSE_LINE_BYTES && !line.ends_with('\n') {
+            return Err(AiError::ParseFailed(format!(
+                "SSE line exceeded max size ({MAX_SSE_LINE_BYTES} bytes)"
+            )));
         }
-        let Some(payload) = trimmed.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            if payload == "[DONE]" {
+        let raw_line = line.trim_end_matches(['\r', '\n']);
+        if raw_line.is_empty() {
+            if flush_sse_event(
+                &mut event_name,
+                &mut event_data,
+                &mut collected,
+                on_sse_payload,
+                on_event,
+            )? {
                 break;
             }
             continue;
         }
-        if let Some(delta) = on_sse_payload(payload)?
-            && !delta.is_empty()
-        {
-            on_event(AiStreamEvent::DeltaText(delta.clone()));
-            collected.push_str(&delta);
+        if raw_line.starts_with(':') {
+            continue;
+        }
+        let (field, value_raw) = raw_line.split_once(':').unwrap_or((raw_line, ""));
+        let value = value_raw.strip_prefix(' ').unwrap_or(value_raw);
+        if field == "event" {
+            event_name = Some(value.trim().to_owned());
+        } else if field == "data" {
+            let extra = usize::from(!event_data.is_empty()) + value.len();
+            if event_data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES {
+                return Err(AiError::ParseFailed(format!(
+                    "SSE event payload exceeded max size ({MAX_SSE_EVENT_BYTES} bytes)"
+                )));
+            }
+            if !event_data.is_empty() {
+                event_data.push('\n');
+            }
+            event_data.push_str(value);
         }
     }
     Ok(collected)
+}
+
+fn flush_sse_event<FChunk>(
+    event_name: &mut Option<String>,
+    event_data: &mut String,
+    collected: &mut String,
+    on_sse_payload: &mut FChunk,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<bool, AiError>
+where
+    FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
+{
+    let name = event_name.take();
+    if event_data.is_empty() {
+        return Ok(false);
+    }
+    let payload_owned = std::mem::take(event_data);
+    let payload = payload_owned.trim();
+    if payload.is_empty() {
+        return Ok(false);
+    }
+    if payload == "[DONE]" {
+        return Ok(true);
+    }
+    if name.as_deref() == Some("error") {
+        let snippet: String = payload.chars().take(600).collect();
+        return Err(AiError::ParseFailed(format!("SSE error event: {snippet}")));
+    }
+    if let Some(delta) = on_sse_payload(payload)?
+        && !delta.is_empty()
+    {
+        if collected.len().saturating_add(delta.len()) > MAX_SSE_COLLECTED_BYTES {
+            return Err(AiError::ParseFailed(format!(
+                "SSE accumulated stream exceeded max size ({MAX_SSE_COLLECTED_BYTES} bytes)"
+            )));
+        }
+        on_event(AiStreamEvent::DeltaText(delta.clone()));
+        collected.push_str(&delta);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -215,5 +356,61 @@ pub(crate) mod test_http {
             Ok(String::from_utf8_lossy(&raw).into_owned())
         });
         Ok((addr, handle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn url_validation_blocks_insecure_plaintext_auth_and_non_http() {
+        let headers = [("Authorization", "Bearer secret")];
+        assert!(validate_http_url_and_headers("https://api.openai.com/v1/chat", &headers).is_ok());
+        assert!(validate_http_url_and_headers("http://127.0.0.1:8080/v1", &headers).is_ok());
+        assert!(validate_http_url_and_headers("http://localhost:11434/v1", &headers).is_ok());
+        assert!(validate_http_url_and_headers("http://[::1]:11434/v1", &headers).is_ok());
+        assert!(validate_http_url_and_headers("http://192.168.1.50:11434/v1", &[]).is_ok());
+        assert!(
+            validate_http_url_and_headers("http://example.com/v1", &headers).is_err(),
+            "non-loopback plaintext http with API credentials must be rejected"
+        );
+        assert!(validate_http_url_and_headers("file:///etc/passwd", &[]).is_err());
+    }
+
+    #[test]
+    fn sse_reader_joins_multiline_data_and_surfaces_error_events() -> Result<(), AiError> {
+        let stream = "data: {\"a\":\ndata: 1}\n\ndata: [DONE]\n\n";
+        let mut events = Vec::new();
+        let text = read_sse_lines(
+            Cursor::new(stream.as_bytes()),
+            &mut |payload| {
+                let parsed: Value = serde_json::from_str(payload)
+                    .map_err(|e| AiError::ParseFailed(e.to_string()))?;
+                Ok(parsed.get("a").map(std::string::ToString::to_string))
+            },
+            &mut |evt| {
+                if let AiStreamEvent::DeltaText(s) = evt {
+                    events.push(s);
+                }
+            },
+        )?;
+        assert_eq!(text, "1");
+        assert_eq!(events, vec!["1"]);
+
+        let err_stream = "event: error\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n";
+        let Err(err) = read_sse_lines(
+            Cursor::new(err_stream.as_bytes()),
+            &mut |_| Ok(None),
+            &mut |_| {},
+        ) else {
+            return Err(AiError::ParseFailed(
+                "SSE error event must return Err".to_owned(),
+            ));
+        };
+        assert!(err.to_string().contains("overloaded"));
+        Ok(())
     }
 }

@@ -7,19 +7,21 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{ColorType, ImageEncoder as _, RgbImage};
+use image::{ColorType, ImageEncoder as _, ImageReader, Limits, RgbImage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ai::provider::encode_base64;
 use crate::media::decoder::{BackendPreference, open_audio_decoder, probe_media};
-use crate::media::image_loader::{inspect_image_file, load_image_file};
+use crate::media::image_loader::inspect_image_file;
 
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_FILES: usize = 500;
 const MAX_NOTE_FILES: usize = 10;
 const MAX_NOTE_BYTES: usize = 64 * 1024;
 const EXIF_HEADER_READ_LIMIT: usize = 64 * 1024;
+const MAX_THUMB_DECODE_DIM: u32 = 16_384;
+const MAX_THUMB_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 
 /// フォルダ走査・サムネイル生成時のエラー。
 #[derive(Debug, Error)]
@@ -317,45 +319,64 @@ pub fn encode_thumbnail_jpeg_base64(
 ) -> Result<EncodedThumbnail, MediaInspectorError> {
     let canon = scope.validate_path(image_path)?;
     let clamped_edge = max_edge_px.clamp(64, 2048);
-    let frame = load_image_file(&canon, Some(clamped_edge))
+
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_THUMB_DECODE_DIM);
+    limits.max_image_height = Some(MAX_THUMB_DECODE_DIM);
+    limits.max_alloc = Some(MAX_THUMB_DECODE_ALLOC_BYTES);
+
+    let mut reader = ImageReader::open(&canon)
+        .map_err(|err| MediaInspectorError::ImageFailed(err.to_string()))?
+        .with_guessed_format()
         .map_err(|err| MediaInspectorError::ImageFailed(err.to_string()))?;
+    reader.limits(limits);
 
-    let rgba = frame.to_rgba8();
-    let mut rgb = Vec::with_capacity((frame.width as usize) * (frame.height as usize) * 3);
-    for px in rgba.as_chunks::<4>().0 {
-        let a = u16::from(px[3]);
-        if a == 255 {
-            rgb.extend_from_slice(&px[..3]);
-        } else {
-            // 透過 PNG 等は白背景へ合成して JPEG 時の黒潰れを防止する
-            let inv = 255 - a;
-            let r = u8::try_from((u16::from(px[0]) * a + 255 * inv) / 255).unwrap_or(255);
-            let g = u8::try_from((u16::from(px[1]) * a + 255 * inv) / 255).unwrap_or(255);
-            let b = u8::try_from((u16::from(px[2]) * a + 255 * inv) / 255).unwrap_or(255);
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
+    let decoded = reader
+        .decode()
+        .map_err(|err| MediaInspectorError::ImageFailed(format!("image decode failed: {err}")))?;
+    let resized = if decoded.width().max(decoded.height()) > clamped_edge {
+        decoded.thumbnail(clamped_edge, clamped_edge)
+    } else {
+        decoded
+    };
+
+    let width = resized.width();
+    let height = resized.height();
+    let rgb_img = if resized.color().has_alpha() {
+        let rgba = resized.into_rgba8();
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for px in rgba.as_chunks::<4>().0 {
+            let a = u16::from(px[3]);
+            if a == 255 {
+                rgb.extend_from_slice(&px[..3]);
+            } else {
+                // 透過 PNG 等は白背景へ合成して JPEG 時の黒潰れを防止する
+                let inv = 255 - a;
+                let r = u8::try_from((u16::from(px[0]) * a + 255 * inv) / 255).unwrap_or(255);
+                let g = u8::try_from((u16::from(px[1]) * a + 255 * inv) / 255).unwrap_or(255);
+                let b = u8::try_from((u16::from(px[2]) * a + 255 * inv) / 255).unwrap_or(255);
+                rgb.push(r);
+                rgb.push(g);
+                rgb.push(b);
+            }
         }
-    }
+        RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
+            MediaInspectorError::ImageFailed("failed to construct RGB image buffer".to_owned())
+        })?
+    } else {
+        resized.into_rgb8()
+    };
 
-    let rgb_img = RgbImage::from_raw(frame.width, frame.height, rgb).ok_or_else(|| {
-        MediaInspectorError::ImageFailed("failed to construct RGB image buffer".to_owned())
-    })?;
     let mut jpeg_buf = Cursor::new(Vec::new());
     let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 78);
     encoder
-        .write_image(
-            rgb_img.as_raw(),
-            frame.width,
-            frame.height,
-            ColorType::Rgb8.into(),
-        )
+        .write_image(rgb_img.as_raw(), width, height, ColorType::Rgb8.into())
         .map_err(|err| MediaInspectorError::ImageFailed(format!("JPEG encode failed: {err}")))?;
 
     Ok(EncodedThumbnail {
         path: canon.to_string_lossy().into_owned(),
-        width: frame.width,
-        height: frame.height,
+        width,
+        height,
         mime_type: "image/jpeg".to_owned(),
         base64_data: encode_base64(&jpeg_buf.into_inner()),
     })
@@ -388,16 +409,31 @@ fn collect_files_bounded(
     if depth >= max_depth {
         return Ok(());
     }
-    let entries = fs::read_dir(dir)?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) if depth > 0 => {
+            *skipped_count += 1;
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     for entry in entries {
         let Ok(entry) = entry else {
             *skipped_count += 1;
             continue;
         };
+        let Ok(file_type) = entry.file_type() else {
+            *skipped_count += 1;
+            continue;
+        };
+        if file_type.is_symlink() {
+            *skipped_count += 1;
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_files_bounded(&path, depth + 1, max_depth, out, skipped_count)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if out.len() >= MAX_SCAN_FILES {
                 *skipped_count += 1;
                 continue;
@@ -428,7 +464,9 @@ fn inspect_single_image(path: &Path, rel: &str, file_name: &str) -> Option<Inspe
         .rsplit_once('/')
         .map(|(parent, _)| parent.to_owned())
         .filter(|s| !s.is_empty());
-    let exif_captured_at = extract_jpeg_exif_datetime(path);
+    let exif_captured_at = (info.format == "Jpeg")
+        .then(|| extract_jpeg_exif_datetime(path))
+        .flatten();
 
     Some(InspectedImageItem {
         path: path.to_string_lossy().into_owned(),
@@ -502,10 +540,10 @@ fn compare_images_chronologically(a: &InspectedImageItem, b: &InspectedImageItem
 
 /// JPEG ファイルの先頭 APP1 セグメントから EXIF 撮影日時 (`DateTimeOriginal` 等) を安全抽出する。
 fn extract_jpeg_exif_datetime(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let mut buf = vec![0_u8; EXIF_HEADER_READ_LIMIT];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
+    let file = fs::File::open(path).ok()?;
+    let limit = u64::try_from(EXIF_HEADER_READ_LIMIT).unwrap_or(65_536);
+    let mut buf = Vec::with_capacity(EXIF_HEADER_READ_LIMIT.min(16 * 1024));
+    file.take(limit).read_to_end(&mut buf).ok()?;
     parse_exif_datetime_from_jpeg_bytes(&buf)
 }
 
@@ -516,30 +554,47 @@ pub fn parse_exif_datetime_from_jpeg_bytes(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let mut pos = 2_usize;
-    while pos + 4 <= bytes.len() {
+    while pos < bytes.len() {
         if bytes[pos] != 0xFF {
             break;
         }
-        let marker = bytes[pos + 1];
+        while pos < bytes.len() && bytes[pos] == 0xFF {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let marker = bytes[pos];
+        pos += 1;
         if marker == 0xDA || marker == 0xD9 {
             break;
         }
         if marker == 0x00 || (0xD0..=0xD8).contains(&marker) {
-            pos += 2;
             continue;
         }
-        let seg_len = usize::from(u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]));
-        if seg_len < 2 || pos + 2 + seg_len > bytes.len() {
+        let Some(len_end) = pos.checked_add(2) else {
+            break;
+        };
+        let Some(len_slice) = bytes.get(pos..len_end) else {
+            break;
+        };
+        let seg_len = usize::from(u16::from_be_bytes([len_slice[0], len_slice[1]]));
+        let Some(end) = pos.checked_add(seg_len) else {
+            break;
+        };
+        if seg_len < 2 || end > bytes.len() {
             break;
         }
-        let payload = &bytes[pos + 4..pos + 2 + seg_len];
+        let Some(payload) = bytes.get(len_end..end) else {
+            break;
+        };
         if marker == 0xE1 && payload.starts_with(b"Exif\0\0") {
             let tiff = &payload[6..];
             if let Some(dt) = parse_tiff_exif_datetime(tiff) {
                 return Some(dt);
             }
         }
-        pos += 2 + seg_len;
+        pos = end;
     }
     None
 }
@@ -552,7 +607,8 @@ enum Endian {
 
 impl Endian {
     fn read_u16(self, b: &[u8], off: usize) -> Option<u16> {
-        let slice = b.get(off..off + 2)?;
+        let end = off.checked_add(2)?;
+        let slice = b.get(off..end)?;
         let arr = [slice[0], slice[1]];
         Some(match self {
             Self::Little => u16::from_le_bytes(arr),
@@ -561,7 +617,8 @@ impl Endian {
     }
 
     fn read_u32(self, b: &[u8], off: usize) -> Option<u32> {
-        let slice = b.get(off..off + 4)?;
+        let end = off.checked_add(4)?;
+        let slice = b.get(off..end)?;
         let arr = [slice[0], slice[1], slice[2], slice[3]];
         Some(match self {
             Self::Little => u32::from_le_bytes(arr),
@@ -608,17 +665,34 @@ fn scan_ifd_for_datetime_and_subifd(
     let mut exif_subifd_off: Option<usize> = None;
 
     for i in 0..entry_count {
-        let entry_off = ifd_off + 2 + i * 12;
+        let Some(base) = ifd_off.checked_add(2) else {
+            break;
+        };
+        let Some(stride) = i.checked_mul(12) else {
+            break;
+        };
+        let Some(entry_off) = base.checked_add(stride) else {
+            break;
+        };
         let Some(tag) = endian.read_u16(tiff, entry_off) else {
             break;
         };
-        let Some(typ) = endian.read_u16(tiff, entry_off + 2) else {
+        let Some(off_typ) = entry_off.checked_add(2) else {
             break;
         };
-        let Some(val_count) = endian.read_u32(tiff, entry_off + 4) else {
+        let Some(typ) = endian.read_u16(tiff, off_typ) else {
             break;
         };
-        let Some(val_or_off) = endian.read_u32(tiff, entry_off + 8) else {
+        let Some(off_cnt) = entry_off.checked_add(4) else {
+            break;
+        };
+        let Some(val_count) = endian.read_u32(tiff, off_cnt) else {
+            break;
+        };
+        let Some(off_val) = entry_off.checked_add(8) else {
+            break;
+        };
+        let Some(val_or_off) = endian.read_u32(tiff, off_val) else {
             break;
         };
 
@@ -632,7 +706,10 @@ fn scan_ifd_for_datetime_and_subifd(
                 continue;
             };
             let len = usize::try_from(val_count).unwrap_or(0);
-            if let Some(raw) = tiff.get(str_off..str_off + len) {
+            let Some(str_end) = str_off.checked_add(len) else {
+                continue;
+            };
+            if let Some(raw) = tiff.get(str_off..str_end) {
                 let cleaned = String::from_utf8_lossy(raw)
                     .trim_end_matches('\0')
                     .trim()
@@ -802,5 +879,21 @@ mod tests {
             parse_exif_datetime_from_jpeg_bytes(&jpeg).as_deref(),
             Some("2023:05:20 11:22:33")
         );
+
+        // 連続 0xFF フィルバイトを含む JPEG でも抽出できること
+        let mut fill_jpeg = vec![0xFF, 0xD8, 0xFF, 0xFF, 0xFF, 0xE1];
+        fill_jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        fill_jpeg.extend_from_slice(&app1);
+        fill_jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(
+            parse_exif_datetime_from_jpeg_bytes(&fill_jpeg).as_deref(),
+            Some("2023:05:20 11:22:33")
+        );
+
+        // オーバーフローを引き起こす巨大オフセット/セグメント長でもパニックしないこと
+        let mut crafted = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        crafted.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(parse_exif_datetime_from_jpeg_bytes(&crafted), None);
+        assert_eq!(Endian::Little.read_u32(&[1, 2, 3, 4], usize::MAX - 1), None);
     }
 }

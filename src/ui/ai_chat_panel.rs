@@ -39,7 +39,7 @@ use crate::ai::providers::gemini::{GeminiConfig, GeminiProvider};
 use crate::ai::providers::mock::MockAiProvider;
 use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::ai::session_store::{
-    AiSessionRecord, AiSessionStore, PendingAgentQuestionSnapshot, StoredChatTurn,
+    AiSessionRecord, AiSessionStore, AiSessionSummary, PendingAgentQuestionSnapshot, StoredChatTurn,
 };
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
@@ -206,6 +206,9 @@ pub struct AiChatState {
     pub(crate) agent_busy: bool,
     pub(crate) agent_active_prompt: String,
     pub(crate) agent_active_model_label: String,
+    pub(crate) cached_agents: Vec<DiscoveredAgentPlugin>,
+    pub(crate) cached_agents_loaded: bool,
+    pub(crate) cached_sessions: Vec<AiSessionSummary>,
 }
 
 impl std::fmt::Debug for AiChatState {
@@ -260,6 +263,9 @@ impl Default for AiChatState {
             agent_busy: false,
             agent_active_prompt: String::new(),
             agent_active_model_label: String::new(),
+            cached_agents: Vec::new(),
+            cached_agents_loaded: false,
+            cached_sessions: Vec::new(),
         }
     }
 }
@@ -288,7 +294,22 @@ impl AiChatState {
             .retain(|cid| doc.find_clip(cid).is_some());
     }
 
-    /// ライブウィンドウ起動用：既定のユーザー設定配下セッションストアを有効化し、エージェント設定を読み込む。
+    /// 導入済みエージェントプラグイン一覧を再走査してキャッシュを更新する。
+    pub fn refresh_discovered_agents(&mut self) {
+        self.cached_agents = AgentPluginRegistry::discover_default().plugins().to_vec();
+        self.cached_agents_loaded = true;
+    }
+
+    /// セッション一覧キャッシュをストレージから再読込する。
+    pub fn refresh_session_history(&mut self) {
+        self.cached_sessions = self
+            .session_store
+            .as_ref()
+            .and_then(|store| store.list_sessions().ok())
+            .unwrap_or_default();
+    }
+
+    /// ライブウィンドウ起動用：既定のユーザー設定配下セッションストアを有効化し、設定・エージェント・履歴キャッシュを読み込む。
     pub fn enable_user_session_store(&mut self) {
         if let Some(store) = AiSessionStore::default_user_store() {
             if let Ok(settings) = store.load_runtime_settings() {
@@ -296,6 +317,8 @@ impl AiChatState {
             }
             self.session_store = Some(store);
         }
+        self.refresh_discovered_agents();
+        self.refresh_session_history();
     }
 
     /// 許可メディアフォルダを添付する（ディレクトリのみ受理・正規化重複除去）。
@@ -318,10 +341,16 @@ impl AiChatState {
             && self.selected_agent_id.is_none()
             && self.turns.is_empty()
         {
-            let reg = AgentPluginRegistry::discover_default();
-            if let Some(director) = reg.find_by_id("sea.agent.director") {
+            if !self.cached_agents_loaded {
+                self.refresh_discovered_agents();
+            }
+            if let Some(director) = self
+                .cached_agents
+                .iter()
+                .find(|p| p.manifest.id == "sea.agent.director")
+            {
                 self.selected_agent_id = Some(director.manifest.id.clone());
-            } else if let Some(first) = reg.plugins().first() {
+            } else if let Some(first) = self.cached_agents.first() {
                 self.selected_agent_id = Some(first.manifest.id.clone());
             }
         }
@@ -377,7 +406,7 @@ impl AiChatState {
     }
 
     /// 現在のチャット／エージェント状態をセッションストアへ保存する。
-    pub fn persist_session(&self) {
+    pub fn persist_session(&mut self) {
         let Some(store) = &self.session_store else {
             return;
         };
@@ -416,7 +445,9 @@ impl AiChatState {
             pending_question: self.pending_question.clone(),
             agent_memory: self.agent_memory.clone(),
         };
-        let _ = store.save_session(&rec);
+        if store.save_session(&rec).is_ok() {
+            self.refresh_session_history();
+        }
     }
 
     /// プロバイダ種別を切り替え、既定モデル・思考レベル・ベース URL を更新する。
@@ -505,6 +536,8 @@ impl AiChatState {
     /// メモリ上の一時 API キーを設定または解除する（プロジェクト JSON には保存されない）。
     pub fn set_runtime_api_key(&mut self, key: Option<SecretString>) {
         self.runtime_api_key = key;
+        self.agent_provider_override = None;
+        self.sync_active_agent_runtime();
     }
 
     /// 現在選択中のプロバイダ向けに有効な認証情報が解決できるか返す。
@@ -801,8 +834,13 @@ impl AppController {
         }
 
         let plugin = resolve_target_agent_plugin(&self.ai_chat, plugin_override)?;
-        self.ai_chat.agent_provider_override = Some(Arc::clone(&provider));
-        let attached_clips = self.prepare_agent_turn_state(&trimmed, &plugin);
+        self.ai_chat.prune_attachments(&self.document);
+        let attached_clips: Vec<String> = self
+            .ai_chat
+            .attached_clip_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let timeline_summary = build_compact_timeline_summary(
             &self.document,
             self.clock.current_frame(),
@@ -815,7 +853,7 @@ impl AppController {
             .active_agent
             .as_ref()
             .is_some_and(|r| r.is_alive() && r.plugin_id() == plugin.manifest.id);
-        if alive_matches {
+        let start_res: Result<(), String> = if alive_matches {
             let runner = self
                 .ai_chat
                 .active_agent
@@ -823,37 +861,37 @@ impl AppController {
                 .ok_or_else(|| "active agent missing".to_owned())?;
             runner
                 .update_runtime(
-                    provider,
+                    Arc::clone(&provider),
                     self.ai_chat.model_name.clone(),
                     self.ai_chat.thinking_level,
                     self.ai_chat.approval_mode,
                     self.ai_chat.runtime_settings.clone(),
                 )
-                .map_err(|e| e.to_string())?;
-            runner
-                .send_follow_up(
-                    trimmed,
-                    self.ai_chat.attached_folders.clone(),
-                    attached_clips,
-                    self.document.clone(),
-                    timeline_summary,
-                )
-                .map_err(|e| e.to_string())?;
+                .and_then(|()| {
+                    runner.send_follow_up(
+                        trimmed.clone(),
+                        self.ai_chat.attached_folders.clone(),
+                        attached_clips.clone(),
+                        self.document.clone(),
+                        timeline_summary,
+                    )
+                })
+                .map_err(|e| e.to_string())
         } else {
             if let Some(old) = self.ai_chat.active_agent.take() {
                 old.cancel();
             }
             let cfg = AgentSessionStartConfig {
-                plugin,
+                plugin: plugin.clone(),
                 session_id: self.ai_chat.session_id.clone(),
-                goal: trimmed,
+                goal: trimmed.clone(),
                 resume: false,
                 attached_folders: self.ai_chat.attached_folders.clone(),
-                attached_clips,
+                attached_clips: attached_clips.clone(),
                 base_document: self.document.clone(),
                 timeline_summary,
                 agent_memory: self.ai_chat.agent_memory.clone(),
-                provider,
+                provider: Arc::clone(&provider),
                 provider_kind: self.ai_chat.selected_provider.clone(),
                 model_name: self.ai_chat.model_name.clone(),
                 thinking_level: self.ai_chat.thinking_level,
@@ -862,29 +900,36 @@ impl AppController {
                 tool_registry: None,
                 extra_extensions: Vec::new(),
             };
-            let runner = AgentSessionRunner::start(cfg).map_err(|e| e.to_string())?;
-            self.ai_chat.active_agent = Some(runner);
+            match AgentSessionRunner::start(cfg) {
+                Ok(runner) => {
+                    self.ai_chat.active_agent = Some(runner);
+                    Ok(())
+                }
+                Err(err) => Err(err.to_string()),
+            }
+        };
+
+        if let Err(err) = start_res {
+            self.ai_chat.last_error = Some(err.clone());
+            self.ai_chat.status_banner = format!("エージェント起動・送信エラー: {err}");
+            return Err(err);
         }
 
+        self.ai_chat.agent_provider_override = Some(provider);
+        self.commit_agent_turn_state(&trimmed, &plugin, &attached_clips);
         self.ai_chat.agent_busy = true;
         "エージェントを起動中...".clone_into(&mut self.ai_chat.status_banner);
         self.ai_chat.persist_session();
         Ok(())
     }
 
-    fn prepare_agent_turn_state(
+    fn commit_agent_turn_state(
         &mut self,
         trimmed: &str,
         plugin: &DiscoveredAgentPlugin,
-    ) -> Vec<String> {
+        attached_clips: &[String],
+    ) {
         self.ai_chat.selected_agent_id = Some(plugin.manifest.id.clone());
-        self.ai_chat.prune_attachments(&self.document);
-        let attached_clips: Vec<String> = self
-            .ai_chat
-            .attached_clip_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect();
 
         let mut tags = Vec::new();
         if !self.ai_chat.attached_folders.is_empty() {
@@ -921,7 +966,6 @@ impl AppController {
         trimmed.clone_into(&mut self.ai_chat.agent_active_prompt);
         self.ai_chat.agent_active_model_label =
             format!("{} ({})", plugin.manifest.name, self.ai_chat.model_name);
-        attached_clips
     }
 
     /// 現在表示中の `ask_user` リッチ質問カードへ回答を返送し、エージェントを続行させる。
@@ -936,17 +980,23 @@ impl AppController {
         free_text: Option<String>,
         skipped: bool,
     ) -> Result<(), String> {
-        let q = self
+        let req_id = self
             .ai_chat
             .pending_question
-            .take()
+            .as_ref()
+            .map(|q| q.request_id.clone())
             .ok_or_else(|| "回答待ちの質問カードはありません".to_owned())?;
         let runner = self
             .ai_chat
             .active_agent
             .as_ref()
             .filter(|r| r.is_alive())
-            .ok_or_else(|| "常駐エージェントプロセスが終了しています".to_owned())?;
+            .ok_or_else(|| {
+                let err = "常駐エージェントプロセスが終了しています".to_owned();
+                self.ai_chat.last_error = Some(err.clone());
+                self.ai_chat.status_banner.clone_from(&err);
+                err
+            })?;
 
         let answer_summary = if skipped {
             "[質問応答] おまかせで続行".to_owned()
@@ -963,11 +1013,6 @@ impl AppController {
                 format!("[選択: {choice_txt}] {}", filled.join(", "))
             }
         };
-        self.ai_chat.turns.push(AiChatTurn {
-            role: AiRole::User,
-            text: answer_summary,
-        });
-        self.ai_chat.ask_field_values.clear();
 
         let payload = AgentUserAnswerPayload {
             choice_id,
@@ -975,9 +1020,19 @@ impl AppController {
             free_text,
             skipped,
         };
-        runner
-            .send_user_answer(q.request_id, payload)
-            .map_err(|e| e.to_string())?;
+        if let Err(err) = runner.send_user_answer(req_id, payload) {
+            let msg = err.to_string();
+            self.ai_chat.last_error = Some(msg.clone());
+            self.ai_chat.status_banner = format!("回答送信エラー: {msg}");
+            return Err(msg);
+        }
+        self.ai_chat.pending_question = None;
+        self.ai_chat.ask_field_values.clear();
+        self.ai_chat.last_error = None;
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::User,
+            text: answer_summary,
+        });
         self.ai_chat.agent_busy = true;
         "回答を受けて構成を設計中...".clone_into(&mut self.ai_chat.status_banner);
         self.ai_chat.persist_session();
@@ -994,26 +1049,37 @@ impl AppController {
         approved: bool,
         reason: Option<String>,
     ) -> Result<(), String> {
-        let pending = self
+        let (req_id, tool_name) = self
             .ai_chat
             .pending_tool_approval
-            .take()
+            .as_ref()
+            .map(|p| (p.request_id.clone(), p.tool_name.clone()))
             .ok_or_else(|| "承認待ちのツール実行はありません".to_owned())?;
         let runner = self
             .ai_chat
             .active_agent
             .as_ref()
             .filter(|r| r.is_alive())
-            .ok_or_else(|| "常駐エージェントプロセスが終了しています".to_owned())?;
+            .ok_or_else(|| {
+                let err = "常駐エージェントプロセスが終了しています".to_owned();
+                self.ai_chat.last_error = Some(err.clone());
+                self.ai_chat.status_banner.clone_from(&err);
+                err
+            })?;
 
-        runner
-            .send_tool_approval(pending.request_id, approved, reason)
-            .map_err(|e| e.to_string())?;
+        if let Err(err) = runner.send_tool_approval(req_id, approved, reason) {
+            let msg = err.to_string();
+            self.ai_chat.last_error = Some(msg.clone());
+            self.ai_chat.status_banner = format!("承認応答エラー: {msg}");
+            return Err(msg);
+        }
+        self.ai_chat.pending_tool_approval = None;
+        self.ai_chat.last_error = None;
         self.ai_chat.agent_busy = true;
         let msg = if approved {
-            format!("外部ツール `{}` を実行中...", pending.tool_name)
+            format!("外部ツール `{tool_name}` を実行中...")
         } else {
-            format!("外部ツール `{}` の実行を拒否しました", pending.tool_name)
+            format!("外部ツール `{tool_name}` の実行を拒否しました")
         };
         self.ai_chat.status_banner = msg;
         Ok(())
@@ -1025,8 +1091,7 @@ impl AppController {
     ///
     /// ストア未初期化、指定セッション読込失敗、または再開起動失敗時。
     pub fn open_saved_ai_session(&mut self, session_id: &str) -> Result<(), String> {
-        let provider: Arc<dyn AiProvider> = Arc::from(self.ai_chat.build_provider());
-        self.open_saved_ai_session_with_provider(session_id, provider, None)?;
+        self.open_saved_ai_session_with_provider(session_id, None, None)?;
         self.ai_chat.agent_provider_override = None;
         Ok(())
     }
@@ -1039,7 +1104,7 @@ impl AppController {
     pub fn open_saved_ai_session_with_provider(
         &mut self,
         session_id: &str,
-        provider: Arc<dyn AiProvider>,
+        provider: Option<Arc<dyn AiProvider>>,
         plugin_override: Option<DiscoveredAgentPlugin>,
     ) -> Result<(), String> {
         if self.ai_chat.is_busy() {
@@ -1055,6 +1120,19 @@ impl AppController {
         if let Some(runner) = self.ai_chat.active_agent.take() {
             runner.cancel();
         }
+        self.apply_restored_session_record(rec);
+
+        let resolved_provider =
+            provider.unwrap_or_else(|| Arc::from(self.ai_chat.build_provider()));
+        self.ai_chat.agent_provider_override = Some(Arc::clone(&resolved_provider));
+        self.spawn_resumed_agent_if_needed(resolved_provider, plugin_override);
+        self.ai_chat.refresh_session_history();
+        "セッションを復元しました（続けて調整指示を出せます）"
+            .clone_into(&mut self.ai_chat.status_banner);
+        Ok(())
+    }
+
+    fn apply_restored_session_record(&mut self, rec: AiSessionRecord) {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.pending_proposal = None;
@@ -1089,54 +1167,62 @@ impl AppController {
                 text: t.text,
             })
             .collect();
-        self.ai_chat.pending_question = rec.pending_question;
+        // ResumeSession 後のプラグインはアイドル待機に入るため、未回答質問カードをそのまま復元すると永続待ちハングになる
+        self.ai_chat.pending_question = None;
         self.ai_chat.ask_field_values.clear();
         self.ai_chat.agent_memory = rec.agent_memory;
         self.ai_chat.active_drawer = AiChatDrawer::None;
-        self.ai_chat.agent_provider_override = Some(Arc::clone(&provider));
+    }
 
-        if let Some(ref agent_id) = rec.agent_plugin_id {
-            let plugin = plugin_override.or_else(|| {
-                AgentPluginRegistry::discover_default()
-                    .find_by_id(agent_id)
-                    .cloned()
-            });
-            if let Some(p) = plugin
-                && p.executable_path.is_some()
-            {
-                let timeline_summary = build_compact_timeline_summary(
-                    &self.document,
-                    self.clock.current_frame(),
-                    self.selected_clip_id.as_ref(),
-                    self.selected_layer_id.as_ref(),
-                );
-                let cfg = AgentSessionStartConfig {
-                    plugin: p,
-                    session_id: self.ai_chat.session_id.clone(),
-                    goal: String::new(),
-                    resume: true,
-                    attached_folders: self.ai_chat.attached_folders.clone(),
-                    attached_clips: Vec::new(),
-                    base_document: self.document.clone(),
-                    timeline_summary,
-                    agent_memory: self.ai_chat.agent_memory.clone(),
-                    provider,
-                    provider_kind: self.ai_chat.selected_provider.clone(),
-                    model_name: self.ai_chat.model_name.clone(),
-                    thinking_level: self.ai_chat.thinking_level,
-                    approval_mode: self.ai_chat.approval_mode,
-                    runtime_settings: self.ai_chat.runtime_settings.clone(),
-                    tool_registry: None,
-                    extra_extensions: Vec::new(),
-                };
-                if let Ok(runner) = AgentSessionRunner::start(cfg) {
-                    self.ai_chat.active_agent = Some(runner);
-                }
-            }
+    fn spawn_resumed_agent_if_needed(
+        &mut self,
+        provider: Arc<dyn AiProvider>,
+        plugin_override: Option<DiscoveredAgentPlugin>,
+    ) {
+        let Some(agent_id) = self.ai_chat.selected_agent_id.clone() else {
+            return;
+        };
+        if !self.ai_chat.cached_agents_loaded && plugin_override.is_none() {
+            self.ai_chat.refresh_discovered_agents();
         }
-        "セッションを復元しました（続けて調整指示を出せます）"
-            .clone_into(&mut self.ai_chat.status_banner);
-        Ok(())
+        let plugin = plugin_override.or_else(|| {
+            self.ai_chat
+                .cached_agents
+                .iter()
+                .find(|p| p.manifest.id == agent_id)
+                .cloned()
+        });
+        let Some(p) = plugin.filter(|p| p.executable_path.is_some()) else {
+            return;
+        };
+        let timeline_summary = build_compact_timeline_summary(
+            &self.document,
+            self.clock.current_frame(),
+            self.selected_clip_id.as_ref(),
+            self.selected_layer_id.as_ref(),
+        );
+        let cfg = AgentSessionStartConfig {
+            plugin: p,
+            session_id: self.ai_chat.session_id.clone(),
+            goal: String::new(),
+            resume: true,
+            attached_folders: self.ai_chat.attached_folders.clone(),
+            attached_clips: Vec::new(),
+            base_document: self.document.clone(),
+            timeline_summary,
+            agent_memory: self.ai_chat.agent_memory.clone(),
+            provider,
+            provider_kind: self.ai_chat.selected_provider.clone(),
+            model_name: self.ai_chat.model_name.clone(),
+            thinking_level: self.ai_chat.thinking_level,
+            approval_mode: self.ai_chat.approval_mode,
+            runtime_settings: self.ai_chat.runtime_settings.clone(),
+            tool_registry: None,
+            extra_extensions: Vec::new(),
+        };
+        if let Ok(runner) = AgentSessionRunner::start(cfg) {
+            self.ai_chat.active_agent = Some(runner);
+        }
     }
 
     /// 保存済みセッションを削除する（現在開いているセッションを消した場合は新規セッションへ移行）。
@@ -1156,7 +1242,20 @@ impl AppController {
         if self.ai_chat.session_id == session_id {
             self.ai_chat.new_session();
         }
+        self.ai_chat.refresh_session_history();
         Ok(())
+    }
+
+    /// アプリ終了時に常駐エージェントプロセスを同期終了し、孤児プロセスの残留を防ぐ。
+    pub fn shutdown_ai_agent(&mut self) {
+        if let Some(handle) = self.ai_chat.running_job.take() {
+            handle.cancelled.store(true, Ordering::Release);
+        }
+        if let Some(runner) = self.ai_chat.active_agent.take() {
+            runner.shutdown();
+        }
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
     }
 
     /// 実行中の AI リクエストまたは常駐エージェントを中断し、再送信できる状態へ戻す（中断時 `true`）。
@@ -1249,14 +1348,21 @@ impl AppController {
         if let Some(runner) = self.ai_chat.active_agent.take() {
             let events = runner.poll_events();
             let mut exited = false;
+            let mut need_persist = false;
             if !events.is_empty() {
                 changed = true;
                 for evt in events {
-                    if self.handle_agent_host_event(evt) {
+                    let (did_exit, persist_evt) = self.handle_agent_host_event(evt);
+                    if did_exit {
                         exited = true;
                     }
+                    if persist_evt {
+                        need_persist = true;
+                    }
                 }
-                self.ai_chat.persist_session();
+                if need_persist {
+                    self.ai_chat.persist_session();
+                }
             }
             if !exited && runner.is_alive() {
                 self.ai_chat.active_agent = Some(runner);
@@ -1266,7 +1372,7 @@ impl AppController {
         changed
     }
 
-    fn handle_agent_host_event(&mut self, evt: AgentHostEvent) -> bool {
+    fn handle_agent_host_event(&mut self, evt: AgentHostEvent) -> (bool, bool) {
         match evt {
             AgentHostEvent::Status {
                 message,
@@ -1275,7 +1381,7 @@ impl AppController {
             } => {
                 self.ai_chat.status_banner = message;
                 self.ai_chat.agent_step_status = Some((step, total_steps));
-                false
+                (false, false)
             }
             AgentHostEvent::ToolActivity {
                 tool_name,
@@ -1287,11 +1393,11 @@ impl AppController {
                 } else {
                     format!("ツール失敗 ({tool_name}): {summary}")
                 };
-                false
+                (false, false)
             }
             AgentHostEvent::MemoryUpdated { agent_memory } => {
                 self.ai_chat.agent_memory = agent_memory;
-                false
+                (false, true)
             }
             AgentHostEvent::AskUser {
                 request_id,
@@ -1309,7 +1415,7 @@ impl AppController {
                     choices,
                     allow_skip,
                 });
-                false
+                (false, true)
             }
             AgentHostEvent::ToolApprovalRequired {
                 request_id,
@@ -1326,7 +1432,7 @@ impl AppController {
                 });
                 self.ai_chat.status_banner =
                     format!("Manual 承認待ち: ツール `{tool_name}` の実行許可が必要です");
-                false
+                (false, false)
             }
             AgentHostEvent::Proposal {
                 summary_markdown,
@@ -1335,7 +1441,7 @@ impl AppController {
                 ..
             } => {
                 self.handle_agent_proposal_event(summary_markdown, *plan, agent_memory);
-                false
+                (false, true)
             }
             AgentHostEvent::AgentError {
                 code,
@@ -1355,7 +1461,7 @@ impl AppController {
                 } else {
                     format!("致命的エラー: {formatted}")
                 };
-                !recoverable
+                (!recoverable, true)
             }
             AgentHostEvent::Exited { reason } => {
                 self.ai_chat.agent_busy = false;
@@ -1363,7 +1469,7 @@ impl AppController {
                 if reason != "cancelled" {
                     self.ai_chat.status_banner = format!("エージェントプロセス終了: {reason}");
                 }
-                true
+                (true, true)
             }
         }
     }
@@ -1721,6 +1827,7 @@ fn render_compact_header(
                 if this.controller.ai_chat.active_drawer == AiChatDrawer::SessionHistory {
                     AiChatDrawer::None
                 } else {
+                    this.controller.ai_chat.refresh_session_history();
                     AiChatDrawer::SessionHistory
                 };
             cx.notify();
@@ -1813,7 +1920,9 @@ fn render_chat_body(
                 .xsmall()
                 .label(tr("ai.undo_last"))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.controller.undo_last_ai_plan();
+                    if let Err(err) = this.controller.undo_last_ai_plan() {
+                        this.controller.ai_chat.last_error = Some(err);
+                    }
                     this.sync_widgets_from_controller(cx);
                     cx.notify();
                 })),
@@ -1963,7 +2072,9 @@ fn render_diff_card(
                     .small()
                     .label(tr("ai.approve"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let _ = this.controller.approve_pending_ai_proposal();
+                        if let Err(err) = this.controller.approve_pending_ai_proposal() {
+                            this.controller.ai_chat.last_error = Some(err);
+                        }
                         this.sync_widgets_from_controller(cx);
                         cx.notify();
                     })),
@@ -2207,39 +2318,46 @@ fn insert_at_mention_into_input(
 }
 
 fn render_attach_context_button(
-    controller: &AppController,
+    _controller: &AppController,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let weak = cx.weak_entity();
-    let selected_ids = controller.effective_selected_clip_ids();
-    let selected_items: Vec<(ClipId, String)> = selected_ids
-        .iter()
-        .filter_map(|cid| {
-            controller
-                .document
-                .find_clip(cid)
-                .map(|(_, c)| (cid.clone(), c.name.clone()))
-        })
-        .collect();
-    let attached_set = controller.ai_chat.attached_clip_ids.clone();
-    let all_clips: Vec<(ClipId, String, String, u64, u64)> = controller
-        .document
-        .layers
-        .iter()
-        .flat_map(|layer| {
-            layer.clips.iter().map(move |clip| {
-                let s = clip.timeline_start.get();
-                let e = s.saturating_add(clip.duration.get());
-                (clip.id.clone(), clip.name.clone(), layer.name.clone(), s, e)
-            })
-        })
-        .collect();
 
     Button::new("ai-attach-context-btn")
         .ghost()
         .xsmall()
         .label("📎 添付 ▾")
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
+            let (selected_items, attached_set, all_clips) = weak
+                .read_with(cx, |view, _| {
+                    let selected_ids = view.controller.effective_selected_clip_ids();
+                    let selected_items: Vec<(ClipId, String)> = selected_ids
+                        .iter()
+                        .filter_map(|cid| {
+                            view.controller
+                                .document
+                                .find_clip(cid)
+                                .map(|(_, c)| (cid.clone(), c.name.clone()))
+                        })
+                        .collect();
+                    let attached_set = view.controller.ai_chat.attached_clip_ids.clone();
+                    let all_clips: Vec<(ClipId, String, String, u64, u64)> = view
+                        .controller
+                        .document
+                        .layers
+                        .iter()
+                        .flat_map(|layer| {
+                            layer.clips.iter().map(move |clip| {
+                                let s = clip.timeline_start.get();
+                                let e = s.saturating_add(clip.duration.get());
+                                (clip.id.clone(), clip.name.clone(), layer.name.clone(), s, e)
+                            })
+                        })
+                        .collect();
+                    (selected_items, attached_set, all_clips)
+                })
+                .unwrap_or_default();
+
             let mut popup = menu
                 .min_w(px(230.))
                 .max_h(px(300.))
@@ -2301,19 +2419,24 @@ fn render_attach_context_button(
 }
 
 fn render_at_mention_button(
-    controller: &AppController,
+    _controller: &AppController,
     ai_chat_input: &Entity<TextareaState>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let weak = cx.weak_entity();
     let input_entity = ai_chat_input.clone();
-    let names = matching_at_mention_names(&controller.document, "");
 
     Button::new("ai-at-mention-btn")
         .ghost()
         .xsmall()
         .label("@ ファイル ▾")
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
+            let names = weak
+                .read_with(cx, |view, _| {
+                    matching_at_mention_names(&view.controller.document, "")
+                })
+                .unwrap_or_default();
+
             let mut popup = menu
                 .min_w(px(210.))
                 .max_h(px(280.))
@@ -2639,6 +2762,26 @@ mod tests {
         controller.undo_last_ai_plan()?;
         assert_eq!(controller.document.layers.len(), 0);
         assert!(!controller.ai_chat.can_one_click_undo);
+
+        // 手動編集 dispatch_command 後に can_one_click_undo がリセットされること
+        controller.submit_ai_prompt_with_provider(
+            "もう1つ追加",
+            &MockAiProvider::with_responses([r#"{"type":"add_layer","name":"Layer B"}"#]),
+        )?;
+        assert!(controller.ai_chat.can_one_click_undo);
+        controller.dispatch_command(&crate::timeline::command::EditCommand::AddLayer {
+            temp_id: None,
+            id: None,
+            name: "Manual Layer".to_owned(),
+            insert_index: None,
+        })?;
+        assert!(!controller.ai_chat.can_one_click_undo);
+
+        // API キー更新時に agent_provider_override がクリアされること
+        controller.ai_chat.agent_provider_override =
+            Some(std::sync::Arc::new(MockAiProvider::new()));
+        controller.ai_chat.set_runtime_api_key(None);
+        assert!(controller.ai_chat.agent_provider_override.is_none());
         Ok(())
     }
 

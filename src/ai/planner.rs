@@ -101,25 +101,23 @@ fn extract_edit_command_and_note(
     Err(AiPlanError::InvalidJsonCommand(last_err))
 }
 
-/// モデル出力をパースしたうえで複製ドキュメント上でドライランし、安全な [`AiEditPlan`] を生成する。
+/// すでにデシリアライズ済みの [`EditCommand`] を複製ドキュメント上で直接ドライラン検証する。
 ///
-/// 呼び出し元の `doc` および履歴には一切の副作用を残さない。
-/// 空のバッチ (`{"type":"batch","commands":[]}`) は変更なしの有効な応答（no-op 計画）として受理する。
+/// 不要な JSON 再シリアライズ／再パースを行わずに検証済み [`AiEditPlan`] を構築したい場合に利用します。
 ///
 /// # Errors
 ///
-/// JSON 不正またはドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
-pub fn dry_run_validate(
+/// ドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
+pub fn dry_run_validate_command(
     doc: &ProjectDocument,
-    raw_response: &str,
+    command: EditCommand,
+    reply_note: Option<String>,
 ) -> Result<AiEditPlan, AiPlanError> {
-    let (raw_json, command, reply_note) = extract_edit_command_and_note(raw_response)?;
     let is_no_op = matches!(&command, EditCommand::Batch { commands } if commands.is_empty());
-
     if is_no_op {
         doc.validate().map_err(CommandError::from)?;
         return Ok(AiEditPlan {
-            raw_json,
+            raw_json: String::new(),
             command,
             reply_note,
             summary_lines: vec!["タイムライン変更なし（0 ステップ）".to_owned()],
@@ -136,12 +134,30 @@ pub fn dry_run_validate(
     summarize_command(&command, &mut summary_lines, &mut affected_targets);
 
     Ok(AiEditPlan {
-        raw_json,
+        raw_json: String::new(),
         command,
         reply_note,
         summary_lines,
         affected_targets,
     })
+}
+
+/// モデル出力をパースしたうえで複製ドキュメント上でドライランし、安全な [`AiEditPlan`] を生成する。
+///
+/// 呼び出し元の `doc` および履歴には一切の副作用を残さない。
+/// 空のバッチ (`{"type":"batch","commands":[]}`) は変更なしの有効な応答（no-op 計画）として受理する。
+///
+/// # Errors
+///
+/// JSON 不正またはドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
+pub fn dry_run_validate(
+    doc: &ProjectDocument,
+    raw_response: &str,
+) -> Result<AiEditPlan, AiPlanError> {
+    let (raw_json, command, reply_note) = extract_edit_command_and_note(raw_response)?;
+    let mut plan = dry_run_validate_command(doc, command, reply_note)?;
+    plan.raw_json = raw_json;
+    Ok(plan)
 }
 
 /// 検証済み計画を実際のドキュメントと [`CommandDispatcher`] へ単一ステップ（単一 Undo 単位）で適用する。

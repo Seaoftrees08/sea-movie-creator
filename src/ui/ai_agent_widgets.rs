@@ -13,7 +13,6 @@ use gpui_kit::{
     PathPromptOptions, SharedString, Styled as _, div, px,
 };
 
-use crate::ai::agent_host::AgentPluginRegistry;
 use crate::ai::session_store::PendingAgentQuestionSnapshot;
 use crate::ui::ai_chat_panel::{AiChatDrawer, AiChatState, PendingAgentToolApproval};
 use crate::ui::i18n::tr;
@@ -28,21 +27,24 @@ pub(crate) fn render_agent_mode_menu_button(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let weak = cx.weak_entity();
-    let registry = AgentPluginRegistry::discover_default();
     let current_agent_id = chat.selected_agent_id.clone();
 
     let active_label = match current_agent_id.as_deref() {
         None => "単発 ▾".to_owned(),
         Some(id) => {
-            let found_name = registry.find_by_id(id).map_or_else(
-                || id.to_owned(),
-                |p| short_agent_display_name(&p.manifest.name),
-            );
+            let found_name = chat
+                .cached_agents
+                .iter()
+                .find(|p| p.manifest.id == id)
+                .map_or_else(
+                    || id.to_owned(),
+                    |p| short_agent_display_name(&p.manifest.name),
+                );
             format!("Agent:{found_name} ▾")
         }
     };
 
-    let available_agents = registry.plugins().to_vec();
+    let available_agents = chat.cached_agents.clone();
     Button::new("ai-agent-mode-picker")
         .ghost()
         .xsmall()
@@ -92,7 +94,17 @@ pub(crate) fn render_agent_mode_menu_button(
                     ));
                 }
             }
+            let weak_reload = weak.clone();
             popup
+                .separator()
+                .item(
+                    PopupMenuItem::new("エージェント一覧を再読込").on_click(move |_, _, cx| {
+                        let _ = weak_reload.update(cx, |view, cx| {
+                            view.controller.ai_chat.refresh_discovered_agents();
+                            cx.notify();
+                        });
+                    }),
+                )
         })
 }
 
@@ -176,11 +188,7 @@ pub(crate) fn render_session_history_drawer(
             ),
     );
 
-    let sessions = chat
-        .session_store
-        .as_ref()
-        .and_then(|store| store.list_sessions().ok())
-        .unwrap_or_default();
+    let sessions = &chat.cached_sessions;
 
     if sessions.is_empty() {
         card = card.child(
@@ -191,7 +199,7 @@ pub(crate) fn render_session_history_drawer(
         return card;
     }
 
-    for (idx, summary) in sessions.into_iter().take(8).enumerate() {
+    for (idx, summary) in sessions.iter().take(8).enumerate() {
         let is_current = summary.session_id == chat.session_id;
         let open_id = summary.session_id.clone();
         let del_id = summary.session_id.clone();
@@ -223,7 +231,9 @@ pub(crate) fn render_session_history_drawer(
                         .flex_1()
                         .min_w(px(0.))
                         .child(open_btn.on_click(cx.listener(move |this, _, _, cx| {
-                            let _ = this.controller.open_saved_ai_session(&open_id);
+                            if let Err(err) = this.controller.open_saved_ai_session(&open_id) {
+                                this.controller.ai_chat.last_error = Some(err);
+                            }
                             this.sync_widgets_from_controller(cx);
                             cx.notify();
                         }))),
@@ -235,7 +245,9 @@ pub(crate) fn render_session_history_drawer(
                         .disabled(chat.is_busy())
                         .label("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let _ = this.controller.delete_saved_ai_session(&del_id);
+                            if let Err(err) = this.controller.delete_saved_ai_session(&del_id) {
+                                this.controller.ai_chat.last_error = Some(err);
+                            }
                             cx.notify();
                         })),
                 ),
@@ -450,7 +462,10 @@ pub(crate) fn render_tool_approval_card(
                         .small()
                         .label(tr("ai.tool_approve"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this.controller.answer_agent_tool_approval(true, None);
+                            if let Err(err) = this.controller.answer_agent_tool_approval(true, None)
+                            {
+                                this.controller.ai_chat.last_error = Some(err);
+                            }
                             cx.notify();
                         })),
                 )
@@ -460,10 +475,12 @@ pub(crate) fn render_tool_approval_card(
                         .small()
                         .label(tr("ai.tool_deny"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this.controller.answer_agent_tool_approval(
+                            if let Err(err) = this.controller.answer_agent_tool_approval(
                                 false,
                                 Some("ユーザーが実行を拒否しました".to_owned()),
-                            );
+                            ) {
+                                this.controller.ai_chat.last_error = Some(err);
+                            }
                             cx.notify();
                         })),
                 ),
@@ -563,11 +580,15 @@ impl SeaEditorWindow {
                 values.insert(field_id.clone(), val);
             }
         }
-        let _ = self
+        if let Err(err) = self
             .controller
-            .answer_pending_agent_question(choice_id, values, None, skipped);
-        self.ai_ask_inputs = None;
-        self.ai_ask_subs.clear();
+            .answer_pending_agent_question(choice_id, values, None, skipped)
+        {
+            self.controller.ai_chat.last_error = Some(err);
+        } else {
+            self.ai_ask_inputs = None;
+            self.ai_ask_subs.clear();
+        }
         cx.notify();
     }
 }

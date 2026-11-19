@@ -6,9 +6,10 @@ use std::io::{self, BufReader, StdinLock, StdoutLock};
 
 use sea_agent_protocol::{
     AgentAskChoice, AgentAskField, AgentLlmMessage, AgentLlmToolCall, AgentToHostMessage,
-    AgentToolSpec, AgentUserAnswerPayload, HostToAgentMessage, protocol_error, read_ndjson_line,
-    write_ndjson_line,
+    AgentToolSpec, AgentUserAnswerPayload, HostToAgentMessage, protocol_error_with_memory,
+    read_ndjson_line, write_ndjson_line,
 };
+use serde::Serialize;
 use serde_json::Value;
 
 /// RPC 待機中にホストからキャンセル要求を受け取った場合の制御結果。
@@ -93,7 +94,23 @@ impl<'a> AgentTransport<'a> {
 
     /// 回復可能・致命エラーを送信する。
     pub fn send_error(&mut self, code: &str, message: impl Into<String>, recoverable: bool) {
-        let _ = self.send_message(&protocol_error(code, message, recoverable));
+        self.send_error_with_memory(code, message, recoverable, None);
+    }
+
+    /// 取得済み解析キャッシュ等の `agent_memory` 部分パッチ付きでエラーを送信する。
+    pub fn send_error_with_memory(
+        &mut self,
+        code: &str,
+        message: impl Into<String>,
+        recoverable: bool,
+        agent_memory_patch: Option<Value>,
+    ) {
+        let _ = self.send_message(&protocol_error_with_memory(
+            code,
+            message,
+            recoverable,
+            agent_memory_patch,
+        ));
     }
 
     /// ホストツールを呼び出し、結果を待つ。
@@ -148,29 +165,44 @@ impl<'a> AgentTransport<'a> {
         }
     }
 
-    /// ホスト LLM ゲートウェイに推論を依頼し、応答を取得する。
+    /// ホスト LLM ゲートウェイに推論を依頼し、応答を取得する（スライス借用により不要な全量クローンを避ける）。
     ///
     /// # Errors
     ///
     /// キャンセル・通信障害・プロバイダエラー時に [`RpcError`] を返す。
     pub fn llm_chat(
         &mut self,
-        system_prompt: Option<String>,
-        messages: Vec<AgentLlmMessage>,
-        tools: Vec<AgentToolSpec>,
-        response_json_schema: Option<Value>,
+        system_prompt: Option<&str>,
+        messages: &[AgentLlmMessage],
+        tools: &[AgentToolSpec],
+        response_json_schema: Option<&Value>,
         prefer_json_object: bool,
     ) -> Result<(String, Vec<AgentLlmToolCall>), RpcError> {
+        #[derive(Serialize)]
+        struct LlmChatRef<'a> {
+            #[serde(rename = "type")]
+            msg_type: &'static str,
+            request_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            system_prompt: Option<&'a str>,
+            messages: &'a [AgentLlmMessage],
+            tools: &'a [AgentToolSpec],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            response_json_schema: Option<&'a Value>,
+            prefer_json_object: bool,
+        }
+
         let req_id = self.alloc_request_id("llm");
-        self.send_message(&AgentToHostMessage::LlmChat {
-            request_id: req_id.clone(),
+        let wire = LlmChatRef {
+            msg_type: "llm_chat",
+            request_id: &req_id,
             system_prompt,
             messages,
             tools,
             response_json_schema,
             prefer_json_object,
-        })
-        .map_err(RpcError::Io)?;
+        };
+        write_ndjson_line(&mut self.writer, &wire).map_err(|err| RpcError::Io(err.to_string()))?;
 
         loop {
             match self.recv_message().map_err(RpcError::Io)? {

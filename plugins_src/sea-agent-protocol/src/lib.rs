@@ -316,6 +316,9 @@ pub enum AgentToHostMessage {
         /// 同じセッションで再試行・別プロバイダ切替・フォローアップにより回復可能か。
         #[serde(default)]
         recoverable: bool,
+        /// 中断前に取得済みの `agent_memory` 更新パッチ（429/403 時の解析キャッシュ保全用・任意）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_memory_patch: Option<Value>,
     },
 }
 
@@ -326,12 +329,27 @@ pub fn protocol_error(
     message: impl Into<String>,
     recoverable: bool,
 ) -> AgentToHostMessage {
+    protocol_error_with_memory(code, message, recoverable, None)
+}
+
+/// 解析キャッシュ等の `agent_memory` 部分更新を伴うエラーメッセージコンストラクタ。
+#[must_use]
+pub fn protocol_error_with_memory(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    recoverable: bool,
+    agent_memory_patch: Option<Value>,
+) -> AgentToHostMessage {
     AgentToHostMessage::Error {
         code: code.into(),
         message: message.into(),
         recoverable,
+        agent_memory_patch,
     }
 }
+
+/// NDJSON 1 行あたりの最大許容バイト数（16 MiB）。
+pub const MAX_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 1 メッセージを NDJSON（1 行 JSON + 改行）として書き出してフラッシュする。
 ///
@@ -349,17 +367,32 @@ pub fn write_ndjson_line<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> io:
 /// NDJSON ストリームから次の有効な 1 行を読み取ってデシリアライズする。
 ///
 /// 空行・空白行はスキップし、EOF 到達時は `Ok(None)` を返す。
+/// 1 行あたりの読取サイズは `MAX_NDJSON_LINE_BYTES`（16 MiB）までに制限する。
 ///
 /// # Errors
 ///
-/// ストリーム読取失敗、または不正な JSON 行を検出した場合に `io::Error` を返す。
+/// ストリーム読取失敗、上限サイズ超過、または不正な JSON 行を検出した場合に `io::Error` を返す。
 pub fn read_ndjson_line<R: BufRead, T: DeserializeOwned>(reader: &mut R) -> io::Result<Option<T>> {
+    read_ndjson_line_bounded(reader, MAX_NDJSON_LINE_BYTES)
+}
+
+fn read_ndjson_line_bounded<R: BufRead, T: DeserializeOwned>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<T>> {
     let mut line = String::new();
+    let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = std::io::Read::take(&mut *reader, limit).read_line(&mut line)?;
         if bytes == 0 {
             return Ok(None);
+        }
+        if bytes > max_bytes && !line.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("NDJSON line exceeds max size ({max_bytes} bytes)"),
+            ));
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -435,7 +468,11 @@ mod tests {
             read_ndjson_line::<_, HostToAgentMessage>(&mut cursor)?,
             None
         );
+        Ok(())
+    }
 
+    #[test]
+    fn agent_messages_roundtrip_over_ndjson() -> io::Result<()> {
         let agent_msgs = vec![
             AgentToHostMessage::Status {
                 message: "写真を解析中 (4/10)...".to_owned(),
@@ -467,7 +504,12 @@ mod tests {
                 agent_memory_patch: Some(json!({"analyzed_count": 10})),
                 blueprint: Some(json!({"target_duration_seconds": 180.0})),
             },
-            protocol_error("rate_limited", "API 制限到達", true),
+            protocol_error_with_memory(
+                "rate_limited",
+                "API 制限到達",
+                true,
+                Some(json!({"analyzed_count": 4})),
+            ),
         ];
 
         let mut agent_buf = Vec::new();
@@ -483,6 +525,17 @@ mod tests {
             read_ndjson_line::<_, AgentToHostMessage>(&mut agent_cursor)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_ndjson_line_returns_invalid_data() -> Result<(), String> {
+        let oversized = "{\"type\":\"cancel\"}\n".repeat(10);
+        let mut cursor = Cursor::new(oversized.as_bytes());
+        let Err(err) = read_ndjson_line_bounded::<_, HostToAgentMessage>(&mut cursor, 8) else {
+            return Err("line exceeding byte bound must be rejected".to_owned());
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         Ok(())
     }
 }

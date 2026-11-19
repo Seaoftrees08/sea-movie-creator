@@ -110,18 +110,46 @@ impl AnthropicProvider {
 
     fn build_agent_request_body(&self, request: &AiAgentTurnRequest) -> Value {
         let mut system_text = request.system_prompt.clone();
-        let mut messages = Vec::new();
+        if request.tools.is_empty()
+            && let Some(schema) = &request.response_json_schema
+        {
+            system_text.push_str("\n\nRespond ONLY with JSON matching this schema:\n");
+            system_text.push_str(&schema.to_string());
+        }
+
+        let mut messages: Vec<Value> = Vec::new();
         for turn in &request.messages {
-            match turn {
-                AiTurnMessage::System { text } => {
+            if let AiTurnMessage::System { text } = turn {
+                if !text.is_empty() {
                     system_text.push_str("\n\n");
                     system_text.push_str(text);
                 }
-                other => messages.push(anthropic_turn_message_to_json(other)),
+                continue;
             }
+            let (role, mut blocks) = anthropic_turn_message_to_blocks(turn);
+            if blocks.is_empty() {
+                continue;
+            }
+            if let Some(last) = messages.last_mut()
+                && last["role"].as_str() == Some(role)
+                && let Some(existing) = last["content"].as_array_mut()
+            {
+                existing.append(&mut blocks);
+                continue;
+            }
+            messages.push(json!({
+                "role": role,
+                "content": blocks,
+            }));
         }
 
-        let budget = self.config.thinking_level.anthropic_budget_tokens();
+        // マルチターン Tool Use で thinking ブロック（signature）を保持するまでは、
+        // tools 併用時の thinking 付与を抑止し 2 ターン目 HTTP 400 を防ぐ
+        let budget = request
+            .tools
+            .is_empty()
+            .then(|| self.config.thinking_level.anthropic_budget_tokens())
+            .flatten();
         let max_tokens = match budget {
             Some(b) => self.config.max_tokens.max(b.saturating_add(4096)),
             None => self.config.max_tokens,
@@ -152,6 +180,8 @@ impl AnthropicProvider {
                 "type": "enabled",
                 "budget_tokens": budget_tokens,
             });
+        } else if let Some(temp) = request.temperature {
+            body["temperature"] = json!(temp);
         }
         body
     }
@@ -253,9 +283,9 @@ impl AiProvider for AnthropicProvider {
     }
 }
 
-fn anthropic_turn_message_to_json(msg: &AiTurnMessage) -> Value {
+fn anthropic_turn_message_to_blocks(msg: &AiTurnMessage) -> (&'static str, Vec<Value>) {
     match msg {
-        AiTurnMessage::System { text } => json!({ "role": "user", "content": text }),
+        AiTurnMessage::System { text } => ("user", vec![json!({ "type": "text", "text": text })]),
         AiTurnMessage::User { parts } => {
             let content: Vec<Value> = parts
                 .iter()
@@ -274,7 +304,7 @@ fn anthropic_turn_message_to_json(msg: &AiTurnMessage) -> Value {
                     }),
                 })
                 .collect();
-            json!({ "role": "user", "content": content })
+            ("user", content)
         }
         AiTurnMessage::Assistant { text, tool_calls } => {
             let mut content = Vec::new();
@@ -291,22 +321,22 @@ fn anthropic_turn_message_to_json(msg: &AiTurnMessage) -> Value {
                     "input": call.arguments,
                 }));
             }
-            json!({ "role": "assistant", "content": content })
+            ("assistant", content)
         }
         AiTurnMessage::ToolResult {
             tool_call_id,
             content_json,
             is_error,
             ..
-        } => json!({
-            "role": "user",
-            "content": [{
+        } => (
+            "user",
+            vec![json!({
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
                 "content": content_json,
                 "is_error": is_error,
-            }]
-        }),
+            })],
+        ),
     }
 }
 
@@ -352,6 +382,12 @@ fn parse_anthropic_agent_response(
 fn parse_anthropic_sse_chunk(payload: &str) -> Result<Option<String>, AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("Anthropic SSE JSON parse failed: {err}")))?;
+    if val["type"].as_str() == Some("error") {
+        let msg = val["error"]["message"]
+            .as_str()
+            .unwrap_or("Anthropic SSE error");
+        return Err(AiError::ParseFailed(format!("Anthropic SSE error: {msg}")));
+    }
     if val["type"].as_str() == Some("content_block_delta")
         && val["delta"]["type"].as_str() == Some("text_delta")
     {
@@ -366,7 +402,9 @@ fn parse_anthropic_sync_text(val: &Value) -> Result<String, AiError> {
     })?;
     let mut joined = String::new();
     for block in blocks {
-        if let Some(txt) = block["text"].as_str() {
+        if block["type"].as_str() == Some("text")
+            && let Some(txt) = block["text"].as_str()
+        {
             joined.push_str(txt);
         }
     }
@@ -469,6 +507,74 @@ mod tests {
             "base64"
         );
         assert_eq!(parsed_body["tools"][0]["name"], "inspect_media_folder");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_merges_tool_results_and_ignores_thinking_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 並列 ToolResult マージ、空 Assistant 除外、tools 併用時の thinking 抑止・temperature 反映、thinking ブロック除外を検証
+        let multi_provider = AnthropicProvider::new(
+            AnthropicConfig::new("claude-sonnet-4-20250514", None)
+                .with_thinking_level(AiThinkingLevel::High),
+        );
+        let multi_req = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![
+                AiTurnMessage::Assistant {
+                    text: None,
+                    tool_calls: Vec::new(),
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "t1".to_owned(),
+                    name: "tool_a".to_owned(),
+                    content_json: "{\"a\":1}".to_owned(),
+                    is_error: false,
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "t2".to_owned(),
+                    name: "tool_b".to_owned(),
+                    content_json: "{\"b\":2}".to_owned(),
+                    is_error: false,
+                },
+            ],
+            tools: vec![crate::ai::provider::AiToolDefinition {
+                name: "tool_a".to_owned(),
+                description: "a".to_owned(),
+                parameters_schema: json!({ "type": "object" }),
+            }],
+            response_json_schema: None,
+            temperature: Some(0.3),
+        };
+        let multi_body = multi_provider.build_agent_request_body(&multi_req);
+        assert_eq!(multi_body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(multi_body["messages"][0]["role"], json!("user"));
+        assert_eq!(
+            multi_body["messages"][0]["content"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(multi_body.get("thinking").is_none());
+        assert!(
+            multi_body["temperature"]
+                .as_f64()
+                .is_some_and(|t| (t - 0.3).abs() < 1e-6)
+        );
+
+        let sync_val = json!({
+            "content": [
+                { "type": "thinking", "thinking": "secret", "text": "ignored" },
+                { "type": "text", "text": "{\"ok\":1}" }
+            ]
+        });
+        assert_eq!(parse_anthropic_sync_text(&sync_val)?, "{\"ok\":1}");
+        assert!(
+            parse_anthropic_sse_chunk(
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+            )
+            .is_err()
+        );
         Ok(())
     }
 

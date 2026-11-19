@@ -1,7 +1,7 @@
 //! 双方向 NDJSON エージェントプラグイン（`plugins/agent/*`）の検出、マニフェスト検証、
 //! 常駐セッション実行ホスト（レート制限・承認ゲート・Draft Sandbox・キャンセル制御）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::BufReader;
@@ -26,9 +26,12 @@ use crate::ai::capabilities::{InstalledExtensionSummary, collect_host_capabiliti
 use crate::ai::media_inspector::{AllowedFolderScope, encode_thumbnail_jpeg_base64};
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::provider::{
-    AgentRuntimeSettings, AiAgentTurnRequest, AiApprovalMode, AiContentPart, AiProvider,
+    AgentRuntimeSettings, AiAgentTurnRequest, AiApprovalMode, AiContentPart, AiError, AiProvider,
     AiProviderKind, AiThinkingLevel, AiToolCall, AiToolDefinition, AiTurnMessage,
 };
+
+const MAX_CHAT_IMAGE_PATHS: usize = 16;
+const MAX_STDERR_LINE_BYTES: usize = 4096;
 use crate::ai::toolbox::{
     AgentToolDescriptor, DraftSandbox, HostToolRegistry, ToolExecutionContext, ToolSafetyClass,
 };
@@ -110,9 +113,12 @@ impl AgentPluginManifest {
         if self.version.trim().is_empty() {
             return Err(invalid("plugin version must not be empty"));
         }
-        if self.entrypoint.trim().is_empty()
+        if self.entrypoint.is_empty()
+            || self.entrypoint != self.entrypoint.trim()
+            || self.entrypoint == "."
             || self.entrypoint.contains('/')
             || self.entrypoint.contains('\\')
+            || self.entrypoint.contains(':')
             || self.entrypoint.contains("..")
             || self.entrypoint.contains('\0')
         {
@@ -585,9 +591,10 @@ pub struct AgentSessionRunner {
     plugin_id: String,
     cmd_tx: mpsc::Sender<CoordinatorMsg>,
     event_rx: Mutex<mpsc::Receiver<AgentHostEvent>>,
+    child: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
-    stderr_tail: Arc<Mutex<Vec<String>>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl AgentSessionRunner {
@@ -595,9 +602,9 @@ impl AgentSessionRunner {
     ///
     /// # Errors
     ///
-    /// バイナリ未ビルド、起動失敗、または初期ハンドシェイク送信失敗時に [`AgentPluginHostError`] を返す。
+    /// バイナリ未ビルド、または子プロセス起動失敗時に [`AgentPluginHostError`] を返す。
     pub fn start(config: AgentSessionStartConfig) -> Result<Self, AgentPluginHostError> {
-        let (mut child, mut stdin, stdout, stderr) = spawn_agent_child(&config.plugin)?;
+        let (child, stdin, stdout, stderr) = spawn_agent_child(&config.plugin)?;
 
         let tool_registry = config
             .tool_registry
@@ -613,27 +620,21 @@ impl AgentSessionRunner {
             &tool_registry,
             &config.extra_extensions,
         );
-        if let Err(err) = write_ndjson_line(&mut stdin, &initial_msg) {
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AgentPluginHostError::Transport(format!(
-                "initial write failed: {err}"
-            )));
-        }
 
         let (coord_tx, coord_rx) = mpsc::channel::<CoordinatorMsg>();
         let (event_tx, event_rx) = mpsc::channel::<AgentHostEvent>();
         let cancelled = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let child_handle = Arc::new(Mutex::new(Some(child)));
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
 
         spawn_stdout_reader(stdout, coord_tx.clone());
         spawn_stderr_drain(stderr, Arc::clone(&stderr_tail));
 
         let state = CoordinatorState {
-            child,
+            child: Arc::clone(&child_handle),
             stdin: Some(stdin),
+            initial_msg: Some(initial_msg),
             tool_registry,
             folder_scope: AllowedFolderScope::from_folders(&config.attached_folders),
             attached_folders_raw: config.attached_folders,
@@ -648,7 +649,7 @@ impl AgentSessionRunner {
             extra_extensions: config.extra_extensions,
             last_llm_call_at: None,
             turn_step_count: 0,
-            pending_approval: None,
+            pending_approvals: HashMap::new(),
             cancelled: Arc::clone(&cancelled),
             alive: Arc::clone(&alive),
             stderr_tail: Arc::clone(&stderr_tail),
@@ -660,6 +661,7 @@ impl AgentSessionRunner {
             plugin_id: config.plugin.manifest.id,
             cmd_tx: coord_tx,
             event_rx: Mutex::new(event_rx),
+            child: child_handle,
             cancelled,
             alive,
             stderr_tail,
@@ -717,7 +719,7 @@ impl AgentSessionRunner {
     pub fn recent_stderr_lines(&self) -> Vec<String> {
         self.stderr_tail
             .lock()
-            .map(|guard| guard.clone())
+            .map(|guard| guard.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -810,17 +812,36 @@ impl AgentSessionRunner {
         self.cancelled.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(CoordinatorMsg::Shutdown);
     }
+
+    /// 終了を短時間待機し、停止しない場合は子プロセスを強制回収して同期終了する（アプリ終了時向け）。
+    pub fn shutdown(&self) {
+        self.cancel();
+        for _ in 0..15 {
+            if !self.alive.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.alive.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for AgentSessionRunner {
     fn drop(&mut self) {
-        self.cancel();
+        self.shutdown();
     }
 }
 
 struct CoordinatorState {
-    child: Child,
+    child: Arc<Mutex<Option<Child>>>,
     stdin: Option<ChildStdin>,
+    initial_msg: Option<HostToAgentMessage>,
     tool_registry: HostToolRegistry,
     folder_scope: AllowedFolderScope,
     attached_folders_raw: Vec<PathBuf>,
@@ -835,10 +856,16 @@ struct CoordinatorState {
     extra_extensions: Vec<InstalledExtensionSummary>,
     last_llm_call_at: Option<Instant>,
     turn_step_count: u32,
-    pending_approval: Option<PendingApprovalCall>,
+    pending_approvals: HashMap<String, PendingApprovalCall>,
     cancelled: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
-    stderr_tail: Arc<Mutex<Vec<String>>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Drop for CoordinatorState {
+    fn drop(&mut self) {
+        self.shutdown_child(Some("coordinator_dropped"));
+    }
 }
 
 impl CoordinatorState {
@@ -847,6 +874,30 @@ impl CoordinatorState {
             return false;
         };
         write_ndjson_line(stdin, msg).is_ok()
+    }
+
+    fn take_child(&self) -> Option<Child> {
+        self.child.lock().ok().and_then(|mut g| g.take())
+    }
+
+    fn reap_child_bounded(&mut self) {
+        let Some(mut child) = self.take_child() else {
+            self.alive.store(false, Ordering::Release);
+            return;
+        };
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.alive.store(false, Ordering::Release);
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        self.alive.store(false, Ordering::Release);
     }
 
     fn shutdown_child(&mut self, reason: Option<&str>) {
@@ -859,20 +910,7 @@ impl CoordinatorState {
             );
             drop(stdin);
         }
-        // 短時間だけ正常終了を待ち、残っていれば確実に強制終了してリークを防ぐ
-        for _ in 0..10 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    self.alive.store(false, Ordering::Release);
-                    return;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(_) => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.alive.store(false, Ordering::Release);
+        self.reap_child_bounded();
     }
 
     fn check_step_budget(&mut self) -> Result<(), String> {
@@ -911,30 +949,25 @@ impl CoordinatorState {
         event_tx: &mpsc::Sender<AgentHostEvent>,
     ) {
         let prev_count = self.tool_registry.list_descriptors().len();
-        let mut logs = Vec::new();
-        let (result, updated_ts) = {
+        let result = {
             let mut ctx = ToolExecutionContext {
                 folder_scope: &self.folder_scope,
                 sandbox: &mut self.sandbox,
                 llm_provider: Some(self.provider.as_ref()),
                 runtime_settings: &self.runtime_settings,
-                last_llm_call_at: self.last_llm_call_at,
+                last_llm_call_at: &mut self.last_llm_call_at,
+                cancelled: Some(&self.cancelled),
                 on_progress: &mut |msg| {
-                    logs.push(msg.to_owned());
+                    let _ = event_tx.send(AgentHostEvent::Status {
+                        message: msg.to_owned(),
+                        step: None,
+                        total_steps: None,
+                    });
                 },
                 extra_extensions: self.extra_extensions.clone(),
             };
-            let res = self.tool_registry.execute(tool_name, arguments, &mut ctx);
-            (res, ctx.last_llm_call_at)
+            self.tool_registry.execute(tool_name, arguments, &mut ctx)
         };
-        self.last_llm_call_at = updated_ts;
-        for msg in logs {
-            let _ = event_tx.send(AgentHostEvent::Status {
-                message: msg,
-                step: None,
-                total_steps: None,
-            });
-        }
 
         let new_count = self.tool_registry.list_descriptors().len();
         let updated_tools =
@@ -978,6 +1011,20 @@ fn run_coordinator_loop(
     coord_rx: &mpsc::Receiver<CoordinatorMsg>,
     event_tx: &mpsc::Sender<AgentHostEvent>,
 ) {
+    if let Some(initial_msg) = state.initial_msg.take()
+        && !state.send_to_child(&initial_msg)
+    {
+        let err = "initial NDJSON handshake write failed".to_owned();
+        let _ = event_tx.send(AgentHostEvent::AgentError {
+            code: "transport_error".to_owned(),
+            message: err.clone(),
+            recoverable: false,
+        });
+        state.shutdown_child(Some("initial_write_failed"));
+        let _ = event_tx.send(AgentHostEvent::Exited { reason: err });
+        return;
+    }
+
     while let Ok(msg) = coord_rx.recv() {
         match msg {
             CoordinatorMsg::Shutdown => {
@@ -988,13 +1035,13 @@ fn run_coordinator_loop(
                 return;
             }
             CoordinatorMsg::ChildEof => {
+                drop(state.stdin.take());
+                state.reap_child_bounded();
                 let tail = state
                     .stderr_tail
                     .lock()
-                    .map(|g| g.join(" | "))
+                    .map(|g| g.iter().cloned().collect::<Vec<_>>().join(" | "))
                     .unwrap_or_default();
-                let _ = state.child.wait();
-                state.alive.store(false, Ordering::Release);
                 let reason = if tail.is_empty() {
                     "plugin exited".to_owned()
                 } else {
@@ -1064,7 +1111,7 @@ fn handle_follow_up_msg(
     timeline_summary: String,
 ) {
     state.turn_step_count = 0;
-    state.pending_approval = None;
+    state.pending_approvals.clear();
     state.sandbox = DraftSandbox::new(base_document);
     if !attached_folders.is_empty() {
         let mut combined = state.attached_folders_raw.clone();
@@ -1091,13 +1138,9 @@ fn handle_tool_approval_msg(
     reason: Option<String>,
     event_tx: &mpsc::Sender<AgentHostEvent>,
 ) {
-    let Some(pending) = state.pending_approval.take() else {
+    let Some(pending) = state.pending_approvals.remove(request_id) else {
         return;
     };
-    if pending.request_id != request_id {
-        state.pending_approval = Some(pending);
-        return;
-    }
     if approved {
         state.execute_registered_tool(
             &pending.request_id,
@@ -1195,7 +1238,14 @@ fn handle_agent_message(
             code,
             message,
             recoverable,
+            agent_memory_patch,
         } => {
+            if let Some(patch) = agent_memory_patch {
+                merge_json_patch(&mut state.agent_memory, patch);
+                let _ = event_tx.send(AgentHostEvent::MemoryUpdated {
+                    agent_memory: state.agent_memory.clone(),
+                });
+            }
             let _ = event_tx.send(AgentHostEvent::AgentError {
                 code,
                 message,
@@ -1232,11 +1282,14 @@ fn handle_call_tool(
         && desc.safety_class == ToolSafetyClass::ExternalSideEffect
         && state.approval_mode == AiApprovalMode::Manual
     {
-        state.pending_approval = Some(PendingApprovalCall {
-            request_id: request_id.clone(),
-            tool_name: tool_name.clone(),
-            arguments: arguments.clone(),
-        });
+        state.pending_approvals.insert(
+            request_id.clone(),
+            PendingApprovalCall {
+                request_id: request_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: arguments.clone(),
+            },
+        );
         let _ = event_tx.send(AgentHostEvent::ToolApprovalRequired {
             request_id,
             tool_name,
@@ -1309,6 +1362,15 @@ fn handle_llm_chat(
         temperature: Some(0.2),
     };
 
+    send_agent_llm_turn_and_reply(state, request_id, &req, event_tx);
+}
+
+fn send_agent_llm_turn_and_reply(
+    state: &mut CoordinatorState,
+    request_id: String,
+    req: &AiAgentTurnRequest,
+    event_tx: &mpsc::Sender<AgentHostEvent>,
+) {
     let cancelled_ref = Arc::clone(&state.cancelled);
     let tx_clone = event_tx.clone();
     let mut on_stream_event = |ev: crate::ai::provider::AiStreamEvent| {
@@ -1324,7 +1386,7 @@ fn handle_llm_chat(
         }
     };
 
-    match state.provider.send_agent_turn(&req, &mut on_stream_event) {
+    match state.provider.send_agent_turn(req, &mut on_stream_event) {
         Ok(resp) => {
             let tool_calls = resp
                 .tool_calls
@@ -1344,7 +1406,24 @@ fn handle_llm_chat(
                 error: None,
             });
         }
-        Err(err) => send_llm_error(state, request_id, err.to_string()),
+        Err(err) => {
+            if let AiError::HttpStatus { status, .. } = &err {
+                if *status == 429 {
+                    let _ = event_tx.send(AgentHostEvent::AgentError {
+                        code: "rate_limited".to_owned(),
+                        message: err.to_string(),
+                        recoverable: true,
+                    });
+                } else if *status == 403 {
+                    let _ = event_tx.send(AgentHostEvent::AgentError {
+                        code: "forbidden".to_owned(),
+                        message: err.to_string(),
+                        recoverable: true,
+                    });
+                }
+            }
+            send_llm_error(state, request_id, err.to_string());
+        }
     }
 }
 
@@ -1364,44 +1443,66 @@ fn convert_wire_messages_to_turn_messages(
     folder_scope: &AllowedFolderScope,
     max_edge_px: u32,
 ) -> Result<Vec<AiTurnMessage>, String> {
+    let clamped_edge = max_edge_px.clamp(128, 1024);
+    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+    let mut remaining_images = MAX_CHAT_IMAGE_PATHS;
     let mut out = Vec::with_capacity(messages.len());
+
     for msg in messages {
         let role_lower = msg.role.trim().to_ascii_lowercase();
         let turn_msg = match role_lower.as_str() {
             "system" => AiTurnMessage::System {
                 text: msg.text.clone(),
             },
-            "assistant" | "model" => AiTurnMessage::Assistant {
-                text: (!msg.text.is_empty()).then(|| msg.text.clone()),
-                tool_calls: msg
-                    .tool_calls
-                    .iter()
-                    .map(|c| AiToolCall {
-                        id: c.id.clone(),
-                        name: c.name.clone(),
-                        arguments: c.arguments.clone(),
-                    })
-                    .collect(),
-            },
-            "tool" => AiTurnMessage::ToolResult {
-                tool_call_id: msg
+            "assistant" | "model" => {
+                for c in &msg.tool_calls {
+                    call_id_to_name.insert(c.id.clone(), c.name.clone());
+                }
+                AiTurnMessage::Assistant {
+                    text: (!msg.text.is_empty()).then(|| msg.text.clone()),
+                    tool_calls: msg
+                        .tool_calls
+                        .iter()
+                        .map(|c| AiToolCall {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect(),
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
                     .tool_call_id
                     .clone()
-                    .unwrap_or_else(|| "tool_call".to_owned()),
-                name: "tool".to_owned(),
-                content_json: msg.text.clone(),
-                is_error: false,
-            },
+                    .unwrap_or_else(|| "tool_call".to_owned());
+                let resolved_name = call_id_to_name
+                    .get(&tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_owned());
+                AiTurnMessage::ToolResult {
+                    tool_call_id,
+                    name: resolved_name,
+                    content_json: msg.text.clone(),
+                    is_error: false,
+                }
+            }
             _ => {
+                if msg.image_paths.len() > remaining_images {
+                    return Err(format!(
+                        "too many images in LlmChat request (max {MAX_CHAT_IMAGE_PATHS})"
+                    ));
+                }
                 let mut parts = Vec::new();
                 if !msg.text.is_empty() {
                     parts.push(AiContentPart::text(&msg.text));
                 }
                 for img_path in &msg.image_paths {
+                    remaining_images = remaining_images.saturating_sub(1);
                     let thumb = encode_thumbnail_jpeg_base64(
                         folder_scope,
                         Path::new(img_path),
-                        max_edge_px,
+                        clamped_edge,
                     )
                     .map_err(|err| format!("thumbnail encoding failed `{img_path}`: {err}"))?;
                     parts.push(AiContentPart::ImageData {
@@ -1525,21 +1626,45 @@ fn spawn_stdout_reader(stdout: std::process::ChildStdout, tx: mpsc::Sender<Coord
     });
 }
 
-fn spawn_stderr_drain(stderr: std::process::ChildStderr, tail: Arc<Mutex<Vec<String>>>) {
-    use std::io::BufRead as _;
+fn spawn_stderr_drain(stderr: std::process::ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {
+    use std::io::{BufRead as _, Read as _};
 
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::with_capacity(512);
+        loop {
+            buf.clear();
+            let limit = u64::try_from(MAX_STDERR_LINE_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+            let Ok(read) = (&mut reader).take(limit).read_until(b'\n', &mut buf) else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            // 改行なし・長大行の後続バイトは次行境界まで読み飛ばす
+            if read > MAX_STDERR_LINE_BYTES && !buf.ends_with(b"\n") {
+                while let Ok(avail) = reader.fill_buf() {
+                    if avail.is_empty() {
+                        break;
+                    }
+                    if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                        reader.consume(pos + 1);
+                        break;
+                    }
+                    let len = avail.len();
+                    reader.consume(len);
+                }
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let trimmed = text.trim();
             if trimmed.is_empty() {
                 continue;
             }
             if let Ok(mut guard) = tail.lock() {
                 if guard.len() >= 40 {
-                    guard.remove(0);
+                    guard.pop_front();
                 }
-                guard.push(trimmed.to_owned());
+                guard.push_back(trimmed.chars().take(MAX_STDERR_LINE_BYTES).collect());
             }
         }
     });
@@ -1655,5 +1780,64 @@ mod tests {
         assert_eq!(mem["couple"]["date"], "2026-11-22");
         assert!(mem.get("temp_flag").is_none());
         assert_eq!(mem["style"], "wedding_warm");
+    }
+
+    #[test]
+    fn wire_conversion_resolves_tool_name_and_validates_entrypoint_and_image_cap()
+    -> Result<(), String> {
+        let mut manifest = AgentPluginManifest {
+            schema_version: 1,
+            id: "sea.agent.test".to_owned(),
+            name: "Test".to_owned(),
+            version: "0.1.0".to_owned(),
+            entrypoint: "C:evil.exe".to_owned(),
+            args: Vec::new(),
+            protocol: AgentPluginProtocol::SeaAgentV1,
+            ai_hints: None,
+        };
+        assert!(manifest.validate(Path::new("agent-plugin.json")).is_err());
+        manifest.entrypoint = " sea-agent ".to_owned();
+        assert!(manifest.validate(Path::new("agent-plugin.json")).is_err());
+        manifest.entrypoint = ".".to_owned();
+        assert!(manifest.validate(Path::new("agent-plugin.json")).is_err());
+
+        let wire_msgs = vec![
+            AgentLlmMessage {
+                role: "assistant".to_owned(),
+                text: String::new(),
+                image_paths: Vec::new(),
+                tool_calls: vec![AgentLlmToolCall {
+                    id: "call_abc".to_owned(),
+                    name: "inspect_media_folder".to_owned(),
+                    arguments: json!({"path":"C:/w"}),
+                }],
+                tool_call_id: None,
+            },
+            AgentLlmMessage {
+                role: "tool".to_owned(),
+                text: "{\"ok\":true}".to_owned(),
+                image_paths: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_abc".to_owned()),
+            },
+        ];
+        let scope = AllowedFolderScope::default();
+        let converted = convert_wire_messages_to_turn_messages(&wire_msgs, &scope, 512)?;
+        assert!(matches!(
+            &converted[1],
+            AiTurnMessage::ToolResult { name, .. } if name == "inspect_media_folder"
+        ));
+
+        let too_many_imgs = vec![AgentLlmMessage {
+            role: "user".to_owned(),
+            text: "hi".to_owned(),
+            image_paths: (0..=MAX_CHAT_IMAGE_PATHS)
+                .map(|i| format!("img_{i}.png"))
+                .collect(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        assert!(convert_wire_messages_to_turn_messages(&too_many_imgs, &scope, 512).is_err());
+        Ok(())
     }
 }

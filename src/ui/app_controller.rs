@@ -504,6 +504,12 @@ impl AppController {
     /// 新規空プロジェクトへ初期化する。
     pub fn new_project(&mut self) {
         self.stop();
+        let _ = self.cancel_ai_prompt();
+        self.ai_chat.clear_attachments();
+        self.ai_chat.can_one_click_undo = false;
+        self.ai_chat.pending_proposal = None;
+        self.ai_chat.pending_question = None;
+        self.ai_chat.pending_tool_approval = None;
         self.document = ProjectDocument::new("Untitled Project");
         self.last_saved_document = self.document.clone();
         self.dispatcher.clear_history();
@@ -533,6 +539,12 @@ impl AppController {
     pub fn open_project_file(&mut self, path: &Path) -> Result<(), String> {
         self.stop();
         let doc = load_project_file(path).map_err(|err| err.to_string())?;
+        let _ = self.cancel_ai_prompt();
+        self.ai_chat.clear_attachments();
+        self.ai_chat.can_one_click_undo = false;
+        self.ai_chat.pending_proposal = None;
+        self.ai_chat.pending_question = None;
+        self.ai_chat.pending_tool_approval = None;
         let project_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
 
         self.document = doc;
@@ -846,6 +858,7 @@ impl AppController {
             .dispatcher
             .dispatch(&mut self.document, cmd)
             .map_err(|err| err.to_string())?;
+        self.ai_chat.can_one_click_undo = false;
         self.sync_available_media_resources();
         self.doc_audio_revision = self.doc_audio_revision.wrapping_add(1);
         self.sync_selection_after_edit();
@@ -867,6 +880,7 @@ impl AppController {
             .undo(&mut self.document)
             .map_err(|err| err.to_string())?;
         if let Some(label) = undone {
+            self.ai_chat.can_one_click_undo = false;
             self.timeline_gesture = None;
             self.timeline_drag = None;
             self.preview_drag = None;
@@ -893,6 +907,7 @@ impl AppController {
             .redo(&mut self.document)
             .map_err(|err| err.to_string())?;
         if let Some(label) = redone {
+            self.ai_chat.can_one_click_undo = false;
             self.timeline_gesture = None;
             self.timeline_drag = None;
             self.preview_drag = None;
@@ -2727,8 +2742,16 @@ impl AppController {
         }
     }
 
-    /// コマンド適用・Undo/Redo 後に未登録の音声リソースを `AudioMixer` へ同期する（画像はオンデマンド確保）。
+    /// コマンド適用・Undo/Redo 後に未登録の音声リソースを `AudioMixer` へ同期し、不要アセットを解放する。
     fn sync_available_media_resources(&mut self) {
+        let valid_assets: HashSet<AssetId> =
+            self.document.assets.iter().map(|a| a.id.clone()).collect();
+        self.mixer.retain_assets(&valid_assets);
+        self.video_decoders
+            .retain(|id, _| valid_assets.contains(id));
+        self.last_played_video_frames
+            .retain(|id, _| valid_assets.contains(id));
+
         let project_dir = self
             .project_path
             .as_deref()

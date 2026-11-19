@@ -22,15 +22,45 @@ use crate::timeline::document::{
     AssetKind, AssetPath, AudioProperties, ProjectDocument, TimelineLengthMode,
 };
 
+const MAX_TARGET_DURATION_SECONDS: f64 = 86_400.0;
+const MAX_SLIDES: usize = 1_000;
+const MAX_BGM_SEGMENTS: usize = 512;
+
+fn sanitize_finite(value: f64, fallback: f64, min: f64, max: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 /// 構成コンパイル時に発生し得るエラー。
 #[derive(Debug, Error)]
 pub enum BlueprintError {
     /// スライドもタイトルカードも 1 つも指定されていない。
     #[error("blueprint must include at least one title card or slide")]
     EmptyBlueprint,
-    /// 目標総尺が不正（0 以下または非有限値）。
-    #[error("target_duration_seconds must be positive and finite (got {0})")]
+    /// 目標総尺が不正（0 以下・上限超過・非有限値）。
+    #[error(
+        "target_duration_seconds must be finite and within (0, {MAX_TARGET_DURATION_SECONDS}] (got {0})"
+    )]
     InvalidDuration(f64),
+    /// スライド枚数が上限を超過した。
+    #[error("too many slides in blueprint ({count}; max {max})")]
+    TooManySlides {
+        /// 指定スライド数。
+        count: usize,
+        /// 上限。
+        max: usize,
+    },
+    /// BGM ループセグメント数が上限を超過した。
+    #[error("too many BGM segments generated ({count}; max {max})")]
+    TooManyBgmSegments {
+        /// 生成予定セグメント数。
+        count: usize,
+        /// 上限。
+        max: usize,
+    },
     /// 指定画像または音声が許可フォルダ外、または存在しない。
     #[error("media access error for `{path}`: {reason}")]
     MediaAccess {
@@ -268,17 +298,11 @@ struct ScheduledCard<'a> {
 /// # Errors
 ///
 /// 目標尺不正、カード空、許可外パス・画像/音声メタ読取失敗・時間計算エラー時に [`BlueprintError`] を返す。
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn compile_blueprint_to_edit_command(
     doc: &ProjectDocument,
     blueprint: &MovieBlueprint,
     scope: Option<&AllowedFolderScope>,
 ) -> Result<CompiledBlueprintResult, BlueprintError> {
-    if !blueprint.target_duration_seconds.is_finite() || blueprint.target_duration_seconds <= 0.0 {
-        return Err(BlueprintError::InvalidDuration(
-            blueprint.target_duration_seconds,
-        ));
-    }
     let fps = doc.fps.as_f64();
     let canvas_w = f64::from(doc.resolution.width.get());
     let canvas_h = f64::from(doc.resolution.height.get());
@@ -290,34 +314,8 @@ pub fn compile_blueprint_to_edit_command(
         background_color: Some(blueprint.style.background_color()),
     });
 
-    let raw_cards = collect_blueprint_cards(blueprint, scope, &mut commands)?;
-    if raw_cards.is_empty() {
-        return Err(BlueprintError::EmptyBlueprint);
-    }
-
-    let min_frames = u64::try_from(raw_cards.len()).unwrap_or(1);
-    let target_total_frames =
-        ((blueprint.target_duration_seconds * fps).round() as u64).max(min_frames);
-
-    // スライド重みとタイトル希望秒数を同一スケールの重みとして合計 target_total_frames へ配分
-    let scheduled = schedule_cards(
-        raw_cards,
-        target_total_frames,
-        blueprint.transition_overlap_seconds,
-        fps,
-    );
-
-    let has_backdrops = scheduled.iter().any(|card| {
-        matches!(
-            card.kind,
-            VisualCardKind::Slide {
-                spec,
-                img_width,
-                img_height,
-                ..
-            } if spec.portrait_backdrop && is_portrait_relative_to_canvas(img_width, img_height, canvas_w, canvas_h)
-        )
-    });
+    let (scheduled, target_total_frames, has_backdrops) =
+        build_scheduled_cards(blueprint, fps, (canvas_w, canvas_h), scope, &mut commands)?;
 
     let layer_ids = BlueprintLayerIds::default();
     append_blueprint_layers(
@@ -379,6 +377,71 @@ pub fn compile_blueprint_to_edit_command(
     })
 }
 
+// rounded_frames は finite かつ非負かつ MAX_TARGET_DURATION_SECONDS 由来で i64 範囲内に収まるため u64 変換が安全
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn build_scheduled_cards<'a>(
+    blueprint: &'a MovieBlueprint,
+    fps: f64,
+    canvas_size: (f64, f64),
+    scope: Option<&AllowedFolderScope>,
+    commands: &mut Vec<EditCommand>,
+) -> Result<(Vec<ScheduledCard<'a>>, u64, bool), BlueprintError> {
+    if !blueprint.target_duration_seconds.is_finite()
+        || blueprint.target_duration_seconds <= 0.0
+        || blueprint.target_duration_seconds > MAX_TARGET_DURATION_SECONDS
+    {
+        return Err(BlueprintError::InvalidDuration(
+            blueprint.target_duration_seconds,
+        ));
+    }
+    if blueprint.slides.len() > MAX_SLIDES {
+        return Err(BlueprintError::TooManySlides {
+            count: blueprint.slides.len(),
+            max: MAX_SLIDES,
+        });
+    }
+
+    let raw_cards = collect_blueprint_cards(blueprint, scope, commands)?;
+    if raw_cards.is_empty() {
+        return Err(BlueprintError::EmptyBlueprint);
+    }
+
+    let min_frames = u64::try_from(raw_cards.len()).unwrap_or(1);
+    let rounded_frames = (blueprint.target_duration_seconds * fps).round();
+    if !rounded_frames.is_finite() || rounded_frames < 0.0 {
+        return Err(BlueprintError::InvalidDuration(
+            blueprint.target_duration_seconds,
+        ));
+    }
+    let target_total_frames = (rounded_frames as u64).max(min_frames);
+    if i64::try_from(target_total_frames).is_err() {
+        return Err(BlueprintError::InvalidDuration(
+            blueprint.target_duration_seconds,
+        ));
+    }
+
+    // スライド重みとタイトル希望秒数を同一スケールの重みとして合計 target_total_frames へ配分
+    let scheduled = schedule_cards(
+        raw_cards,
+        target_total_frames,
+        blueprint.transition_overlap_seconds,
+        fps,
+    );
+    let (canvas_w, canvas_h) = canvas_size;
+    let has_backdrops = scheduled.iter().any(|card| {
+        matches!(
+            card.kind,
+            VisualCardKind::Slide {
+                spec,
+                img_width,
+                img_height,
+                ..
+            } if spec.portrait_backdrop && is_portrait_relative_to_canvas(img_width, img_height, canvas_w, canvas_h)
+        )
+    });
+    Ok((scheduled, target_total_frames, has_backdrops))
+}
+
 struct BlueprintLayerIds {
     bgm: &'static str,
     bg_a: &'static str,
@@ -416,7 +479,7 @@ fn collect_blueprint_cards<'a>(
     if let Some(title) = &blueprint.title_card {
         raw_cards.push((
             VisualCardKind::Title(title),
-            title.duration_seconds.max(1.0),
+            sanitize_finite(title.duration_seconds, default_title_seconds(), 1.0, 300.0),
         ));
     }
 
@@ -452,11 +515,7 @@ fn collect_blueprint_cards<'a>(
             registered_images.insert(key, entry.clone());
             entry
         };
-        let weight = if slide.weight.is_finite() && slide.weight > 0.0 {
-            slide.weight
-        } else {
-            1.0
-        };
+        let weight = sanitize_finite(slide.weight, default_weight(), 0.05, 100.0);
         raw_cards.push((
             VisualCardKind::Slide {
                 spec: slide,
@@ -471,7 +530,7 @@ fn collect_blueprint_cards<'a>(
     if let Some(ending) = &blueprint.ending_card {
         raw_cards.push((
             VisualCardKind::Ending(ending),
-            ending.duration_seconds.max(1.0),
+            sanitize_finite(ending.duration_seconds, default_title_seconds(), 1.0, 300.0),
         ));
     }
     Ok(raw_cards)
@@ -780,10 +839,13 @@ fn schedule_cards(
         *last += target_total_frames - sum;
     }
 
-    let desired_overlap = if overlap_seconds.is_finite() && overlap_seconds > 0.0 {
-        (overlap_seconds * fps).round() as u64
-    } else {
-        0
+    let desired_overlap = {
+        let clamped = sanitize_finite(overlap_seconds, default_overlap_seconds(), 0.0, 10.0);
+        if clamped > 0.0 {
+            (clamped * fps).round() as u64
+        } else {
+            0
+        }
     };
 
     let mut out = Vec::with_capacity(n);
@@ -1050,7 +1112,10 @@ fn append_bgm_commands(
     })?;
     let sample_rate_hz = dec.sample_rate().max(1);
     let channels = dec.channels().max(1);
-    let duration_sec = dec.duration_seconds().unwrap_or(300.0).max(0.1);
+    let duration_sec = match dec.duration_seconds() {
+        Some(d) if d.is_finite() => d.max(0.1),
+        _ => 300.0,
+    };
     let source_duration = RationalDuration::from_millis((duration_sec * 1000.0).round() as u64);
     let max_asset_frames = ((duration_sec * fps).floor() as u64).max(1);
 
@@ -1072,22 +1137,31 @@ fn append_bgm_commands(
         },
     });
 
-    let base_gain = bgm.gain_db.clamp(-40.0, 12.0);
-    let fade_in_frames = (bgm.fade_in_seconds.max(0.0) * fps).round() as u64;
-    let fade_out_frames = (bgm.fade_out_seconds.max(0.0) * fps).round() as u64;
+    let base_gain = sanitize_finite(bgm.gain_db, default_bgm_gain_db(), -40.0, 12.0);
+    let fade_in_sec = sanitize_finite(bgm.fade_in_seconds, default_bgm_fade_in(), 0.0, 60.0);
+    let fade_out_sec = sanitize_finite(bgm.fade_out_seconds, default_bgm_fade_out(), 0.0, 60.0);
+    let fade_in_frames = (fade_in_sec * fps).round() as u64;
+    let fade_out_frames = (fade_out_sec * fps).round() as u64;
 
-    let mut cursor = 0_u64;
-    let mut segments = 0_usize;
-    while cursor < target_total_frames {
-        let remaining = target_total_frames - cursor;
-        let seg_frames = remaining.min(max_asset_frames);
-        let is_first = segments == 0;
-        let is_last = cursor + seg_frames >= target_total_frames || !bgm.loop_if_shorter;
-        let gain_param = build_bgm_gain_curve(
+    let segment_ranges = plan_bgm_segment_ranges(
+        target_total_frames,
+        max_asset_frames,
+        fps,
+        bgm.loop_if_shorter,
+    )?;
+    let actual_bgm_end = segment_ranges.last().map_or(0, |(s, d)| s + d);
+    let fade_in_end = fade_in_frames.min(actual_bgm_end / 3);
+    let fade_out_len = fade_out_frames.min(actual_bgm_end.saturating_sub(fade_in_end));
+    let fade_out_start = actual_bgm_end.saturating_sub(fade_out_len);
+
+    for (idx, &(seg_start, seg_frames)) in segment_ranges.iter().enumerate() {
+        let gain_param = build_bgm_segment_gain_curve(
+            seg_start,
             seg_frames,
+            fade_in_end,
+            fade_out_start,
+            actual_bgm_end,
             base_gain,
-            if is_first { fade_in_frames } else { 0 },
-            if is_last { fade_out_frames } else { 0 },
         );
         let dur_fc =
             FrameCount::new(seg_frames).map_err(|e| BlueprintError::Time(e.to_string()))?;
@@ -1096,8 +1170,8 @@ fn append_bgm_commands(
             id: None,
             layer_id: LayerRef::Temp(layer_temp_id.to_owned()),
             clip: Box::new(NewClipSpec {
-                name: format!("BGM #{}", segments + 1),
-                timeline_start: FrameIndex::new(cursor),
+                name: format!("BGM #{}", idx + 1),
+                timeline_start: FrameIndex::new(seg_start),
                 duration: dur_fc,
                 effect_offset_frames: 0,
                 effect_duration_frames: None,
@@ -1114,42 +1188,118 @@ fn append_bgm_commands(
                 },
             }),
         });
-        segments += 1;
-        cursor += seg_frames;
-        if !bgm.loop_if_shorter {
+    }
+    Ok(segment_ranges.len())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn plan_bgm_segment_ranges(
+    target_total_frames: u64,
+    max_asset_frames: u64,
+    fps: f64,
+    loop_if_shorter: bool,
+) -> Result<Vec<(u64, u64)>, BlueprintError> {
+    let min_loop_tail_frames = ((fps * 0.2).round() as u64).max(3);
+    let mut segment_ranges = Vec::new();
+    let mut cursor = 0_u64;
+    while cursor < target_total_frames {
+        let remaining = target_total_frames - cursor;
+        if !segment_ranges.is_empty() && remaining < min_loop_tail_frames {
+            // 29.97fps 等の端数で生じる極小クリップ（< 0.2 秒）のポップノイズを防ぐ
+            break;
+        }
+        if segment_ranges.len() >= MAX_BGM_SEGMENTS {
+            return Err(BlueprintError::TooManyBgmSegments {
+                count: segment_ranges.len() + 1,
+                max: MAX_BGM_SEGMENTS,
+            });
+        }
+        let seg_frames = remaining.min(max_asset_frames);
+        segment_ranges.push((cursor, seg_frames));
+        cursor = cursor.saturating_add(seg_frames);
+        if !loop_if_shorter {
             break;
         }
     }
-    Ok(segments)
+    Ok(segment_ranges)
 }
 
-fn build_bgm_gain_curve(
-    dur: u64,
+#[allow(clippy::cast_precision_loss)]
+fn eval_global_bgm_gain(
+    frame: u64,
+    fade_in_end: u64,
+    fade_out_start: u64,
+    bgm_end: u64,
     base_gain_db: f64,
-    fade_in: u64,
-    fade_out: u64,
-) -> AnimatedParameter {
-    if dur <= 2 || (fade_in == 0 && fade_out == 0) {
-        return AnimatedParameter::constant(base_gain_db);
+) -> f64 {
+    if fade_in_end > 0 && frame < fade_in_end {
+        let ratio = (frame as f64) / (fade_in_end as f64);
+        return -40.0 + (base_gain_db - (-40.0)) * ratio;
     }
-    let last = i64::try_from(dur.saturating_sub(1)).unwrap_or(0);
-    let in_end = i64::try_from(fade_in.min(dur / 3)).unwrap_or(0);
-    let out_start = last.saturating_sub(i64::try_from(fade_out.min(dur / 3)).unwrap_or(0));
+    let last_global = bgm_end.saturating_sub(1);
+    if bgm_end > fade_out_start && frame >= fade_out_start {
+        if last_global <= fade_out_start {
+            return -45.0;
+        }
+        let span = (last_global - fade_out_start) as f64;
+        let ratio = ((frame - fade_out_start) as f64 / span).clamp(0.0, 1.0);
+        return base_gain_db + (-45.0 - base_gain_db) * ratio;
+    }
+    base_gain_db
+}
 
-    let mut kfs = Vec::new();
-    if in_end > 0 {
-        kfs.push(Keyframe::with_easing(0, -40.0, EasingCurve::EaseOut));
-        kfs.push(Keyframe::new(in_end, base_gain_db));
-    } else {
-        kfs.push(Keyframe::new(0, base_gain_db));
-    }
-    if out_start > in_end && fade_out > 0 {
-        kfs.push(Keyframe::with_easing(
-            out_start,
+fn build_bgm_segment_gain_curve(
+    seg_start: u64,
+    dur: u64,
+    fade_in_end: u64,
+    fade_out_start: u64,
+    bgm_end: u64,
+    base_gain_db: f64,
+) -> AnimatedParameter {
+    let seg_end = seg_start.saturating_add(dur);
+    if dur <= 1
+        || (seg_start >= fade_in_end && seg_end <= fade_out_start)
+        || (fade_in_end == 0 && fade_out_start >= bgm_end)
+    {
+        return AnimatedParameter::constant(eval_global_bgm_gain(
+            seg_start,
+            fade_in_end,
+            fade_out_start,
+            bgm_end,
             base_gain_db,
-            EasingCurve::EaseIn,
         ));
-        kfs.push(Keyframe::new(last, -45.0));
+    }
+
+    let mut global_frames = vec![seg_start];
+    if fade_in_end > seg_start && fade_in_end < seg_end.saturating_sub(1) {
+        global_frames.push(fade_in_end);
+    }
+    if fade_out_start > seg_start && fade_out_start < seg_end.saturating_sub(1) {
+        global_frames.push(fade_out_start);
+    }
+    let last_global = seg_end.saturating_sub(1);
+    if last_global > seg_start {
+        global_frames.push(last_global);
+    }
+    global_frames.sort_unstable();
+    global_frames.dedup();
+
+    let mut kfs = Vec::with_capacity(global_frames.len());
+    for (idx, &gf) in global_frames.iter().enumerate() {
+        let local = i64::try_from(gf.saturating_sub(seg_start)).unwrap_or(0);
+        let db = eval_global_bgm_gain(gf, fade_in_end, fade_out_start, bgm_end, base_gain_db);
+        let next_gf = global_frames.get(idx + 1).copied();
+        let kf = match next_gf {
+            Some(nf) if gf < fade_in_end && nf <= fade_in_end => {
+                Keyframe::with_easing(local, db, EasingCurve::EaseOut)
+            }
+            Some(nf) if gf >= fade_out_start || nf > fade_out_start => {
+                Keyframe::with_easing(local, db, EasingCurve::EaseIn)
+            }
+            Some(_) => Keyframe::with_easing(local, db, EasingCurve::Linear),
+            None => Keyframe::new(local, db),
+        };
+        kfs.push(kf);
     }
     AnimatedParameter::Keyframes {
         keyframes: kfs,
@@ -1286,15 +1436,38 @@ mod tests {
             assert_eq!(res.summary.slide_count, 10);
             assert_eq!(res.summary.subtitle_count, 12); // title + 10 slides + ending
             assert_eq!(res.summary.portrait_backdrop_count, 4); // indices 0,3,6,9
-            // 29.97fps では floor(60*29.97)=1798f * 3 = 5394f に対し 180s が 5395f のため 1f 分の補完ループが追加される
-            let expected_bgm_segments = if fps == FrameRate::FPS_29_97 { 4 } else { 3 };
-            assert_eq!(res.summary.bgm_segment_count, expected_bgm_segments);
+            // 29.97fps では 1798f * 3 = 5394f に対し残り 1f (< 0.2秒) のポップノイズ原因となる端数クリップ生成を抑止するため 3 セグメントになる
+            assert_eq!(res.summary.bgm_segment_count, 3);
 
             let mut dispatcher = CommandDispatcher::new();
             dispatcher.dispatch(&mut doc, &res.command)?;
             assert_eq!(doc.total_duration_frames(), expected_frames);
             doc.validate()?;
         }
+
+        // 目標総尺上限超過・NaN・極端な重み等に対する安全ガードを検証
+        let doc = ProjectDocument::new("Test");
+        let mut bad_dur = blueprint.clone();
+        bad_dur.target_duration_seconds = 1e12;
+        assert!(matches!(
+            compile_blueprint_to_edit_command(&doc, &bad_dur, Some(&scope)),
+            Err(BlueprintError::InvalidDuration(_))
+        ));
+        bad_dur.target_duration_seconds = f64::NAN;
+        assert!(matches!(
+            compile_blueprint_to_edit_command(&doc, &bad_dur, Some(&scope)),
+            Err(BlueprintError::InvalidDuration(_))
+        ));
+
+        let mut extreme_vals = blueprint;
+        extreme_vals.slides[0].weight = f64::NAN;
+        extreme_vals.slides[1].weight = 1e308;
+        if let Some(bgm) = &mut extreme_vals.bgm {
+            bgm.gain_db = f64::NAN;
+            bgm.fade_out_seconds = f64::INFINITY;
+        }
+        let res = compile_blueprint_to_edit_command(&doc, &extreme_vals, Some(&scope))?;
+        assert_eq!(res.summary.total_frames, 10_800);
         Ok(())
     }
 }

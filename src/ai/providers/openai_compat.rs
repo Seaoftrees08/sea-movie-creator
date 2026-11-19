@@ -99,6 +99,17 @@ impl OpenAiCompatProvider {
         Self { config, label }
     }
 
+    fn is_openai_reasoning_model(&self) -> bool {
+        if !matches!(self.config.kind, AiProviderKind::OpenAi) {
+            return false;
+        }
+        let model_lower = self.config.model.to_ascii_lowercase();
+        model_lower.starts_with("o1")
+            || model_lower.starts_with("o3")
+            || model_lower.starts_with("o4")
+            || model_lower.starts_with("gpt-5")
+    }
+
     fn build_request_body(&self, request: &AiRequest, stream: bool) -> Value {
         let system_text = format!(
             "{}\n\n# EditCommand JSON Schema\n{}\n\n# Current Timeline Context\n{}",
@@ -124,7 +135,9 @@ impl OpenAiCompatProvider {
             "messages": messages,
             "stream": stream,
         });
-        if effort.is_none() || !matches!(self.config.kind, AiProviderKind::OpenAi) {
+        if !self.is_openai_reasoning_model()
+            && (effort.is_none() || !matches!(self.config.kind, AiProviderKind::OpenAi))
+        {
             body["temperature"] = json!(0.1);
         }
         if let Some(effort_str) = effort {
@@ -164,7 +177,9 @@ impl OpenAiCompatProvider {
             "messages": messages,
             "stream": false,
         });
-        if effort.is_none() || !matches!(self.config.kind, AiProviderKind::OpenAi) {
+        if !self.is_openai_reasoning_model()
+            && (effort.is_none() || !matches!(self.config.kind, AiProviderKind::OpenAi))
+        {
             body["temperature"] = json!(request.temperature.unwrap_or(0.2));
         }
         if let Some(effort_str) = effort {
@@ -221,6 +236,30 @@ impl OpenAiCompatProvider {
     }
 }
 
+fn is_likely_ollama_vision_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    [
+        "gemma3",
+        "llava",
+        "bakllava",
+        "moondream",
+        "minicpm-v",
+        "pixtral",
+        "internvl",
+        "granite-vision",
+        "llama3.2-vision",
+        "qwen2.5vl",
+        "qwen2.5-vl",
+        "qwen2-vl",
+        "qwen3-vl",
+        "vision",
+    ]
+    .iter()
+    .any(|token| m.contains(token))
+        || m.contains("-vl:")
+        || m.ends_with("-vl")
+}
+
 impl AiProvider for OpenAiCompatProvider {
     fn id(&self) -> &'static str {
         match self.config.kind {
@@ -235,7 +274,10 @@ impl AiProvider for OpenAiCompatProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        true
+        if !matches!(self.config.kind, AiProviderKind::OllamaCompat) {
+            return true;
+        }
+        is_likely_ollama_vision_model(&self.config.model)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -586,6 +628,23 @@ mod tests {
         assert_eq!(res2.tool_calls[0].arguments["path"], "C:/ol");
         let cap2 = srv2.join().map_err(|_| "join2")??;
         assert!(cap2.contains("JSON Action Mode"));
+
+        let gpt5_body = OpenAiCompatProvider::new(OpenAiCompatConfig::openai("gpt-5", None))
+            .build_agent_request_body(&turn_req);
+        assert!(gpt5_body.get("temperature").is_none());
+
+        let text_ollama = OpenAiCompatProvider::new(OpenAiCompatConfig::local_compatible(
+            "http://127.0.0.1:11434/v1",
+            "qwen3:8b",
+            None,
+        ));
+        assert!(!text_ollama.supports_vision());
+        let llama_ollama = OpenAiCompatProvider::new(OpenAiCompatConfig::local_compatible(
+            "http://127.0.0.1:11434/v1",
+            "llama3.2",
+            None,
+        ));
+        assert!(!llama_ollama.supports_vision());
         Ok(())
     }
 
