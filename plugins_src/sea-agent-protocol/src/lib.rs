@@ -380,20 +380,22 @@ fn read_ndjson_line_bounded<R: BufRead, T: DeserializeOwned>(
     reader: &mut R,
     max_bytes: usize,
 ) -> io::Result<Option<T>> {
-    let mut line = String::new();
+    let mut buf = Vec::new();
     let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
     loop {
-        line.clear();
-        let bytes = std::io::Read::take(&mut *reader, limit).read_line(&mut line)?;
+        buf.clear();
+        let bytes = std::io::Read::take(&mut *reader, limit).read_until(b'\n', &mut buf)?;
         if bytes == 0 {
             return Ok(None);
         }
-        if bytes > max_bytes && !line.ends_with('\n') {
+        if bytes > max_bytes && !buf.ends_with(b"\n") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("NDJSON line exceeds max size ({max_bytes} bytes)"),
             ));
         }
+        let line = std::str::from_utf8(&buf)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -536,6 +538,17 @@ mod tests {
             return Err("line exceeding byte bound must be rejected".to_owned());
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds max size"));
+
+        // マルチバイト UTF-8 文字の途中でサイズ上限に達してもサイズ超過エラーを返すこと
+        let multibyte = format!("{{\"msg\":\"{}\"}}\n", "あ".repeat(10));
+        let mut mb_cursor = Cursor::new(multibyte.as_bytes());
+        let Err(mb_err) = read_ndjson_line_bounded::<_, HostToAgentMessage>(&mut mb_cursor, 10)
+        else {
+            return Err("multibyte line exceeding byte bound must be rejected".to_owned());
+        };
+        assert_eq!(mb_err.kind(), io::ErrorKind::InvalidData);
+        assert!(mb_err.to_string().contains("exceeds max size"));
         Ok(())
     }
 }

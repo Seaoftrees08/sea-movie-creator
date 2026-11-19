@@ -382,7 +382,9 @@ const MAX_SESSION_FILE_BYTES: u64 = 32 * 1024 * 1024;
 struct AiSessionSummaryHeader {
     session_id: String,
     title: String,
+    #[serde(default)]
     created_at_unix_secs: u64,
+    #[serde(default)]
     updated_at_unix_secs: u64,
     #[serde(default)]
     turns: Vec<serde::de::IgnoredAny>,
@@ -579,6 +581,28 @@ mod tests {
             store.load_session("nul"),
             Err(SessionStoreError::InvalidSessionId(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_accepts_header_without_timestamps() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!(
+            "sea_session_no_ts_{}_{}",
+            std::process::id(),
+            AiSessionStore::generate_session_id()
+        ));
+        let _guard = TempDirGuard(dir.clone());
+        let store = AiSessionStore::new(&dir);
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("sess_legacy.json"),
+            r#"{"session_id":"sess_legacy","title":"古い形式","turns":[]}"#,
+        )?;
+        let loaded = store.load_session("sess_legacy")?;
+        assert_eq!(loaded.created_at_unix_secs, 0);
+        let list = store.list_sessions()?;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "sess_legacy");
         Ok(())
     }
 }

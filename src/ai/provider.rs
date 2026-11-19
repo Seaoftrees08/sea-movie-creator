@@ -1095,7 +1095,7 @@ fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
 }
 
 pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAgentTurnResponse {
-    if let Some(val) = extract_json_object_for_tools(raw_text)
+    if let Some(val) = crate::ai::planner::extract_json_object_from_text(raw_text)
         && let Some(calls_arr) = val.get("tool_calls").and_then(serde_json::Value::as_array)
     {
         let mut parsed_calls = Vec::new();
@@ -1139,23 +1139,6 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
         model: model.to_owned(),
         finish_reason: Some("stop".to_owned()),
     }
-}
-
-fn extract_json_object_for_tools(raw: &str) -> Option<serde_json::Value> {
-    let trimmed = raw.trim();
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && val.is_object()
-    {
-        return Some(val);
-    }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
-        .ok()
-        .filter(serde_json::Value::is_object)
 }
 
 #[cfg(test)]
@@ -1209,5 +1192,11 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "inspect_media_folder");
         assert_eq!(parsed.tool_calls[0].arguments["path"], "C:/photos");
         assert_eq!(parsed.text.as_deref(), Some("スキャン開始"));
+
+        // 前後の説明文に波括弧 {foo} が含まれていても最初の有効なツール JSON を抽出できること
+        let prose = "前提 {foo} を確認し、次の JSON を実行します: {\"tool_calls\":[{\"name\":\"validate_draft_plan\",\"arguments\":{}}]} 補足 {bar}";
+        let parsed_prose = parse_fallback_agent_response(prose, "ollama:qwen3");
+        assert_eq!(parsed_prose.tool_calls.len(), 1);
+        assert_eq!(parsed_prose.tool_calls[0].name, "validate_draft_plan");
     }
 }

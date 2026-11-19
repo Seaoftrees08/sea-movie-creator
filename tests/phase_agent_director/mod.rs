@@ -649,9 +649,9 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
         .iter()
         .filter(|item| item["vision_analyzed"].as_bool() == Some(true))
         .count();
-    assert!(
-        vision_done >= 4,
-        "expected first batch of 4 images preserved despite 429 on batch 2, got {vision_done}"
+    assert_eq!(
+        vision_done, 4,
+        "expected only first batch of 4 analyzed images marked vision_analyzed=true despite partial 429 on batch 2, got {vision_done}"
     );
     let _ = controller.cancel_ai_prompt();
 

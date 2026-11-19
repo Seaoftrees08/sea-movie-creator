@@ -525,7 +525,7 @@ impl SeaEditorWindow {
                 self.controller.ai_chat.last_error = Some(err);
             }
         }
-        cx.notify();
+        self.sync_widgets_from_controller(cx);
     }
 
     fn on_ai_provider_select(

@@ -1091,9 +1091,7 @@ impl AppController {
     ///
     /// ストア未初期化、指定セッション読込失敗、または再開起動失敗時。
     pub fn open_saved_ai_session(&mut self, session_id: &str) -> Result<(), String> {
-        self.open_saved_ai_session_with_provider(session_id, None, None)?;
-        self.ai_chat.agent_provider_override = None;
-        Ok(())
+        self.open_saved_ai_session_with_provider(session_id, None, None)
     }
 
     /// 指定プロバイダ・任意プラグインを使って保存済みセッションを読み込み復元する（テスト兼用）。
@@ -1122,9 +1120,9 @@ impl AppController {
         }
         self.apply_restored_session_record(rec);
 
+        self.ai_chat.agent_provider_override.clone_from(&provider);
         let resolved_provider =
             provider.unwrap_or_else(|| Arc::from(self.ai_chat.build_provider()));
-        self.ai_chat.agent_provider_override = Some(Arc::clone(&resolved_provider));
         self.spawn_resumed_agent_if_needed(resolved_provider, plugin_override);
         self.ai_chat.refresh_session_history();
         "セッションを復元しました（続けて調整指示を出せます）"
@@ -1144,6 +1142,12 @@ impl AppController {
         self.ai_chat.session_title = rec.title;
         self.ai_chat.session_created_at_unix_secs = rec.created_at_unix_secs;
         if let Some(p) = rec.provider {
+            if rec.model_name.is_empty() {
+                p.preferred_default_model()
+                    .clone_into(&mut self.ai_chat.model_name);
+            }
+            p.default_base_url()
+                .clone_into(&mut self.ai_chat.custom_base_url);
             self.ai_chat.selected_provider = p;
         }
         if !rec.model_name.is_empty() {
@@ -1285,6 +1289,7 @@ impl AppController {
             self.ai_chat.agent_busy = false;
             self.ai_chat.agent_step_status = None;
             self.ai_chat.pending_question = None;
+            self.ai_chat.ask_field_values.clear();
             self.ai_chat.pending_tool_approval = None;
             if was_busy {
                 "エージェント実行を停止しました".clone_into(&mut self.ai_chat.status_banner);
@@ -2578,7 +2583,7 @@ fn render_prompt_composer(
             .label(tr("ai.stop"))
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.controller.cancel_ai_prompt() {
-                    cx.notify();
+                    this.sync_widgets_from_controller(cx);
                 }
             }))
     } else {
@@ -2848,6 +2853,56 @@ mod tests {
 
         let names = matching_at_mention_names(&controller.document, "");
         assert_eq!(names.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn open_saved_session_resets_custom_base_url_and_clears_override()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ai::session_store::{AiSessionRecord, AiSessionStore};
+
+        let dir = std::env::temp_dir().join(format!(
+            "sea_restore_prov_{}_{}",
+            std::process::id(),
+            AiSessionStore::generate_session_id()
+        ));
+        let store = AiSessionStore::new(&dir);
+        let rec = AiSessionRecord {
+            schema_version: 1,
+            session_id: "sess_restore_gemini".to_owned(),
+            title: "Gemini セッション".to_owned(),
+            created_at_unix_secs: 1,
+            updated_at_unix_secs: 2,
+            provider: Some(AiProviderKind::Gemini),
+            agent_plugin_id: None,
+            model_name: "gemini-2.5-flash".to_owned(),
+            thinking_level: AiThinkingLevel::Auto,
+            approval_mode: AiApprovalMode::Manual,
+            attached_folders: Vec::new(),
+            turns: Vec::new(),
+            pending_question: None,
+            agent_memory: serde_json::Value::Null,
+        };
+        store.save_session(&rec)?;
+
+        let mut controller = AppController::new();
+        controller.ai_chat.session_store = Some(store);
+        controller
+            .ai_chat
+            .select_provider(AiProviderKind::OllamaCompat);
+        controller.ai_chat.agent_provider_override =
+            Some(std::sync::Arc::new(MockAiProvider::new()));
+        assert!(controller.ai_chat.custom_base_url.contains("11434"));
+
+        controller.open_saved_ai_session_with_provider("sess_restore_gemini", None, None)?;
+        assert_eq!(controller.ai_chat.selected_provider, AiProviderKind::Gemini);
+        assert_eq!(
+            controller.ai_chat.custom_base_url,
+            AiProviderKind::Gemini.default_base_url()
+        );
+        assert!(controller.ai_chat.agent_provider_override.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

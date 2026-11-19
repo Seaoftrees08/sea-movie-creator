@@ -509,6 +509,7 @@ impl AppController {
         self.ai_chat.can_one_click_undo = false;
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
+        self.ai_chat.ask_field_values.clear();
         self.ai_chat.pending_tool_approval = None;
         self.document = ProjectDocument::new("Untitled Project");
         self.last_saved_document = self.document.clone();
@@ -544,6 +545,7 @@ impl AppController {
         self.ai_chat.can_one_click_undo = false;
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
+        self.ai_chat.ask_field_values.clear();
         self.ai_chat.pending_tool_approval = None;
         let project_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
 

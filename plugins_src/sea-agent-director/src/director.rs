@@ -394,10 +394,13 @@ fn run_vision_analysis_batches(
 fn is_vision_unsupported_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     [
-        "vision",
+        "does not support vision",
+        "vision not supported",
+        "vision is not supported",
         "does not support image",
-        "multimodal",
-        "image input",
+        "image input not supported",
+        "multimodal not supported",
+        "not a vision model",
         "not supported",
     ]
     .iter()
@@ -555,10 +558,13 @@ fn apply_vision_results_to_memory(
     target_indices: &[usize],
     tool_res: &Value,
 ) {
+    let is_partial = tool_res.get("partial").and_then(Value::as_bool) == Some(true);
     let Some(arr) = tool_res.get("analyses").and_then(Value::as_array) else {
-        for &idx in target_indices {
-            if let Some(slot) = images.get_mut(idx) {
-                slot.vision_analyzed = true;
+        if !is_partial {
+            for &idx in target_indices {
+                if let Some(slot) = images.get_mut(idx) {
+                    slot.vision_analyzed = true;
+                }
             }
         }
         return;
@@ -570,7 +576,7 @@ fn apply_vision_results_to_memory(
         let matched = arr
             .iter()
             .find(|v| v.get("path").and_then(Value::as_str) == Some(slot.path.as_str()))
-            .or_else(|| arr.get(pos));
+            .or_else(|| (!is_partial).then(|| arr.get(pos)).flatten());
         if let Some(item) = matched {
             if let Some(s) = item.get("scene_description").and_then(Value::as_str) {
                 s.clone_into(&mut slot.scene_description);
@@ -587,8 +593,8 @@ fn apply_vision_results_to_memory(
             if let Some(s) = item.get("recommended_motion").and_then(Value::as_str) {
                 s.clone_into(&mut slot.recommended_motion);
             }
+            slot.vision_analyzed = true;
         }
-        slot.vision_analyzed = true;
     }
 }
 
@@ -1466,5 +1472,56 @@ mod tests {
         });
         normalize_blueprint_candidate(&mut no_bgm_bp, &session, 60.0);
         assert!(no_bgm_bp["bgm"].is_null());
+    }
+
+    #[test]
+    fn apply_vision_partial_marks_only_matched_and_errors_filter_timeouts() {
+        assert!(!is_vision_unsupported_error("vision request timed out"));
+        assert!(!is_vision_unsupported_error("vision api 500"));
+        assert!(is_vision_unsupported_error(
+            "Model does not support image input"
+        ));
+
+        let mut images = vec![
+            AnalyzedImageMeta {
+                path: "D:/wedding/01.jpg".to_owned(),
+                relative_path: "01.jpg".to_owned(),
+                file_name: "01.jpg".to_owned(),
+                width: 1920,
+                height: 1080,
+                exif_datetime: None,
+                scene_description: String::new(),
+                suggested_chapter: String::new(),
+                suggested_subtitle: String::new(),
+                mood: "warm".to_owned(),
+                recommended_motion: "zoom_in".to_owned(),
+                vision_analyzed: false,
+            },
+            AnalyzedImageMeta {
+                path: "D:/wedding/02.jpg".to_owned(),
+                relative_path: "02.jpg".to_owned(),
+                file_name: "02.jpg".to_owned(),
+                width: 1920,
+                height: 1080,
+                exif_datetime: None,
+                scene_description: String::new(),
+                suggested_chapter: String::new(),
+                suggested_subtitle: String::new(),
+                mood: "warm".to_owned(),
+                recommended_motion: "zoom_in".to_owned(),
+                vision_analyzed: false,
+            },
+        ];
+        let partial_res = json!({
+            "partial": true,
+            "analyses": [{
+                "path": "D:/wedding/01.jpg",
+                "suggested_subtitle": "新郎の幼少期"
+            }]
+        });
+        apply_vision_results_to_memory(&mut images, &[0, 1], &partial_res);
+        assert!(images[0].vision_analyzed);
+        assert_eq!(images[0].suggested_subtitle, "新郎の幼少期");
+        assert!(!images[1].vision_analyzed);
     }
 }

@@ -822,9 +822,8 @@ impl AgentSessionRunner {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if let Ok(mut guard) = self.child.lock()
-            && let Some(mut child) = guard.take()
-        {
+        let child = self.child.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
             self.alive.store(false, Ordering::Release);

@@ -485,7 +485,7 @@ fn execute_vision_batches(
         if ctx.is_cancelled() {
             return Ok(partial_vision_json(
                 &all_analyses,
-                false,
+                used_vision_ok && !all_analyses.is_empty(),
                 total,
                 "cancelled",
                 "vision analysis cancelled by user",
@@ -497,7 +497,7 @@ fn execute_vision_batches(
         if let Err(cancel_msg) = ctx.throttle_before_llm_call() {
             return Ok(partial_vision_json(
                 &all_analyses,
-                false,
+                used_vision_ok && !all_analyses.is_empty(),
                 total,
                 "cancelled",
                 &cancel_msg,
@@ -587,9 +587,13 @@ fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
         } => {
             let lower = body.to_ascii_lowercase();
             let unsupported = [
-                "vision",
-                "image",
-                "multimodal",
+                "does not support vision",
+                "vision not supported",
+                "vision is not supported",
+                "does not support image",
+                "image input not supported",
+                "multimodal not supported",
+                "not a vision",
                 "does not support",
                 "not supported",
                 "unknown variant",
@@ -700,15 +704,13 @@ fn run_single_vision_batch(
 }
 
 fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<Value>> {
-    let trimmed = raw.trim();
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
+    let val = crate::ai::planner::extract_json_object_from_text(raw)?;
+    let arr = val.get("analyses")?.as_array()?;
+    if arr.is_empty() {
         return None;
     }
-    let val: Value = serde_json::from_str(&trimmed[start..=end]).ok()?;
-    let arr = val.get("analyses")?.as_array()?;
     let mut out = Vec::with_capacity(valid_paths.len());
+    let mut matched_count = 0_usize;
     for (idx, default_path) in valid_paths.iter().enumerate() {
         let matched = arr
             .iter()
@@ -716,6 +718,7 @@ fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<V
             .or_else(|| arr.get(idx))
             .and_then(Value::as_object);
         if let Some(item_map) = matched {
+            matched_count += 1;
             let mut obj_map = item_map.clone();
             // LLM がハルシネーションやインジェクションで別パスを返しても正規実パスで上書きする
             obj_map.insert("path".to_owned(), Value::String(default_path.clone()));
@@ -724,7 +727,7 @@ fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<V
             out.push(build_filename_fallback_analysis(default_path));
         }
     }
-    Some(out)
+    (matched_count > 0).then_some(out)
 }
 
 fn build_filename_fallback_analysis(path: &str) -> Value {
@@ -1086,5 +1089,24 @@ mod tests {
         );
         assert_ne!(logs.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn parse_vision_analyses_empty_or_unmatched_triggers_fallback() {
+        let valid = vec!["D:/wedding/01.jpg".to_owned()];
+        assert!(parse_vision_analyses_json(r#"{"analyses":[]}"#, &valid).is_none());
+        assert!(parse_vision_analyses_json(r#"{"analyses":["not_an_object"]}"#, &valid).is_none());
+        // 説明文に {note} が混在しても後続 JSON を正しく抽出できること
+        let prose_res = parse_vision_analyses_json(
+            "補足 {ignored} です:\n{\"analyses\":[{\"index\":0,\"path\":\"evil\",\"suggested_subtitle\":\"素敵な笑顔\"}]}",
+            &valid,
+        );
+        assert_eq!(
+            prose_res
+                .as_ref()
+                .and_then(|v| v.first())
+                .and_then(|v| v["path"].as_str()),
+            Some("D:/wedding/01.jpg")
+        );
     }
 }

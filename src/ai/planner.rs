@@ -215,6 +215,45 @@ fn parse_command_candidate(
     ))
 }
 
+/// テキスト（素 JSON・コードフェンス内・説明文混在）から最初の有効な JSON オブジェクトを抽出する。
+#[must_use]
+pub(crate) fn extract_json_object_from_text(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+        && val.is_object()
+    {
+        return Some(val);
+    }
+    for (_, _, json_body) in scan_fenced_blocks(trimmed) {
+        if let Some(body) = json_body
+            && let Some(val) = parse_first_balanced_json_object(&body)
+        {
+            return Some(val);
+        }
+    }
+    parse_first_balanced_json_object(trimmed)
+}
+
+fn parse_first_balanced_json_object(raw: &str) -> Option<Value> {
+    let mut offset = 0_usize;
+    while let Some(rel_brace) = raw[offset..].find('{') {
+        let brace_pos = offset + rel_brace;
+        if let Some((0, rel_end)) = find_first_balanced_json_span(&raw[brace_pos..]) {
+            let candidate = &raw[brace_pos..brace_pos + rel_end];
+            if let Ok(val) = serde_json::from_str::<Value>(candidate)
+                && val.is_object()
+            {
+                return Some(val);
+            }
+        }
+        offset = brace_pos + 1;
+    }
+    None
+}
+
 fn scan_fenced_blocks(raw: &str) -> Vec<(usize, usize, Option<String>)> {
     let mut blocks = Vec::new();
     let mut offset = 0_usize;

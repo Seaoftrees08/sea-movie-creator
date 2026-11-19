@@ -248,7 +248,7 @@ pub(crate) fn render_session_history_drawer(
                             if let Err(err) = this.controller.delete_saved_ai_session(&del_id) {
                                 this.controller.ai_chat.last_error = Some(err);
                             }
-                            cx.notify();
+                            this.sync_widgets_from_controller(cx);
                         })),
                 ),
         );

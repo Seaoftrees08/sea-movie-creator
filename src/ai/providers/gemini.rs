@@ -112,8 +112,13 @@ impl GeminiProvider {
     }
 
     fn validate_model_id(&self) -> Result<(), AiError> {
-        let model = self.config.model.trim();
-        if model.is_empty() || model.contains(['/', '?', '#', '\\', ' ']) || model.contains("..") {
+        let model = self.config.model.as_str();
+        if model.is_empty()
+            || model.contains("..")
+            || !model
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
             return Err(AiError::Transport(format!(
                 "invalid Gemini model identifier: {}",
                 self.config.model
@@ -499,7 +504,13 @@ mod tests {
         assert!(captured.contains("inlineData"));
         assert!(captured.contains("functionDeclarations"));
         assert!(captured.contains("parametersJsonSchema"));
+        Ok(())
+    }
 
+    #[test]
+    fn gemini_merges_tool_results_filters_thoughts_and_validates_model_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = GeminiProvider::new(GeminiConfig::new("gemini-2.5-flash", None));
         // 並列 ToolResult の単一 user ターン統合、System -> systemInstruction、responseJsonSchema、thought 除外を検証
         let multi_req = AiAgentTurnRequest {
             system_prompt: "Director".to_owned(),
@@ -561,6 +572,10 @@ mod tests {
 
         let bad_model = GeminiProvider::new(GeminiConfig::new("gemini-2.5/../../evil", None));
         assert!(bad_model.validate_model_id().is_err());
+        let encoded_model = GeminiProvider::new(GeminiConfig::new("gemini-2.5%2fevil", None));
+        assert!(encoded_model.validate_model_id().is_err());
+        let colon_model = GeminiProvider::new(GeminiConfig::new("gemini:evil", None));
+        assert!(colon_model.validate_model_id().is_err());
         Ok(())
     }
 
