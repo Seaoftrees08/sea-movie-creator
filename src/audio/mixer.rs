@@ -1,6 +1,6 @@
 //! タイムライン音声クリップの合成、`PlaybackRate` 時間伸縮、アニメーション音量/パン評価、ソフトリミッタ。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -111,6 +111,25 @@ impl AudioMixer {
     #[must_use]
     pub fn get_pcm(&self, asset_id: &AssetId) -> Option<&Arc<DecodedAudioPcm>> {
         self.sources.get(asset_id)
+    }
+
+    /// 現在ドキュメント上に存在するアセット ID 群以外の PCM・リサンプル・波形キャッシュを解放する。
+    pub fn retain_assets(&mut self, valid_ids: &HashSet<AssetId>) {
+        let removed: Vec<AssetId> = self
+            .sources
+            .keys()
+            .filter(|id| !valid_ids.contains(*id))
+            .cloned()
+            .collect();
+        if let Ok(mut wf) = self.waveform_cache.lock() {
+            for id in &removed {
+                wf.invalidate_asset(id);
+            }
+        }
+        self.sources.retain(|id, _| valid_ids.contains(id));
+        if let Ok(mut guard) = self.prepared_cache.lock() {
+            guard.retain(|k, _| valid_ids.contains(&k.asset_id));
+        }
     }
 
     /// 登録済みデコード音声ソースの `Arc` 参照を共有する軽量ミキサ複製を返す（バックグラウンド波形生成用）。

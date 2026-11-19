@@ -35,6 +35,7 @@
 | 003 | タイムラインクリップ表示・再生FPS・音声再生・プレビュー画質の抜本改修 | Implemented | [`completed/003-playback-audio-quality-and-clip-tile-fix.md`](completed/003-playback-audio-quality-and-clip-tile-fix.md) |
 | - | 市場調査・開発戦略レポート | Reference | [`loadmap/Market Research.md`](loadmap/Market%20Research.md) |
 | - | 機能モジュール・プラグイン開発ロードマップ（要件・優先順位） | Draft | [`loadmap/Plugin Loadmap.md`](loadmap/Plugin%20Loadmap.md) |
+| - | 自律エージェントプラグイン 将来拡張メモ | Memo | [`loadmap/Agent-Future-Features.md`](loadmap/Agent-Future-Features.md) |
 | 004 | Phase P0 設計書：本体前提基盤機能モジュール（キャラプリセット・連続字幕入力・APIキーガイド・プラグイン統合窓口） | Draft | [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md) |
 | 005 | Phase P1 設計書：音声作成機能モジュール＆外部 TTS プラグイン（TTS 連携・尺自動伸縮・リップル・間・キャッシュ） | Draft | [`005-phase-p1-tts-voice-plugin.md`](005-phase-p1-tts-voice-plugin.md) |
 | 006 | Phase P2 設計書：感情連動立ち絵・定番演出自動配置（機能モジュール） | Draft | [`006-phase-p2-tachie-ai-effects-plugin.md`](006-phase-p2-tachie-ai-effects-plugin.md) |

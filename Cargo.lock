@@ -6220,6 +6220,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sea-agent-director"
+version = "0.1.0"
+dependencies = [
+ "sea-agent-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sea-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sea-ai-acp"
 version = "0.1.0"
 dependencies = [
@@ -6316,6 +6333,7 @@ dependencies = [
  "rav1e",
  "rubato",
  "schemars",
+ "sea-agent-protocol",
  "sea-export-protocol",
  "serde",
  "serde_json",

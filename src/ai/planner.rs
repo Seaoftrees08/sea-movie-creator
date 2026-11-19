@@ -101,25 +101,23 @@ fn extract_edit_command_and_note(
     Err(AiPlanError::InvalidJsonCommand(last_err))
 }
 
-/// モデル出力をパースしたうえで複製ドキュメント上でドライランし、安全な [`AiEditPlan`] を生成する。
+/// すでにデシリアライズ済みの [`EditCommand`] を複製ドキュメント上で直接ドライラン検証する。
 ///
-/// 呼び出し元の `doc` および履歴には一切の副作用を残さない。
-/// 空のバッチ (`{"type":"batch","commands":[]}`) は変更なしの有効な応答（no-op 計画）として受理する。
+/// 不要な JSON 再シリアライズ／再パースを行わずに検証済み [`AiEditPlan`] を構築したい場合に利用します。
 ///
 /// # Errors
 ///
-/// JSON 不正またはドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
-pub fn dry_run_validate(
+/// ドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
+pub fn dry_run_validate_command(
     doc: &ProjectDocument,
-    raw_response: &str,
+    command: EditCommand,
+    reply_note: Option<String>,
 ) -> Result<AiEditPlan, AiPlanError> {
-    let (raw_json, command, reply_note) = extract_edit_command_and_note(raw_response)?;
     let is_no_op = matches!(&command, EditCommand::Batch { commands } if commands.is_empty());
-
     if is_no_op {
         doc.validate().map_err(CommandError::from)?;
         return Ok(AiEditPlan {
-            raw_json,
+            raw_json: String::new(),
             command,
             reply_note,
             summary_lines: vec!["タイムライン変更なし（0 ステップ）".to_owned()],
@@ -136,12 +134,30 @@ pub fn dry_run_validate(
     summarize_command(&command, &mut summary_lines, &mut affected_targets);
 
     Ok(AiEditPlan {
-        raw_json,
+        raw_json: String::new(),
         command,
         reply_note,
         summary_lines,
         affected_targets,
     })
+}
+
+/// モデル出力をパースしたうえで複製ドキュメント上でドライランし、安全な [`AiEditPlan`] を生成する。
+///
+/// 呼び出し元の `doc` および履歴には一切の副作用を残さない。
+/// 空のバッチ (`{"type":"batch","commands":[]}`) は変更なしの有効な応答（no-op 計画）として受理する。
+///
+/// # Errors
+///
+/// JSON 不正またはドキュメント不変条件・存在チェック違反時に [`AiPlanError`] を返す。
+pub fn dry_run_validate(
+    doc: &ProjectDocument,
+    raw_response: &str,
+) -> Result<AiEditPlan, AiPlanError> {
+    let (raw_json, command, reply_note) = extract_edit_command_and_note(raw_response)?;
+    let mut plan = dry_run_validate_command(doc, command, reply_note)?;
+    plan.raw_json = raw_json;
+    Ok(plan)
 }
 
 /// 検証済み計画を実際のドキュメントと [`CommandDispatcher`] へ単一ステップ（単一 Undo 単位）で適用する。
@@ -197,6 +213,45 @@ fn parse_command_candidate(
             .err()
             .map_or_else(|| "unknown schema error".to_owned(), |e| e.to_string())
     ))
+}
+
+/// テキスト（素 JSON・コードフェンス内・説明文混在）から最初の有効な JSON オブジェクトを抽出する。
+#[must_use]
+pub(crate) fn extract_json_object_from_text(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+        && val.is_object()
+    {
+        return Some(val);
+    }
+    for (_, _, json_body) in scan_fenced_blocks(trimmed) {
+        if let Some(body) = json_body
+            && let Some(val) = parse_first_balanced_json_object(&body)
+        {
+            return Some(val);
+        }
+    }
+    parse_first_balanced_json_object(trimmed)
+}
+
+fn parse_first_balanced_json_object(raw: &str) -> Option<Value> {
+    let mut offset = 0_usize;
+    while let Some(rel_brace) = raw[offset..].find('{') {
+        let brace_pos = offset + rel_brace;
+        if let Some((0, rel_end)) = find_first_balanced_json_span(&raw[brace_pos..]) {
+            let candidate = &raw[brace_pos..brace_pos + rel_end];
+            if let Ok(val) = serde_json::from_str::<Value>(candidate)
+                && val.is_object()
+            {
+                return Some(val);
+            }
+        }
+        offset = brace_pos + 1;
+    }
+    None
 }
 
 fn scan_fenced_blocks(raw: &str) -> Vec<(usize, usize, Option<String>)> {
