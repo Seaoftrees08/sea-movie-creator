@@ -50,6 +50,7 @@ cargo test --workspace --all-targets --all-features
   - [はじめに（導入・ビルド・起動方法）](docs/getting-started.md)
   - [ユーザーガイド（画面構成・編集・書き出し）](docs/user-guide.md)
   - [AI 連携・MCP・音声プラグインガイド](docs/ai-and-plugins.md)
+  - [プラグイン開発ガイド（書き出し / MCP / VST3・CLAP / コントリビューション）](docs/plugin-development.md)
   - [多言語ファイル (`lang/*.json`) 作成ガイド](docs/localization.md)
   - [トラブルシューティング・FAQ](docs/troubleshooting.md)
 - 開発設計ドキュメント: [dev-doc/README.md](dev-doc/README.md)
