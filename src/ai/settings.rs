@@ -495,6 +495,7 @@ impl AiUserSettings {
                         "custom_models.{provider_key} に空の model id が含まれています"
                     ));
                 }
+                validate_context_window_tokens(model.context_window_tokens)?;
                 validate_optional_price(model.input_price_per_1m_usd, "input_price_per_1m_usd")?;
                 validate_optional_price(model.output_price_per_1m_usd, "output_price_per_1m_usd")?;
             }
@@ -592,11 +593,35 @@ impl AiUserSettings {
             .map_or(&[], |(_, v)| v.as_slice())
     }
 
+    fn consolidate_custom_models_key(&mut self, canonical: &str) {
+        let matching: Vec<String> = self
+            .custom_models
+            .keys()
+            .filter(|k| AiProviderKind::normalize_settings_key(k) == canonical)
+            .cloned()
+            .collect();
+        let mut combined: Vec<AiCustomModelConfig> = Vec::new();
+        for key in matching {
+            if let Some(items) = self.custom_models.remove(&key) {
+                for item in items {
+                    if let Some(pos) = combined.iter().position(|existing| existing.id == item.id) {
+                        combined[pos] = item;
+                    } else {
+                        combined.push(item);
+                    }
+                }
+            }
+        }
+        if !combined.is_empty() {
+            self.custom_models.insert(canonical.to_owned(), combined);
+        }
+    }
+
     /// カスタマイズ可能プロバイダへカスタムモデルを追加または上書き更新する。
     ///
     /// # Errors
     ///
-    /// 固定モデル CLI プロバイダ指定時、モデル ID 空欄時、または単価が不正な場合にエラーを返す。
+    /// 固定モデル CLI プロバイダ指定時、モデル ID 空欄時、またはコンテキスト長・単価が不正な場合にエラーを返す。
     pub fn upsert_custom_model(
         &mut self,
         kind: &AiProviderKind,
@@ -613,6 +638,7 @@ impl AiUserSettings {
         if model.id.is_empty() {
             return Err("モデル ID を入力してください".to_owned());
         }
+        validate_context_window_tokens(model.context_window_tokens)?;
         validate_optional_price(model.input_price_per_1m_usd, "input_price_per_1m_usd")?;
         validate_optional_price(model.output_price_per_1m_usd, "output_price_per_1m_usd")?;
         model.display_name = model
@@ -621,6 +647,7 @@ impl AiUserSettings {
             .filter(|n| !n.is_empty());
 
         let canonical = kind.settings_key();
+        self.consolidate_custom_models_key(&canonical);
         let entry = self.custom_models.entry(canonical).or_default();
         if let Some(existing) = entry.iter_mut().find(|m| m.id == model.id) {
             *existing = model;
@@ -633,6 +660,7 @@ impl AiUserSettings {
     /// 指定プロバイダのカスタムモデルを削除する（削除できたら `true`）。
     pub fn remove_custom_model(&mut self, kind: &AiProviderKind, model_id: &str) -> bool {
         let canonical = kind.settings_key();
+        self.consolidate_custom_models_key(&canonical);
         let trimmed = model_id.trim();
         let Some(list) = self.custom_models.get_mut(&canonical) else {
             return false;
@@ -656,18 +684,23 @@ impl AiUserSettings {
         if !kind.supports_custom_models() && !discovered.is_empty() {
             return discovered
                 .iter()
-                .map(|entry| ResolvedAiModel {
-                    id: entry.id.clone(),
-                    display_name: entry.display_name.clone(),
-                    badge: entry.badge.clone(),
-                    thinking_levels: entry.thinking_levels.clone(),
-                    default_thinking: entry.default_thinking,
-                    context_window_tokens: entry.context_window_tokens,
-                    input_price_per_1m_usd: None,
-                    output_price_per_1m_usd: None,
-                    is_custom: false,
-                    available: entry.available,
-                    availability_note: entry.note.clone(),
+                .map(|entry| {
+                    let preset = kind.model_preset(&entry.id);
+                    ResolvedAiModel {
+                        id: entry.id.clone(),
+                        display_name: entry.display_name.clone(),
+                        badge: entry.badge.clone(),
+                        thinking_levels: entry.thinking_levels.clone(),
+                        default_thinking: entry.default_thinking,
+                        context_window_tokens: entry
+                            .context_window_tokens
+                            .or_else(|| preset.and_then(|p| p.context_window_tokens)),
+                        input_price_per_1m_usd: None,
+                        output_price_per_1m_usd: None,
+                        is_custom: false,
+                        available: entry.available,
+                        availability_note: entry.note.clone(),
+                    }
                 })
                 .collect();
         }
@@ -690,6 +723,13 @@ impl AiUserSettings {
         }
         merged
     }
+}
+
+fn validate_context_window_tokens(value: Option<u64>) -> Result<(), String> {
+    if value == Some(0) {
+        return Err("context_window_tokens は 1 以上の正の整数である必要があります".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_optional_price(value: Option<f64>, field: &str) -> Result<(), String> {
@@ -727,6 +767,8 @@ fn read_runtime_file(path: &Path) -> Option<AgentRuntimeSettings> {
 }
 
 fn atomic_write_text(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
     let seq = TEMP_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let file_name = path
@@ -734,7 +776,20 @@ fn atomic_write_text(path: &Path, text: &str) -> Result<(), std::io::Error> {
         .and_then(|n| n.to_str())
         .unwrap_or("ai_settings");
     let tmp_path = path.with_file_name(format!("{file_name}.tmp.{pid}.{seq}"));
-    fs::write(&tmp_path, text.as_bytes())?;
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_opts.mode(0o600);
+    }
+    let mut file = open_opts.open(&tmp_path)?;
+    if let Err(err) = file.write_all(text.as_bytes()).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
@@ -879,5 +934,65 @@ mod tests {
         assert_eq!(loaded.runtime.max_steps_per_turn, 42);
         assert_eq!(loaded.runtime.min_llm_interval_ms, 2000);
         Ok(())
+    }
+
+    #[test]
+    fn cli_probe_inherits_preset_context_window_and_custom_models_handle_aliases_and_zero_ctx() {
+        let agy = AiProviderKind::Plugin {
+            plugin_id: "sea.ai.antigravity".to_owned(),
+        };
+        let resolved = AiUserSettings::default().resolve_models_with_discovered(
+            &agy,
+            &[ProbedModelEntry {
+                id: "gemini-4-hydrogen".to_owned(),
+                display_name: "Gemini 4 Hydrogen".to_owned(),
+                badge: Some("Live CLI".to_owned()),
+                thinking_levels: vec![AiThinkingLevel::Low, AiThinkingLevel::Medium],
+                default_thinking: AiThinkingLevel::Medium,
+                context_window_tokens: None,
+                available: true,
+                note: Some("検出済み".to_owned()),
+            }],
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].context_window_tokens, Some(1_000_000));
+
+        // 0 コンテキスト長は validate と upsert の両方で拒否される
+        let zero_json = r#"{"schema_version":1,"custom_models":{"openrouter":[{"id":"x/zero","context_window_tokens":0}]}}"#;
+        assert!(AiUserSettings::parse_and_validate_json(zero_json).is_err());
+
+        let mut raw_settings = AiUserSettings::default();
+        assert!(
+            raw_settings
+                .upsert_custom_model(
+                    &AiProviderKind::OpenRouter,
+                    AiCustomModelConfig {
+                        id: "x/zero".to_owned(),
+                        display_name: None,
+                        thinking_levels: Vec::new(),
+                        default_thinking: None,
+                        context_window_tokens: Some(0),
+                        input_price_per_1m_usd: None,
+                        output_price_per_1m_usd: None,
+                    },
+                )
+                .is_err()
+        );
+
+        // エイリアスキー ("openrouter") をそのまま持つ未正規化構造体からも統合削除できる
+        raw_settings.custom_models.insert(
+            "openrouter".to_owned(),
+            vec![AiCustomModelConfig {
+                id: "alias/model".to_owned(),
+                display_name: None,
+                thinking_levels: Vec::new(),
+                default_thinking: None,
+                context_window_tokens: Some(64_000),
+                input_price_per_1m_usd: None,
+                output_price_per_1m_usd: None,
+            }],
+        );
+        assert!(raw_settings.remove_custom_model(&AiProviderKind::OpenRouter, "alias/model"));
+        assert!(raw_settings.custom_models.is_empty());
     }
 }

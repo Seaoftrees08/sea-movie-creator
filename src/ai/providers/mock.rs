@@ -206,11 +206,8 @@ impl AiProvider for MockAiProvider {
         }
 
         let usage = AiTokenUsage::estimate_from_chars(
-            request
-                .system_prompt
-                .len()
-                .saturating_add(request.user_prompt.len()),
-            raw_text.len(),
+            request.estimated_input_chars(),
+            raw_text.chars().count(),
         );
         let response = AiResponse {
             raw_text,

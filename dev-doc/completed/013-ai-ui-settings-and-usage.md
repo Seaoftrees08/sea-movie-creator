@@ -9,8 +9,8 @@
   - 自律エージェントプラグイン基盤設計書（完了済み）: [`012-agentic-plugin-architecture.md`](012-agentic-plugin-architecture.md)
   - Phase P0 設計書（API キーガイド関連）: [`../004-phase-p0-core-prerequisites.md`](../004-phase-p0-core-prerequisites.md)
   - プラグインプロトコル互換性ポリシー: [`../011-plugin-protocol-compatibility-policy.md`](../011-plugin-protocol-compatibility-policy.md)
-  - 導入・ビルド・起動方法: [`../docs/getting-started.md`](../../docs/getting-started.md)
-  - AI 連携・MCP・AI CLI プラグイン開発ガイド: [`../docs/plugins/ai-and-mcp.md`](../../docs/plugins/ai-and-mcp.md)
+  - 導入・ビルド・起動方法: [`../../docs/getting-started.md`](../../docs/getting-started.md)
+  - AI 連携・MCP・AI CLI プラグイン開発ガイド: [`../../docs/plugins/ai-and-mcp.md`](../../docs/plugins/ai-and-mcp.md)
 
 ---
 

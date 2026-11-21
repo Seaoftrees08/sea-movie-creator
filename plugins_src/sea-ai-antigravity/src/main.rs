@@ -639,20 +639,34 @@ fn run_list_models(params: &CallParams) -> Result<(), String> {
     let mut reader = BufReader::new(stdout);
     let mut streamed = String::new();
 
-    write_jsonrpc_line(&mut child_stdin, &build_initialize_request(1))?;
-    let _init = read_acp_until_response(&mut reader, &mut child_stdin, 1, &mut streamed)?;
-    write_jsonrpc_line(
-        &mut child_stdin,
-        &build_session_new_request(2, sandbox_dir.path()),
-    )?;
-    let session_resp = read_acp_until_response(&mut reader, &mut child_stdin, 2, &mut streamed)?;
+    let probe_res = (|| -> Result<Value, String> {
+        write_jsonrpc_line(&mut child_stdin, &build_initialize_request(1))?;
+        let _init = read_acp_until_response(&mut reader, &mut child_stdin, 1, &mut streamed)?;
+        write_jsonrpc_line(
+            &mut child_stdin,
+            &build_session_new_request(2, sandbox_dir.path()),
+        )?;
+        read_acp_until_response(&mut reader, &mut child_stdin, 2, &mut streamed)
+    })();
     drop(child_stdin);
 
+    if probe_res.is_err() {
+        let _ = child.kill();
+    }
     let output = child
         .wait_with_output()
         .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let session_resp = match probe_res {
+        Ok(resp) => resp,
+        Err(err) => {
+            if stderr.is_empty() {
+                return Err(err);
+            }
+            return Err(format!("{err} ({stderr})"));
+        }
+    };
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!(
             "`agy acp` モデル取得が終了コード {} で失敗しました: {stderr}",
             output.status

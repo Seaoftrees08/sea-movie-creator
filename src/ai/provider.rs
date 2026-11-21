@@ -831,6 +831,27 @@ pub struct AiRequest {
     pub stream: bool,
 }
 
+impl AiRequest {
+    /// システム指示・スキーマ・タイムライン要約・履歴・ユーザー指示を含む推定入力文字数を返す。
+    #[must_use]
+    pub fn estimated_input_chars(&self) -> usize {
+        let history_chars: usize = self
+            .history
+            .iter()
+            .map(|msg| msg.content.chars().count().saturating_add(16))
+            .sum();
+        let schema_chars = self.command_schema_json.to_string().chars().count();
+        let summary_chars = self.context_summary.to_string().chars().count();
+        self.system_prompt
+            .chars()
+            .count()
+            .saturating_add(schema_chars)
+            .saturating_add(summary_chars)
+            .saturating_add(history_chars)
+            .saturating_add(self.user_prompt.chars().count())
+    }
+}
+
 /// AI 応答 1 ターン分のトークン使用量・概算コストメタデータ。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1111,6 +1132,35 @@ pub struct AiAgentTurnRequest {
     pub temperature: Option<f32>,
 }
 
+impl AiAgentTurnRequest {
+    /// システム指示および会話・ツール結果列から推定入力文字数（Unicode スカラー値数）を返す。
+    #[must_use]
+    pub fn estimated_input_chars(&self) -> usize {
+        let messages_chars: usize = self
+            .messages
+            .iter()
+            .map(|m| match m {
+                AiTurnMessage::System { text } => text.chars().count(),
+                AiTurnMessage::User { parts } => parts
+                    .iter()
+                    .map(|p| match p {
+                        AiContentPart::Text { text } => text.chars().count(),
+                        AiContentPart::ImageData { base64_data, .. } => base64_data.len() / 16,
+                    })
+                    .sum(),
+                AiTurnMessage::Assistant { text, .. } => {
+                    text.as_ref().map_or(0, |s| s.chars().count()) + 64
+                }
+                AiTurnMessage::ToolResult { content_json, .. } => content_json.chars().count(),
+            })
+            .sum();
+        self.system_prompt
+            .chars()
+            .count()
+            .saturating_add(messages_chars)
+    }
+}
+
 /// マルチモーダル・ツール呼び出し対応の AI エージェントターン応答。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAgentTurnResponse {
@@ -1128,6 +1178,17 @@ pub struct AiAgentTurnResponse {
     /// トークン使用量・コストメタデータ（任意）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AiTokenUsage>,
+}
+
+impl AiAgentTurnResponse {
+    /// 応答テキスト・ツール呼び出し数から推定出力文字数を返す。
+    #[must_use]
+    pub fn estimated_output_chars(&self) -> usize {
+        self.text
+            .as_ref()
+            .map_or(0, |s| s.chars().count())
+            .saturating_add(self.tool_calls.len().saturating_mul(120))
+    }
 }
 
 /// 組み込み HTTP・Mock・外部プラグインを統一的に扱う AI プロバイダトレイト。

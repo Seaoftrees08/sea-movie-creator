@@ -954,6 +954,9 @@ impl CoordinatorState {
     ) {
         let prev_count = self.tool_registry.list_descriptors().len();
         let result = {
+            let mut on_usage = |usage| {
+                let _ = event_tx.send(AgentHostEvent::UsageReported { usage });
+            };
             let mut ctx = ToolExecutionContext {
                 folder_scope: &self.folder_scope,
                 sandbox: &mut self.sandbox,
@@ -968,6 +971,7 @@ impl CoordinatorState {
                         total_steps: None,
                     });
                 },
+                on_usage: Some(&mut on_usage),
                 extra_extensions: self.extra_extensions.clone(),
             };
             self.tool_registry.execute(tool_name, arguments, &mut ctx)
@@ -1393,33 +1397,10 @@ fn send_agent_llm_turn_and_reply(
     match state.provider.send_agent_turn(req, &mut on_stream_event) {
         Ok(resp) => {
             let reported_usage = resp.usage.clone().unwrap_or_else(|| {
-                let in_chars = req.system_prompt.len().saturating_add(
-                    req.messages
-                        .iter()
-                        .map(|m| match m {
-                            AiTurnMessage::System { text } => text.len(),
-                            AiTurnMessage::User { parts } => parts
-                                .iter()
-                                .map(|p| match p {
-                                    AiContentPart::Text { text } => text.len(),
-                                    AiContentPart::ImageData { base64_data, .. } => {
-                                        base64_data.len() / 16
-                                    }
-                                })
-                                .sum(),
-                            AiTurnMessage::Assistant { text, .. } => {
-                                text.as_ref().map_or(0, String::len) + 64
-                            }
-                            AiTurnMessage::ToolResult { content_json, .. } => content_json.len(),
-                        })
-                        .sum::<usize>(),
-                );
-                let out_chars = resp
-                    .text
-                    .as_ref()
-                    .map_or(0, String::len)
-                    .saturating_add(resp.tool_calls.len().saturating_mul(120));
-                AiTokenUsage::estimate_from_chars(in_chars, out_chars)
+                AiTokenUsage::estimate_from_chars(
+                    req.estimated_input_chars(),
+                    resp.estimated_output_chars(),
+                )
             });
             let _ = event_tx.send(AgentHostEvent::UsageReported {
                 usage: reported_usage,

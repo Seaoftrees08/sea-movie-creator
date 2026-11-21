@@ -79,24 +79,57 @@ pub fn resolve_api_key_from(
 }
 
 /// 指定設定オブジェクトを参照して認証キーと取得元 (`CredentialSource`) を解決する。
+///
+/// UI 描画パス等のパフォーマンスと OS Keyring IPC 抑止のため、優先度の高い経路から順に
+/// 短絡評価し、上位に有効値が存在する場合は `read_from_os_keyring` を呼び出さない。
 #[must_use]
 pub fn resolve_api_key_with_source(
     kind: &AiProviderKind,
     runtime_override: Option<&SecretString>,
     settings: Option<&AiUserSettings>,
 ) -> Option<ResolvedCredential> {
-    let env_val = kind
-        .default_env_var()
-        .and_then(|var| std::env::var(var).ok());
-    let json_val = settings.and_then(|s| s.api_key_for(kind));
+    if let Some(secret) = runtime_override
+        && !secret.is_empty()
+    {
+        return Some(ResolvedCredential {
+            secret: secret.clone(),
+            source: CredentialSource::RuntimeOverride,
+        });
+    }
+
+    if let Some(env_var) = kind.default_env_var()
+        && let Ok(env_val) = std::env::var(env_var)
+    {
+        let trimmed = env_val.trim();
+        if !trimmed.is_empty() {
+            return Some(ResolvedCredential {
+                secret: SecretString::new(trimmed),
+                source: CredentialSource::EnvVar(env_var),
+            });
+        }
+    }
+
+    if let Some(json_val) = settings.and_then(|s| s.api_key_for(kind)) {
+        let trimmed = json_val.trim();
+        if !trimmed.is_empty() {
+            return Some(ResolvedCredential {
+                secret: SecretString::new(trimmed),
+                source: CredentialSource::SettingsJson,
+            });
+        }
+    }
+
     let keyring_val = kind.keyring_account().and_then(read_from_os_keyring);
-    resolve_api_key_from(
-        kind,
-        runtime_override,
-        env_val.as_deref(),
-        json_val,
-        keyring_val.as_ref(),
-    )
+    if let Some(stored) = keyring_val
+        && !stored.is_empty()
+    {
+        return Some(ResolvedCredential {
+            secret: stored,
+            source: CredentialSource::Keyring,
+        });
+    }
+
+    None
 }
 
 /// 現在の有効な認証情報取得元のみを診断して返す。
