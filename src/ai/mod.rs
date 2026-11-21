@@ -11,4 +11,5 @@ pub mod plugin_host;
 pub mod provider;
 pub mod providers;
 pub mod session_store;
+pub mod settings;
 pub mod toolbox;

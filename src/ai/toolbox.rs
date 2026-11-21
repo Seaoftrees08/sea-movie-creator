@@ -16,8 +16,8 @@ use crate::ai::media_inspector::{
 };
 use crate::ai::planner::dry_run_validate_command;
 use crate::ai::provider::{
-    AgentRuntimeSettings, AiAgentTurnRequest, AiContentPart, AiError, AiProvider, AiToolDefinition,
-    AiTurnMessage,
+    AgentRuntimeSettings, AiAgentTurnRequest, AiContentPart, AiError, AiProvider, AiTokenUsage,
+    AiToolDefinition, AiTurnMessage,
 };
 use crate::core::time::FrameIndex;
 use crate::timeline::command::EditCommand;
@@ -171,6 +171,8 @@ pub struct ToolExecutionContext<'a> {
     pub cancelled: Option<&'a AtomicBool>,
     /// 進捗通知コールバック。
     pub on_progress: &'a mut dyn FnMut(&str),
+    /// ツール内部で行われた LLM 呼び出しのトークン使用量通知コールバック（任意）。
+    pub on_usage: Option<&'a mut dyn FnMut(AiTokenUsage)>,
     /// 登録済み外部拡張を自己申告一覧に含めるための追加リスト（任意）。
     pub extra_extensions: Vec<InstalledExtensionSummary>,
 }
@@ -504,14 +506,18 @@ fn execute_vision_batches(
             ));
         }
 
-        match run_single_vision_batch(
+        let (outcome, batch_usage) = run_single_vision_batch(
             provider,
             ctx.folder_scope,
             chunk,
             max_edge,
             theme_hint,
             language,
-        ) {
+        );
+        if let (Some(cb), Some(usage)) = (ctx.on_usage.as_deref_mut(), batch_usage) {
+            cb(usage);
+        }
+        match outcome {
             VisionBatchOutcome::Parsed(items) => all_analyses.extend(items),
             VisionBatchOutcome::ParseFallback(items) => {
                 used_vision_ok = false;
@@ -625,7 +631,7 @@ fn run_single_vision_batch(
     max_edge: u32,
     theme_hint: &str,
     language: &str,
-) -> VisionBatchOutcome {
+) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let mut parts = Vec::new();
     let mut manifest_lines = Vec::new();
     let mut valid_paths = Vec::new();
@@ -634,10 +640,13 @@ fn run_single_vision_batch(
         let thumb = match encode_thumbnail_jpeg_base64(scope, std::path::Path::new(p), max_edge) {
             Ok(t) => t,
             Err(err) => {
-                return VisionBatchOutcome::Failed {
-                    code: "media_error",
-                    message: err.to_string(),
-                };
+                return (
+                    VisionBatchOutcome::Failed {
+                        code: "media_error",
+                        message: err.to_string(),
+                    },
+                    None,
+                );
             }
         };
         let fname = std::path::Path::new(&thumb.path)
@@ -684,23 +693,28 @@ fn run_single_vision_batch(
         Ok(r) => r,
         Err(err) => {
             let (code, is_unsupported, message) = classify_vision_api_error(&err);
-            return if is_unsupported {
+            let outcome = if is_unsupported {
                 VisionBatchOutcome::VisionUnsupported(message)
             } else {
                 VisionBatchOutcome::Failed { code, message }
             };
+            return (outcome, None);
         }
     };
+    let in_chars = req.estimated_input_chars();
+    let out_chars = resp.estimated_output_chars();
+    let usage = resp
+        .usage
+        .unwrap_or_else(|| AiTokenUsage::estimate_from_chars(in_chars, out_chars));
     let raw_text = resp.text.unwrap_or_default();
     if let Some(parsed) = parse_vision_analyses_json(&raw_text, &valid_paths) {
-        return VisionBatchOutcome::Parsed(parsed);
+        return (VisionBatchOutcome::Parsed(parsed), Some(usage));
     }
-    VisionBatchOutcome::ParseFallback(
-        valid_paths
-            .iter()
-            .map(|p| build_filename_fallback_analysis(p))
-            .collect(),
-    )
+    let fallback = valid_paths
+        .iter()
+        .map(|p| build_filename_fallback_analysis(p))
+        .collect();
+    (VisionBatchOutcome::ParseFallback(fallback), Some(usage))
 }
 
 fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<Value>> {
@@ -971,23 +985,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_toolbox_supports_dynamic_registration_vision_and_draft_sandbox()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let guard = TempDirGuard::new("toolbox")?;
-        let p1 = guard.0.join("memory1.png");
-        write_png(&p1)?;
-
-        let mut registry = HostToolRegistry::with_builtin_tools();
-        // 将来ツールの動的登録をテスト
-        registry.register(Box::new(DummyCustomExtensionTool));
-        assert!(registry.find_descriptor("future_silence_cut").is_some());
-
-        let live_doc = ProjectDocument::new("ToolboxTest");
-        let mut sandbox = DraftSandbox::new(live_doc.clone());
-        let scope = AllowedFolderScope::from_folders([&guard.0]);
-        let settings = AgentRuntimeSettings::default();
-        let mock_vision = MockAiProvider::with_agent_turns([AiAgentTurnResponse {
+    fn sample_vision_mock_response() -> AiAgentTurnResponse {
+        AiAgentTurnResponse {
             text: Some(
                 json!({
                     "analyses": [{
@@ -1004,10 +1003,32 @@ mod tests {
             tool_calls: Vec::new(),
             model: "mock-vision".to_owned(),
             finish_reason: Some("stop".to_owned()),
-        }]);
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn host_toolbox_supports_dynamic_registration_vision_and_draft_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::new("toolbox")?;
+        let p1 = guard.0.join("memory1.png");
+        write_png(&p1)?;
+
+        let mut registry = HostToolRegistry::with_builtin_tools();
+        // 将来ツールの動的登録をテスト
+        registry.register(Box::new(DummyCustomExtensionTool));
+        assert!(registry.find_descriptor("future_silence_cut").is_some());
+
+        let live_doc = ProjectDocument::new("ToolboxTest");
+        let mut sandbox = DraftSandbox::new(live_doc.clone());
+        let scope = AllowedFolderScope::from_folders([&guard.0]);
+        let settings = AgentRuntimeSettings::default();
+        let mock_vision = MockAiProvider::with_agent_turns([sample_vision_mock_response()]);
 
         let mut logs = Vec::new();
         let mut progress = |msg: &str| logs.push(msg.to_owned());
+        let mut reported_usages = Vec::new();
+        let mut on_usage = |usage| reported_usages.push(usage);
         let mut last_llm_call_at = None;
         let mut ctx = ToolExecutionContext {
             folder_scope: &scope,
@@ -1017,6 +1038,7 @@ mod tests {
             last_llm_call_at: &mut last_llm_call_at,
             cancelled: None,
             on_progress: &mut progress,
+            on_usage: Some(&mut on_usage),
             extra_extensions: Vec::new(),
         };
 
@@ -1088,6 +1110,8 @@ mod tests {
                 .is_err()
         );
         assert_ne!(logs.len(), 0);
+        assert_eq!(reported_usages.len(), 1);
+        assert!(reported_usages[0].total_tokens > 0);
         Ok(())
     }
 

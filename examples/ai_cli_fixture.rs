@@ -109,7 +109,28 @@ fn run_acp_agy_sandbox() -> Result<(), String> {
                     "result": {
                         "sessionId": "agy-sandbox-1",
                         "models": { "currentModelId": "gemini-4-argon-medium" },
-                        "configOptions": [{ "id": "model", "type": "select", "currentValue": "gemini-4-argon" }]
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "type": "select",
+                                "currentValue": "gemini-4-argon",
+                                "options": [
+                                    { "value": "gemini-4-argon", "name": "Gemini 4 Argon" },
+                                    { "value": "gemini-4-hydrogen", "name": "Gemini 4 Hydrogen" }
+                                ]
+                            },
+                            {
+                                "id": "thought_level",
+                                "type": "select",
+                                "currentValue": "medium",
+                                "options": [
+                                    { "value": "low", "name": "Low" },
+                                    { "value": "medium", "name": "Medium" },
+                                    { "value": "high", "name": "High" },
+                                    { "value": "xhigh", "name": "Extra" }
+                                ]
+                            }
+                        ]
                     }
                 });
                 writeln!(out, "{sess}").map_err(|e| e.to_string())?;

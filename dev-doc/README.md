@@ -44,3 +44,5 @@
 | 009 | Phase P5 設計書：他ソフト向けプロジェクト書き出しプラグイン（YMM4 → AviUtl サブ機能） | Draft | [`009-phase-p5-external-project-export-plugins.md`](009-phase-p5-external-project-export-plugins.md) |
 | 010 | PR 前コード品質ゲート・自動テスト基盤 | Implemented | [`completed/010-pre-pr-quality-gates.md`](completed/010-pre-pr-quality-gates.md) |
 | 011 | 外部プラグイン向け SDK・プロトコル互換性ポリシー | Draft | [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md) |
+| 012 | 自律エージェントプラグイン基盤＆構成コンパイラ設計書 | Implemented | [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md) |
+| 013 | AI チャット UI 改修・VS Code 風設定画面・起動時状態復元・モデル管理・トークン残量表示設計書 | Implemented | [`completed/013-ai-ui-settings-and-usage.md`](completed/013-ai-ui-settings-and-usage.md) |

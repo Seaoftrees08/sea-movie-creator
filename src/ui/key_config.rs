@@ -421,7 +421,7 @@ impl KeyConfig {
         *self = Self::with_defaults();
     }
 
-    /// 既定の設定保存パス (`%APPDATA%\sea-movie-creator\key_config.json` 等) を返す。
+    /// 既定の設定保存パス (`<settings_dir>/key_config.json`) を返す。
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
         crate::core::user_config_file_path(KEY_CONFIG_FILE_NAME)
@@ -440,10 +440,10 @@ impl KeyConfig {
         Ok(cfg)
     }
 
-    /// 既定パスが存在すれば読み込み、未作成・壊れている場合は初期値を返す。
+    /// 既定パス（未作成時は旧保存先フォールバック含む）が存在すれば読み込み、未作成・壊れている場合は初期値を返す。
     #[must_use]
     pub fn load_or_default() -> Self {
-        Self::default_path()
+        crate::core::user_config_read_path(KEY_CONFIG_FILE_NAME)
             .and_then(|p| Self::load_from_path(&p).ok())
             .unwrap_or_else(Self::with_defaults)
     }

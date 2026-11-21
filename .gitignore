@@ -83,3 +83,6 @@ venv/
 *.ckpt
 *.bin
 /models/
+
+# Portable user settings directory (when run from repo root / SEA_SETTINGS_DIR=./settings; may contain API keys)
+/settings/

@@ -15,7 +15,8 @@ use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
     Anchor, Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px,
 };
 use sea_agent_protocol::AgentUserAnswerPayload;
 use serde_json::{Value, json};
@@ -28,26 +29,35 @@ use crate::ai::context_builder::{
     AiSelectionContext, build_ai_request_with_attachments, build_timeline_context,
 };
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
-use crate::ai::plugin_host::AiPluginRegistry;
+use crate::ai::plugin_host::{AiPluginRegistry, DiscoveredAiModel};
 use crate::ai::provider::{
-    AgentRuntimeSettings, AiChatMessage, AiError, AiModelPreset, AiProvider, AiProviderKind,
-    AiRequest, AiRole, AiStreamEvent, AiThinkingLevel, SecretString,
+    AgentRuntimeSettings, AiChatMessage, AiError, AiProvider, AiProviderKind, AiRequest, AiRole,
+    AiStreamEvent, AiThinkingLevel, AiTokenUsage, SecretString,
 };
 use crate::ai::providers::anthropic::{AnthropicConfig, AnthropicProvider};
-use crate::ai::providers::credentials::resolve_api_key;
+use crate::ai::providers::credentials::{
+    CredentialSource, diagnose_credential_source, resolve_api_key_with_settings,
+};
 use crate::ai::providers::gemini::{GeminiConfig, GeminiProvider};
 use crate::ai::providers::mock::MockAiProvider;
-use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::ai::providers::openai_compat::{
+    OpenAiCompatConfig, OpenAiCompatProvider, OpenRouterCreditsSnapshot, fetch_openrouter_credits,
+};
 use crate::ai::session_store::{
-    AiSessionRecord, AiSessionStore, AiSessionSummary, PendingAgentQuestionSnapshot, StoredChatTurn,
+    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage,
+    PendingAgentQuestionSnapshot, StoredChatTurn,
+};
+use crate::ai::settings::{
+    AI_SETTINGS_FILE_NAME, AiUserSettings, ProbedModelEntry, ResolvedAiModel,
+    UsageDisplayPreference,
 };
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
 use crate::ui::ai_agent_widgets::{
-    render_agent_mode_menu_button, render_agent_settings_drawer, render_ask_user_card,
-    render_attached_folder_chip, render_folder_attach_button, render_session_history_drawer,
-    render_tool_approval_card,
+    render_agent_mode_menu_button, render_ask_user_card, render_attached_folder_chip,
+    render_folder_attach_button, render_session_history_drawer, render_tool_approval_card,
 };
+use crate::ui::ai_settings_modal::AiSettingsTab;
 use crate::ui::app_controller::AppController;
 use crate::ui::i18n::tr;
 use crate::ui::window::SeaEditorWindow;
@@ -90,8 +100,11 @@ pub use crate::ai::provider::AiApprovalMode;
 struct AiChatJobHandle {
     rx: mpsc::Receiver<AiStreamEvent>,
     prompt: String,
+    estimated_input_chars: usize,
     cancelled: Arc<AtomicBool>,
 }
+
+type PluginModelsProbeRx = mpsc::Receiver<(String, Result<Vec<ProbedModelEntry>, String>)>;
 
 /// API / プロバイダ切り替えコンボボックス用アイテム。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,8 +156,6 @@ pub enum AiChatDrawer {
     None,
     /// セッション履歴ドロワー。
     SessionHistory,
-    /// エージェント安全設定ドロワー。
-    AgentSettings,
 }
 
 /// UI 状態と履歴を管理する AI チャットパネル状態。
@@ -191,16 +202,38 @@ pub struct AiChatState {
     pub pending_tool_approval: Option<PendingAgentToolApproval>,
     /// 常駐エージェントの永続メモリ（画像解析キャッシュ・前回設計等）。
     pub agent_memory: Value,
+    /// 現在セッションで累積されたトークン・概算コスト利用量。
+    pub session_usage: AiSessionUsage,
     /// ステップ上限・最小呼出間隔・Vision 設定。
     pub runtime_settings: AgentRuntimeSettings,
+    /// ユーザー設定 (`<settings_dir>/ai_settings.json`)。
+    pub user_settings: AiUserSettings,
+    /// 設定 JSON ファイルの保存先パス（テスト未注入時は `None`）。
+    pub settings_path: Option<PathBuf>,
+    /// 起動時の `ai_settings.json` 読込警告（破損時は自動上書きを抑止する）。
+    pub settings_load_warning: Option<String>,
+    /// `OpenRouter` の残クレジット取得結果。
+    pub openrouter_credits: Option<OpenRouterCreditsSnapshot>,
+    /// `OpenRouter` クレジット取得の直近エラー。
+    pub openrouter_credits_error: Option<String>,
+    /// `list_models` でプローブされた CLI プラグイン利用可能モデル一覧。
+    pub discovered_plugin_models: BTreeMap<String, Vec<ProbedModelEntry>>,
+    /// CLI プラグインの直近プローブ状態メッセージ。
+    pub plugin_models_note: BTreeMap<String, String>,
+    /// CLI プラグインのプローブ実行中フラグ。
+    pub plugin_models_probing: BTreeMap<String, bool>,
+    /// プロバイダごとの診断済み認証ソースキャッシュ（UI 毎フレーム描画での Keyring IPC 回避用）。
+    pub(crate) cached_credential_sources: BTreeMap<String, CredentialSource>,
     /// セッション保存先ストア（ライブウィンドウ起動時に設定、テストでも任意注入可）。
     pub session_store: Option<AiSessionStore>,
-    /// 上部に開いている補助ドロワー（履歴または安全設定）。
+    /// 上部に開いている補助ドロワー。
     pub active_drawer: AiChatDrawer,
     /// エージェントの現在ステップ進捗 `(step, total_steps)`。
     pub agent_step_status: Option<(Option<u32>, Option<u32>)>,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
+    credits_rx: Option<mpsc::Receiver<Result<OpenRouterCreditsSnapshot, String>>>,
+    models_probe_rxs: Vec<PluginModelsProbeRx>,
     pub(crate) active_agent: Option<AgentSessionRunner>,
     pub(crate) agent_provider_override: Option<Arc<dyn AiProvider>>,
     pub(crate) agent_busy: bool,
@@ -252,12 +285,24 @@ impl Default for AiChatState {
             ask_field_values: BTreeMap::new(),
             pending_tool_approval: None,
             agent_memory: json!({}),
+            session_usage: AiSessionUsage::default(),
             runtime_settings: AgentRuntimeSettings::default(),
+            user_settings: AiUserSettings::default(),
+            settings_path: None,
+            settings_load_warning: None,
+            openrouter_credits: None,
+            openrouter_credits_error: None,
+            discovered_plugin_models: BTreeMap::new(),
+            plugin_models_note: BTreeMap::new(),
+            plugin_models_probing: BTreeMap::new(),
+            cached_credential_sources: BTreeMap::new(),
             session_store: None,
             active_drawer: AiChatDrawer::None,
             agent_step_status: None,
             runtime_api_key: None,
             running_job: None,
+            credits_rx: None,
+            models_probe_rxs: Vec::new(),
             active_agent: None,
             agent_provider_override: None,
             agent_busy: false,
@@ -309,7 +354,7 @@ impl AiChatState {
             .unwrap_or_default();
     }
 
-    /// ライブウィンドウ起動用：既定のユーザー設定配下セッションストアを有効化し、設定・エージェント・履歴キャッシュを読み込む。
+    /// ライブウィンドウ起動用：既定のユーザー設定配下セッションストアと `settings/ai_settings.json` を読み込み、前回の選択状態を復元する。
     pub fn enable_user_session_store(&mut self) {
         if let Some(store) = AiSessionStore::default_user_store() {
             if let Ok(settings) = store.load_runtime_settings() {
@@ -317,8 +362,123 @@ impl AiChatState {
             }
             self.session_store = Some(store);
         }
+        let (settings, path, warn) = AiUserSettings::load_or_default_user();
+        self.settings_path = path;
+        self.settings_load_warning = warn;
+        self.apply_user_settings_snapshot(settings);
         self.refresh_discovered_agents();
         self.refresh_session_history();
+        self.refresh_active_provider_side_data();
+    }
+
+    /// 指定した設定ディレクトリ配下でセッションストアと `ai_settings.json` を有効化する（テスト・隔離環境用）。
+    pub fn enable_settings_in_dir(&mut self, settings_dir: &Path) {
+        let store = AiSessionStore::with_paths(
+            settings_dir.join("ai_sessions"),
+            settings_dir.join("agent_settings.json"),
+        );
+        self.session_store = Some(store);
+        self.settings_path = Some(settings_dir.join(AI_SETTINGS_FILE_NAME));
+        // テスト・隔離環境では端末ホストの旧 %APPDATA% 設定を誤読しないようレガシーフォールバックを無効化する
+        let (settings, warn) = AiUserSettings::load_or_default_at(settings_dir, false);
+        self.settings_load_warning = warn;
+        self.apply_user_settings_snapshot(settings);
+        self.refresh_discovered_agents();
+        self.refresh_session_history();
+    }
+
+    /// 読み込んだ [`AiUserSettings`] の選択状態・カスタム Base URL・エージェント設定をチャット状態へ反映する。
+    pub fn apply_user_settings_snapshot(&mut self, settings: AiUserSettings) {
+        let last = settings.last_selection.clone();
+        self.runtime_settings = settings.runtime.clone();
+        self.user_settings = settings;
+        self.selected_provider = last.provider.clone();
+        self.custom_base_url = self
+            .user_settings
+            .base_url_for(&self.selected_provider)
+            .unwrap_or_else(|| self.selected_provider.default_base_url())
+            .to_owned();
+        self.approval_mode = last.approval_mode;
+        self.selected_agent_id = last.selected_agent_id;
+        self.model_name = if last.model_name.trim().is_empty() {
+            self.selected_provider.preferred_default_model().to_owned()
+        } else {
+            last.model_name
+        };
+        self.normalize_thinking_level_for_active_model(last.thinking_level);
+        self.agent_provider_override = None;
+        self.last_error = None;
+        self.refresh_all_credential_sources();
+    }
+
+    /// 現在のプロバイダ／モデル／思考／エージェント設定を [`AiUserSettings`] へ反映し、安全ならディスク保存する。
+    pub fn sync_selection_and_persist(&mut self) {
+        self.user_settings.last_selection.provider = self.selected_provider.clone();
+        self.user_settings
+            .last_selection
+            .model_name
+            .clone_from(&self.model_name);
+        self.user_settings.last_selection.thinking_level = self.thinking_level;
+        self.user_settings.last_selection.approval_mode = self.approval_mode;
+        self.user_settings
+            .last_selection
+            .selected_agent_id
+            .clone_from(&self.selected_agent_id);
+        self.user_settings
+            .set_base_url(&self.selected_provider, &self.custom_base_url);
+        self.user_settings.runtime = self.runtime_settings.clone();
+
+        if self.settings_load_warning.is_some() {
+            return;
+        }
+        if let Some(path) = &self.settings_path {
+            let _ = self.user_settings.save_to_path(path);
+        }
+    }
+
+    /// 設定モーダルでの明示変更を検証済み [`AiUserSettings`] として保存し、警告フラグを解除する。
+    ///
+    /// # Errors
+    ///
+    /// ディスク保存 I/O に失敗した場合にエラー文言を返す。
+    pub fn save_explicit_user_settings(&mut self, mut next: AiUserSettings) -> Result<(), String> {
+        next.last_selection.provider = self.selected_provider.clone();
+        next.last_selection.model_name.clone_from(&self.model_name);
+        next.last_selection.thinking_level = self.thinking_level;
+        next.last_selection.approval_mode = self.approval_mode;
+        next.last_selection
+            .selected_agent_id
+            .clone_from(&self.selected_agent_id);
+        next.runtime = self.runtime_settings.clone();
+        if let Some(path) = &self.settings_path {
+            next.save_to_path(path)?;
+        }
+        self.settings_load_warning = None;
+        if let Some(updated_url) = next.base_url_for(&self.selected_provider) {
+            updated_url.clone_into(&mut self.custom_base_url);
+        } else {
+            self.selected_provider
+                .default_base_url()
+                .clone_into(&mut self.custom_base_url);
+        }
+        self.user_settings = next;
+        self.refresh_all_credential_sources();
+        Ok(())
+    }
+
+    /// `{ } JSON` 直接編集など、`last_selection` 全体を含む明示保存を実行して即時反映する。
+    ///
+    /// # Errors
+    ///
+    /// ディスク保存 I/O に失敗した場合にエラー文言を返す。
+    pub fn save_and_apply_user_settings(&mut self, next: AiUserSettings) -> Result<(), String> {
+        if let Some(path) = &self.settings_path {
+            next.save_to_path(path)?;
+        }
+        self.settings_load_warning = None;
+        self.apply_user_settings_snapshot(next);
+        self.sync_active_agent_runtime();
+        Ok(())
     }
 
     /// 許可メディアフォルダを添付する（ディレクトリのみ受理・正規化重複除去）。
@@ -353,6 +513,7 @@ impl AiChatState {
             } else if let Some(first) = self.cached_agents.first() {
                 self.selected_agent_id = Some(first.manifest.id.clone());
             }
+            self.sync_selection_and_persist();
         }
     }
 
@@ -371,6 +532,7 @@ impl AiChatState {
             self.agent_busy = false;
             self.agent_step_status = None;
             self.selected_agent_id = agent_id;
+            self.sync_selection_and_persist();
         }
     }
 
@@ -378,15 +540,18 @@ impl AiChatState {
     pub fn set_approval_mode(&mut self, mode: AiApprovalMode) {
         self.approval_mode = mode;
         self.sync_active_agent_runtime();
+        self.sync_selection_and_persist();
     }
 
     /// ステップ上限・呼出間隔設定を更新・保存し、常駐エージェントにも即時反映する。
     pub fn apply_runtime_settings(&mut self, settings: AgentRuntimeSettings) {
-        self.runtime_settings = settings;
+        self.runtime_settings = settings.clone();
+        self.user_settings.runtime = settings;
         if let Some(store) = &self.session_store {
             let _ = store.save_runtime_settings(&self.runtime_settings);
         }
         self.sync_active_agent_runtime();
+        self.sync_selection_and_persist();
     }
 
     fn sync_active_agent_runtime(&self) {
@@ -403,6 +568,15 @@ impl AiChatState {
                 self.runtime_settings.clone(),
             );
         }
+    }
+
+    /// 現在のターンのトークン使用量（およびモデル単価からの概算コスト）をセッション累計へ反映する。
+    pub fn record_turn_usage(&mut self, usage: &AiTokenUsage) {
+        let model = self.active_resolved_model();
+        let fallback_cost = model.and_then(|m| {
+            usage.resolved_cost_usd(m.input_price_per_1m_usd, m.output_price_per_1m_usd)
+        });
+        self.session_usage.record_turn(usage, fallback_cost);
     }
 
     /// 現在のチャット／エージェント状態をセッションストアへ保存する。
@@ -444,23 +618,35 @@ impl AiChatState {
                 .collect(),
             pending_question: self.pending_question.clone(),
             agent_memory: self.agent_memory.clone(),
+            session_usage: self.session_usage.clone(),
         };
         if store.save_session(&rec).is_ok() {
             self.refresh_session_history();
         }
     }
 
-    /// プロバイダ種別を切り替え、既定モデル・思考レベル・ベース URL を更新する。
+    /// プロバイダ種別を切り替え、保存済み Base URL・既定モデル・思考レベルを更新して永続化する。
     pub fn select_provider(&mut self, kind: AiProviderKind) {
-        kind.preferred_default_model()
-            .clone_into(&mut self.model_name);
-        self.thinking_level = kind.default_thinking_level();
-        kind.default_base_url()
-            .clone_into(&mut self.custom_base_url);
+        let restored_base = self
+            .user_settings
+            .base_url_for(&kind)
+            .unwrap_or_else(|| kind.default_base_url())
+            .to_owned();
+        let default_model = kind.preferred_default_model().to_owned();
+        self.custom_base_url = restored_base;
         self.selected_provider = kind;
+        self.model_name = default_model;
+        let default_thinking = self.active_resolved_model().map_or_else(
+            || self.selected_provider.default_thinking_level(),
+            |m| m.default_thinking,
+        );
+        self.normalize_thinking_level_for_active_model(default_thinking);
         self.agent_provider_override = None;
         self.last_error = None;
         self.sync_active_agent_runtime();
+        let active_provider = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active_provider);
+        self.sync_selection_and_persist();
     }
 
     /// モデルを選択し、対応していれば `Medium` を標準選択（非対応時はモデル既定）とする。
@@ -468,21 +654,27 @@ impl AiChatState {
         self.select_model(model_id, AiThinkingLevel::Medium);
     }
 
-    /// モデルと思考レベルを同時に選択し、そのモデルで無効なレベルは自動補正する。
+    /// モデルと思考レベルを同時に選択し、そのモデルで無効なレベルは自動補正して永続化する。
     pub fn select_model(&mut self, model_id: &str, thinking: AiThinkingLevel) {
         model_id.clone_into(&mut self.model_name);
-        self.thinking_level = match self.selected_provider.model_preset(model_id) {
-            Some(preset) if preset.thinking_levels.is_empty() => AiThinkingLevel::Auto,
-            Some(preset) if preset.thinking_levels.contains(&thinking) => thinking,
-            Some(preset) => preset.default_thinking,
-            None => thinking,
-        };
+        self.normalize_thinking_level_for_active_model(thinking);
         self.agent_provider_override = None;
         self.last_error = None;
         self.sync_active_agent_runtime();
+        self.sync_selection_and_persist();
     }
 
-    /// 現在選択中のモデルに対して思考レベルを切り替える。
+    fn normalize_thinking_level_for_active_model(&mut self, desired: AiThinkingLevel) {
+        let resolved = self.active_resolved_model();
+        self.thinking_level = match resolved {
+            Some(model) if model.thinking_levels.is_empty() => AiThinkingLevel::Auto,
+            Some(model) if model.thinking_levels.contains(&desired) => desired,
+            Some(model) => model.default_thinking,
+            None => desired,
+        };
+    }
+
+    /// 現在選択中のモデルに対して思考レベルを切り替え、永続化する。
     pub fn select_thinking_level(&mut self, level: AiThinkingLevel) {
         let allowed = self.active_thinking_options();
         self.thinking_level = if allowed.is_empty() {
@@ -490,34 +682,55 @@ impl AiChatState {
         } else if allowed.contains(&level) {
             level
         } else {
-            self.active_model_preset()
-                .map_or(AiThinkingLevel::Auto, |preset| preset.default_thinking)
+            self.active_resolved_model()
+                .map_or(AiThinkingLevel::Auto, |m| m.default_thinking)
         };
         self.agent_provider_override = None;
         self.last_error = None;
         self.sync_active_agent_runtime();
+        self.sync_selection_and_persist();
     }
 
-    /// 現在選択中モデルに対応するカタログ定義を返す。
+    /// 指定プロバイダの標準カタログ・カスタムモデル・検出済み CLI モデルを統合した一覧を返す。
     #[must_use]
-    pub fn active_model_preset(&self) -> Option<&'static AiModelPreset> {
-        self.selected_provider.model_preset(&self.model_name)
+    pub fn resolved_models_for_provider(&self, kind: &AiProviderKind) -> Vec<ResolvedAiModel> {
+        let discovered = match kind {
+            AiProviderKind::Plugin { plugin_id } => self
+                .discovered_plugin_models
+                .get(plugin_id)
+                .map_or(&[][..], Vec::as_slice),
+            _ => &[],
+        };
+        self.user_settings
+            .resolve_models_with_discovered(kind, discovered)
+    }
+
+    /// 現在選択中プロバイダの利用可能モデル一覧を返す。
+    #[must_use]
+    pub fn resolved_models_for_current_provider(&self) -> Vec<ResolvedAiModel> {
+        self.resolved_models_for_provider(&self.selected_provider)
+    }
+
+    /// 現在選択中モデルの解決済み定義（カスタム設定・CLI プローブ結果を含む）を返す。
+    #[must_use]
+    pub fn active_resolved_model(&self) -> Option<ResolvedAiModel> {
+        self.resolved_models_for_current_provider()
+            .into_iter()
+            .find(|m| m.id == self.model_name)
     }
 
     /// 現在選択中モデルで切り替え可能な思考レベル一覧を返す。
     #[must_use]
-    pub fn active_thinking_options(&self) -> &'static [AiThinkingLevel] {
-        self.active_model_preset()
-            .map_or(&[], |preset| preset.thinking_levels)
+    pub fn active_thinking_options(&self) -> Vec<AiThinkingLevel> {
+        self.active_resolved_model()
+            .map_or_else(Vec::new, |m| m.thinking_levels)
     }
 
     /// UI 向けの短いモデル表示名（未登録モデルは ID そのまま）を返す。
     #[must_use]
     pub fn active_model_display_name(&self) -> String {
-        self.active_model_preset().map_or_else(
-            || self.model_name.clone(),
-            |preset| preset.display_name.to_owned(),
-        )
+        self.active_resolved_model()
+            .map_or_else(|| self.model_name.clone(), |m| m.display_name)
     }
 
     /// 思考レベルを含めた UI ボタン表示ラベル（例: `Gemini 4 Hydrogen Extra`）を返す。
@@ -533,10 +746,72 @@ impl AiChatState {
         }
     }
 
+    /// 指定プロバイダの有効な認証情報取得元を再診断して UI 描画用キャッシュへ保存する。
+    pub fn refresh_credential_source_for(&mut self, kind: &AiProviderKind) -> CredentialSource {
+        let runtime = if &self.selected_provider == kind {
+            self.runtime_api_key.as_ref()
+        } else {
+            None
+        };
+        let source = diagnose_credential_source(kind, runtime, Some(&self.user_settings));
+        self.cached_credential_sources
+            .insert(kind.settings_key(), source.clone());
+        source
+    }
+
+    /// UI 選択対象となる全プロバイダの認証情報取得元キャッシュを更新する。
+    pub fn refresh_all_credential_sources(&mut self) {
+        for kind in AiProviderKind::ui_selectable_providers() {
+            self.refresh_credential_source_for(&kind);
+        }
+        let active = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active);
+    }
+
+    /// UI 描画向けにキャッシュ済みの認証情報取得元を返す（Keyring IPC を発生させない）。
+    #[must_use]
+    pub fn cached_credential_source_for(&self, kind: &AiProviderKind) -> CredentialSource {
+        if &self.selected_provider == kind && self.runtime_api_key.is_some() {
+            return CredentialSource::RuntimeOverride;
+        }
+        self.cached_credential_sources
+            .get(&kind.settings_key())
+            .cloned()
+            .unwrap_or(CredentialSource::Missing)
+    }
+
+    /// キャッシュ済みの情報に基づき現在選択中プロバイダ向けの認証情報が有効か返す。
+    #[must_use]
+    pub fn has_cached_credentials(&self) -> bool {
+        if !self.selected_provider.requires_api_key() {
+            return true;
+        }
+        self.cached_credential_source_for(&self.selected_provider) != CredentialSource::Missing
+    }
+
+    /// 指定プロバイダに対する現在の有効な認証情報取得元を診断して返す。
+    #[must_use]
+    pub fn credential_source_for(&self, kind: &AiProviderKind) -> CredentialSource {
+        let runtime = if &self.selected_provider == kind {
+            self.runtime_api_key.as_ref()
+        } else {
+            None
+        };
+        diagnose_credential_source(kind, runtime, Some(&self.user_settings))
+    }
+
+    /// 現在選択中プロバイダの有効な認証情報取得元を診断して返す。
+    #[must_use]
+    pub fn credential_source(&self) -> CredentialSource {
+        self.credential_source_for(&self.selected_provider)
+    }
+
     /// メモリ上の一時 API キーを設定または解除する（プロジェクト JSON には保存されない）。
     pub fn set_runtime_api_key(&mut self, key: Option<SecretString>) {
         self.runtime_api_key = key;
         self.agent_provider_override = None;
+        let active = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active);
         self.sync_active_agent_runtime();
     }
 
@@ -546,7 +821,170 @@ impl AiChatState {
         if !self.selected_provider.requires_api_key() {
             return true;
         }
-        resolve_api_key(&self.selected_provider, self.runtime_api_key.as_ref()).is_some()
+        resolve_api_key_with_settings(
+            &self.selected_provider,
+            self.runtime_api_key.as_ref(),
+            Some(&self.user_settings),
+        )
+        .is_some()
+    }
+
+    /// `OpenRouter` クレジット取得のバックグラウンド通信が実行中かどうかを返す。
+    #[must_use]
+    pub const fn is_openrouter_credits_loading(&self) -> bool {
+        self.credits_rx.is_some()
+    }
+
+    /// `OpenRouter` の残クレジットをバックグラウンドスレッドで非同期取得する。
+    pub fn refresh_openrouter_credits_async(&mut self) {
+        if self.is_openrouter_credits_loading() {
+            return;
+        }
+        let Some(api_key) = resolve_api_key_with_settings(
+            &AiProviderKind::OpenRouter,
+            self.runtime_api_key.as_ref(),
+            Some(&self.user_settings),
+        ) else {
+            self.openrouter_credits = None;
+            self.openrouter_credits_error = None;
+            return;
+        };
+        let base_url = if self.selected_provider == AiProviderKind::OpenRouter
+            && !self.custom_base_url.trim().is_empty()
+        {
+            self.custom_base_url.clone()
+        } else {
+            self.user_settings
+                .base_url_for(&AiProviderKind::OpenRouter)
+                .unwrap_or_else(|| AiProviderKind::OpenRouter.default_base_url())
+                .to_owned()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.credits_rx = Some(rx);
+        self.openrouter_credits_error = None;
+        std::thread::spawn(move || {
+            let res = fetch_openrouter_credits(&base_url, &api_key, 10).map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+    }
+
+    /// 指定 CLI プラグインの `list_models` をバックグラウンドで実行し、利用可能モデル一覧を更新する。
+    pub fn probe_plugin_models_async(&mut self, plugin_id: &str) {
+        let trimmed = plugin_id.trim();
+        if trimmed.is_empty()
+            || self
+                .plugin_models_probing
+                .get(trimmed)
+                .copied()
+                .unwrap_or(false)
+        {
+            return;
+        }
+        let target_id = trimmed.to_owned();
+        let (tx, rx) = mpsc::channel();
+        self.models_probe_rxs.push(rx);
+        self.plugin_models_probing.insert(target_id.clone(), true);
+        self.plugin_models_note.remove(&target_id);
+        std::thread::spawn(move || {
+            let res = (|| -> Result<Vec<ProbedModelEntry>, String> {
+                let reg = AiPluginRegistry::discover_default();
+                let provider = reg
+                    .resolve_provider(&target_id)
+                    .map_err(|e| e.to_string())?;
+                let discovered = provider
+                    .probe_available_models()
+                    .map_err(|e| e.to_string())?;
+                Ok(discovered
+                    .iter()
+                    .map(DiscoveredAiModel::to_probed_entry)
+                    .collect())
+            })();
+            let _ = tx.send((target_id, res));
+        });
+    }
+
+    /// 現在選択中の CLI プラグインの `list_models` プローブを開始する。
+    pub fn probe_current_plugin_models_async(&mut self) {
+        if let AiProviderKind::Plugin { plugin_id } = &self.selected_provider {
+            let id = plugin_id.clone();
+            self.probe_plugin_models_async(&id);
+        }
+    }
+
+    /// 現在プロバイダに応じて `OpenRouter` クレジットまたは CLI モデル一覧を初回のみ自動取得する。
+    pub fn refresh_active_provider_side_data(&mut self) {
+        match &self.selected_provider {
+            AiProviderKind::OpenRouter
+                if self.openrouter_credits.is_none()
+                    && !self.is_openrouter_credits_loading()
+                    && self.has_resolved_credentials() =>
+            {
+                self.refresh_openrouter_credits_async();
+            }
+            AiProviderKind::Plugin { plugin_id }
+                if !self.discovered_plugin_models.contains_key(plugin_id) =>
+            {
+                let id = plugin_id.clone();
+                self.probe_plugin_models_async(&id);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn poll_background_probes(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = self.credits_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    self.openrouter_credits = Some(snapshot);
+                    self.openrouter_credits_error = None;
+                    changed = true;
+                }
+                Ok(Err(err)) => {
+                    self.openrouter_credits_error = Some(err);
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.credits_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if !self.models_probe_rxs.is_empty() {
+            let receivers = std::mem::take(&mut self.models_probe_rxs);
+            for rx in receivers {
+                match rx.try_recv() {
+                    Ok((plugin_id, Ok(entries))) => {
+                        self.plugin_models_probing.insert(plugin_id.clone(), false);
+                        if entries.is_empty() {
+                            self.plugin_models_note.insert(
+                                plugin_id,
+                                "CLI からモデルが検出されませんでした（認証状態を確認してください）"
+                                    .to_owned(),
+                            );
+                        } else {
+                            self.plugin_models_note.insert(
+                                plugin_id.clone(),
+                                format!("CLI から {} 件のモデルを検出しました", entries.len()),
+                            );
+                            self.discovered_plugin_models.insert(plugin_id, entries);
+                        }
+                        changed = true;
+                    }
+                    Ok((plugin_id, Err(err))) => {
+                        self.plugin_models_probing.insert(plugin_id.clone(), false);
+                        self.plugin_models_note
+                            .insert(plugin_id, format!("モデル検出エラー: {err}"));
+                        changed = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.models_probe_rxs.push(rx);
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+        }
+        changed
     }
 
     /// 非同期処理を実行中かどうか。
@@ -586,6 +1024,7 @@ impl AiChatState {
         self.can_one_click_undo = false;
         self.attached_clip_ids.clear();
         self.attached_folders.clear();
+        self.session_usage = AiSessionUsage::default();
         self.agent_provider_override = None;
         "自然言語で編集指示を入力してください（フォルダ添付で自律構成も可能）"
             .clone_into(&mut self.status_banner);
@@ -600,7 +1039,11 @@ impl AiChatState {
             self.model_name.clone()
         };
         let thinking = self.thinking_level;
-        let key = self.runtime_api_key.clone();
+        let key = resolve_api_key_with_settings(
+            &self.selected_provider,
+            self.runtime_api_key.as_ref(),
+            Some(&self.user_settings),
+        );
         match &self.selected_provider {
             AiProviderKind::Mock => Box::new(MockAiProvider::with_responses([
                 "{\"type\":\"batch\",\"commands\":[]}",
@@ -645,12 +1088,20 @@ impl AiChatState {
                         .with_thinking_level(thinking),
                 ))
             }
-            AiProviderKind::Gemini => Box::new(GeminiProvider::new(
-                GeminiConfig::new(model, key).with_thinking_level(thinking),
-            )),
-            AiProviderKind::Anthropic => Box::new(AnthropicProvider::new(
-                AnthropicConfig::new(model, key).with_thinking_level(thinking),
-            )),
+            AiProviderKind::Gemini => {
+                let mut cfg = GeminiConfig::new(model, key).with_thinking_level(thinking);
+                if !self.custom_base_url.trim().is_empty() {
+                    cfg.base_url.clone_from(&self.custom_base_url);
+                }
+                Box::new(GeminiProvider::new(cfg))
+            }
+            AiProviderKind::Anthropic => {
+                let mut cfg = AnthropicConfig::new(model, key).with_thinking_level(thinking);
+                if !self.custom_base_url.trim().is_empty() {
+                    cfg.base_url.clone_from(&self.custom_base_url);
+                }
+                Box::new(AnthropicProvider::new(cfg))
+            }
         }
     }
 
@@ -751,6 +1202,13 @@ impl AppController {
         if !status_buf.is_empty() {
             self.ai_chat.status_banner = status_buf;
         }
+        let usage = response.usage.clone().unwrap_or_else(|| {
+            AiTokenUsage::estimate_from_chars(
+                req.estimated_input_chars(),
+                response.raw_text.chars().count(),
+            )
+        });
+        self.ai_chat.record_turn_usage(&usage);
         self.finalize_ai_response(trimmed, &response.model, &response.raw_text)
     }
 
@@ -784,6 +1242,7 @@ impl AppController {
         }
 
         let req = self.prepare_ai_request_and_turn(&trimmed)?;
+        let estimated_input_chars = req.estimated_input_chars();
         if self.ai_chat.session_title == "新しいセッション" {
             self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(&trimmed);
         }
@@ -809,6 +1268,7 @@ impl AppController {
         self.ai_chat.running_job = Some(AiChatJobHandle {
             rx,
             prompt: trimmed,
+            estimated_input_chars,
             cancelled: cancel_flag,
         });
         Ok(())
@@ -1125,6 +1585,7 @@ impl AppController {
             provider.unwrap_or_else(|| Arc::from(self.ai_chat.build_provider()));
         self.spawn_resumed_agent_if_needed(resolved_provider, plugin_override);
         self.ai_chat.refresh_session_history();
+        self.ai_chat.refresh_active_provider_side_data();
         "セッションを復元しました（続けて調整指示を出せます）"
             .clone_into(&mut self.ai_chat.status_banner);
         Ok(())
@@ -1146,7 +1607,10 @@ impl AppController {
                 p.preferred_default_model()
                     .clone_into(&mut self.ai_chat.model_name);
             }
-            p.default_base_url()
+            self.ai_chat
+                .user_settings
+                .base_url_for(&p)
+                .unwrap_or_else(|| p.default_base_url())
                 .clone_into(&mut self.ai_chat.custom_base_url);
             self.ai_chat.selected_provider = p;
         }
@@ -1175,7 +1639,9 @@ impl AppController {
         self.ai_chat.pending_question = None;
         self.ai_chat.ask_field_values.clear();
         self.ai_chat.agent_memory = rec.agent_memory;
+        self.ai_chat.session_usage = rec.session_usage;
         self.ai_chat.active_drawer = AiChatDrawer::None;
+        self.ai_chat.refresh_all_credential_sources();
     }
 
     fn spawn_resumed_agent_if_needed(
@@ -1300,9 +1766,9 @@ impl AppController {
         false
     }
 
-    /// 非同期 AI チャットおよび常駐エージェント受信キューをポーリングし、UI 更新が必要なら `true` を返す。
+    /// 非同期 AI チャット・バックグラウンドプローブおよび常駐エージェント受信キューをポーリングし、UI 更新が必要なら `true` を返す。
     pub fn poll_ai_chat(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.ai_chat.poll_background_probes();
 
         if let Some(handle) = self.ai_chat.running_job.take() {
             let mut completed = None;
@@ -1331,6 +1797,16 @@ impl AppController {
             }
 
             if let Some(resp) = completed {
+                let usage = resp.usage.clone().unwrap_or_else(|| {
+                    AiTokenUsage::estimate_from_chars(
+                        handle.estimated_input_chars,
+                        resp.raw_text.chars().count(),
+                    )
+                });
+                self.ai_chat.record_turn_usage(&usage);
+                if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
+                    self.ai_chat.refresh_openrouter_credits_async();
+                }
                 let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
                 self.ai_chat.persist_session();
                 return true;
@@ -1404,6 +1880,13 @@ impl AppController {
                 self.ai_chat.agent_memory = agent_memory;
                 (false, true)
             }
+            AgentHostEvent::UsageReported { usage } => {
+                self.ai_chat.record_turn_usage(&usage);
+                if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
+                    self.ai_chat.refresh_openrouter_credits_async();
+                }
+                (false, true)
+            }
             AgentHostEvent::AskUser {
                 request_id,
                 title,
@@ -1452,22 +1935,7 @@ impl AppController {
                 code,
                 message,
                 recoverable,
-            } => {
-                self.ai_chat.agent_busy = false;
-                self.ai_chat.agent_step_status = None;
-                let formatted = format!("[{code}] {message}");
-                self.ai_chat.last_error = Some(formatted.clone());
-                self.ai_chat.turns.push(AiChatTurn {
-                    role: AiRole::Assistant,
-                    text: format!("エラー: {formatted}"),
-                });
-                self.ai_chat.status_banner = if recoverable {
-                    format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
-                } else {
-                    format!("致命的エラー: {formatted}")
-                };
-                (!recoverable, true)
-            }
+            } => self.handle_agent_error_event(&code, &message, recoverable),
             AgentHostEvent::Exited { reason } => {
                 self.ai_chat.agent_busy = false;
                 self.ai_chat.agent_step_status = None;
@@ -1477,6 +1945,28 @@ impl AppController {
                 (true, true)
             }
         }
+    }
+
+    fn handle_agent_error_event(
+        &mut self,
+        code: &str,
+        message: &str,
+        recoverable: bool,
+    ) -> (bool, bool) {
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
+        let formatted = format!("[{code}] {message}");
+        self.ai_chat.last_error = Some(formatted.clone());
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::Assistant,
+            text: format!("エラー: {formatted}"),
+        });
+        self.ai_chat.status_banner = if recoverable {
+            format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
+        } else {
+            format!("致命的エラー: {formatted}")
+        };
+        (!recoverable, true)
     }
 
     fn handle_agent_ask_user_event(&mut self, snap: PendingAgentQuestionSnapshot) {
@@ -1748,13 +2238,14 @@ pub fn render_ai_chat_panel(
 ) -> impl IntoElement {
     let chat = &controller.ai_chat;
     let theme = cx.theme().clone();
+    let drag_theme = theme.clone();
 
     v_flex()
         .size_full()
         .min_h(px(0.))
         .text_xs()
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(theme.primary)
+            style.border_1().border_color(drag_theme.primary)
         })
         .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _, cx| {
             let mut attached = false;
@@ -1771,12 +2262,39 @@ pub fn render_ai_chat_panel(
             }
         }))
         .child(render_compact_header(chat, ai_provider_select, cx))
+        .children(chat.settings_load_warning.as_ref().map(|warn| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_1p5()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(gpui_kit::rgba(0xf59e_0bff))
+                .bg(theme.secondary)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(gpui_kit::rgba(0xfde6_8aff))
+                        .child(warn.clone()),
+                )
+                .child(
+                    Button::new("ai-repair-settings-json")
+                        .xsmall()
+                        .outline()
+                        .label(tr("ai.open_json"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_ai_settings_json_modal(window, cx);
+                        })),
+                )
+                .into_any_element()
+        }))
         .children(match chat.active_drawer {
             AiChatDrawer::SessionHistory => {
                 Some(render_session_history_drawer(chat, cx).into_any_element())
-            }
-            AiChatDrawer::AgentSettings => {
-                Some(render_agent_settings_drawer(chat, cx).into_any_element())
             }
             AiChatDrawer::None => None,
         })
@@ -1784,13 +2302,18 @@ pub fn render_ai_chat_panel(
         .child(render_prompt_composer(controller, ai_chat_input, cx))
 }
 
-fn format_cred_label(chat: &AiChatState) -> String {
-    if chat.has_resolved_credentials() {
-        "認証: OK".to_owned()
-    } else if let Some(var) = chat.selected_provider.default_env_var() {
-        format!("未設定: {var}")
+fn format_cred_label(provider: &AiProviderKind, has_cred: bool) -> String {
+    if !provider.requires_api_key() {
+        return match provider {
+            AiProviderKind::OllamaCompat => tr("ai.cred_local"),
+            AiProviderKind::Plugin { .. } => tr("ai.cred_cli"),
+            _ => "認証不要".to_owned(),
+        };
+    }
+    if has_cred {
+        tr("ai.cred_ok")
     } else {
-        "認証不要".to_owned()
+        tr("ai.cred_missing")
     }
 }
 
@@ -1800,10 +2323,12 @@ fn render_compact_header(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let cred_color = if chat.has_resolved_credentials() {
-        theme.muted_foreground
-    } else {
+    let has_cred = chat.has_cached_credentials();
+    let missing_required = chat.selected_provider.requires_api_key() && !has_cred;
+    let cred_color = if missing_required {
         theme.danger
+    } else {
+        theme.muted_foreground
     };
 
     let mut history_btn = Button::new("ai-session-history-toggle")
@@ -1815,18 +2340,29 @@ fn render_compact_header(
         history_btn.ghost()
     };
 
-    let mut settings_btn = Button::new("ai-agent-settings-toggle").xsmall().label("⚙");
-    settings_btn = if chat.active_drawer == AiChatDrawer::AgentSettings {
-        settings_btn.primary()
-    } else {
-        settings_btn.ghost()
-    };
+    let settings_btn = Button::new("ai-agent-settings-toggle")
+        .ghost()
+        .xsmall()
+        .label("⚙");
+
+    let cred_badge = div()
+        .id("ai-header-cred-btn")
+        .cursor_pointer()
+        .px_1()
+        .py_0p5()
+        .rounded(px(4.))
+        .hover(|s| s.bg(theme.secondary))
+        .text_color(cred_color)
+        .child(format_cred_label(&chat.selected_provider, has_cred))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_ai_settings_modal(AiSettingsTab::ApiKeys, window, cx);
+        }));
 
     let mut right_actions = h_flex()
         .items_center()
         .gap_0p5()
         .flex_shrink_0()
-        .child(div().text_color(cred_color).child(format_cred_label(chat)))
+        .child(cred_badge)
         .child(history_btn.on_click(cx.listener(|this, _, _, cx| {
             this.controller.ai_chat.active_drawer =
                 if this.controller.ai_chat.active_drawer == AiChatDrawer::SessionHistory {
@@ -1837,14 +2373,8 @@ fn render_compact_header(
                 };
             cx.notify();
         })))
-        .child(settings_btn.on_click(cx.listener(|this, _, _, cx| {
-            this.controller.ai_chat.active_drawer =
-                if this.controller.ai_chat.active_drawer == AiChatDrawer::AgentSettings {
-                    AiChatDrawer::None
-                } else {
-                    AiChatDrawer::AgentSettings
-                };
-            cx.notify();
+        .child(settings_btn.on_click(cx.listener(|this, _, window, cx| {
+            this.open_ai_settings_modal(AiSettingsTab::ApiKeys, window, cx);
         })));
 
     if !chat.turns.is_empty() || chat.active_agent.is_some() {
@@ -1867,13 +2397,13 @@ fn render_compact_header(
         .flex_shrink_0()
         .items_center()
         .justify_between()
-        .gap_1p5()
+        .gap_1()
         .px_2()
         .py_1p5()
         .border_b_1()
         .border_color(theme.border)
         .child(
-            div().flex_1().min_w(px(80.)).child(
+            div().flex_1().min_w(px(64.)).overflow_hidden().child(
                 Select::new(ai_provider_select)
                     .menu_width(px(230.))
                     .with_size(Size::XSmall),
@@ -2097,34 +2627,13 @@ fn render_diff_card(
     )
 }
 
-fn format_model_menu_label(
-    preset: &AiModelPreset,
-    is_selected: bool,
-    current_thinking: AiThinkingLevel,
-) -> String {
-    let mut parts = vec![preset.display_name.to_owned()];
-    if !preset.thinking_levels.is_empty() {
-        let displayed_level = if is_selected {
-            current_thinking
-        } else if preset.thinking_levels.contains(&AiThinkingLevel::Medium) {
-            AiThinkingLevel::Medium
-        } else {
-            preset.default_thinking
-        };
-        parts.push(displayed_level.display_label().to_owned());
-    }
-    if let Some(badge) = preset.badge {
-        parts.push(format!("[{badge}]"));
-    }
-    parts.join("  ")
-}
-
 fn render_model_menu_button(
     chat: &AiChatState,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let weak = cx.weak_entity();
-    let catalog = chat.selected_provider.model_catalog();
+    let models = chat.resolved_models_for_current_provider();
+    let supports_custom = chat.selected_provider.supports_custom_models();
     let current_model = chat.model_name.clone();
     let current_thinking = chat.thinking_level;
     let trigger_label = format!("{} ▾", chat.active_model_display_name());
@@ -2141,17 +2650,42 @@ fn render_model_menu_button(
                 .check_side(Side::Right)
                 .label("Model (クリックで Medium 標準選択)");
 
-            for preset in catalog {
-                let is_selected = preset.id == current_model;
-                let row_label = format_model_menu_label(preset, is_selected, current_thinking);
-                let model_id = preset.id;
+            for model in &models {
+                let is_selected = model.id == current_model;
+                let row_label = model.format_menu_label(is_selected, current_thinking);
+                let model_id = model.id.clone();
                 let weak_item = weak.clone();
-                popup = popup.item(PopupMenuItem::new(row_label).checked(is_selected).on_click(
+                popup = popup.item(
+                    PopupMenuItem::new(row_label)
+                        .checked(is_selected)
+                        .disabled(!model.available)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_item.update(cx, |view, cx| {
+                                view.controller
+                                    .ai_chat
+                                    .select_model_default_medium(&model_id);
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            popup = popup.separator();
+            if supports_custom {
+                let weak_manage = weak.clone();
+                popup = popup.item(PopupMenuItem::new(tr("ai.add_manage_models")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_manage.update(cx, |view, cx| {
+                            view.open_ai_settings_modal(AiSettingsTab::Models, window, cx);
+                        });
+                    },
+                ));
+            } else {
+                let weak_refresh = weak.clone();
+                popup = popup.item(PopupMenuItem::new(tr("ai.refresh_models")).on_click(
                     move |_, _, cx| {
-                        let _ = weak_item.update(cx, |view, cx| {
-                            view.controller
-                                .ai_chat
-                                .select_model_default_medium(model_id);
+                        let _ = weak_refresh.update(cx, |view, cx| {
+                            view.controller.ai_chat.probe_current_plugin_models_async();
                             cx.notify();
                         });
                     },
@@ -2183,7 +2717,7 @@ fn render_thinking_menu_button(
                     .min_w(px(136.))
                     .check_side(Side::Right)
                     .label("Thinking Level");
-                for &level in options {
+                for &level in &options {
                     let weak_item = weak.clone();
                     popup = popup.item(
                         PopupMenuItem::new(level.display_label())
@@ -2612,7 +3146,8 @@ fn render_prompt_composer(
                 .gap_1()
                 .child(selectors)
                 .child(action_btn),
-        );
+        )
+        .child(render_usage_footer(chat, cx));
 
     let mut outer = v_flex().w_full().px_2().pb_2().pt_1().flex_shrink_0();
     if let Some(ac_bar) = render_at_autocomplete_bar(controller, ai_chat_input, cx) {
@@ -2621,15 +3156,280 @@ fn render_prompt_composer(
     outer.child(card)
 }
 
+fn format_compact_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        let tenths = tokens / 100;
+        if tenths.is_multiple_of(10) || tokens >= 100_000 {
+            return format!("{}k", tokens / 1_000);
+        }
+        return format!("{}.{}k", tenths / 10, tenths % 10);
+    }
+    let tenths_m = tokens / 100_000;
+    if tenths_m.is_multiple_of(10) {
+        format!("{}M", tokens / 1_000_000)
+    } else {
+        format!("{}.{}M", tenths_m / 10, tenths_m % 10)
+    }
+}
+
+fn format_usd(amount: f64) -> String {
+    if !amount.is_finite() || amount <= 0.0 {
+        return "$0.00".to_owned();
+    }
+    if amount < 0.01 {
+        return format!("${amount:.4}");
+    }
+    if amount < 1.0 {
+        return format!("${amount:.3}");
+    }
+    format!("${amount:.2}")
+}
+
+fn context_usage_info(chat: &AiChatState) -> Option<(u64, u64, u64)> {
+    let win = chat
+        .active_resolved_model()
+        .and_then(|m| m.context_window_tokens)
+        .filter(|&w| w > 0)?;
+    let used = chat.session_usage.last_context_tokens;
+    let remaining = win.saturating_sub(used);
+    Some((win, used, remaining))
+}
+
+fn format_session_used_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) -> String {
+    let prefix = tr("ai.usage_session");
+    let est = if chat.session_usage.has_estimated_tokens {
+        "~"
+    } else {
+        ""
+    };
+    let tok_str = format!(
+        "{est}{} tok",
+        format_compact_tokens(chat.session_usage.total_tokens)
+    );
+    let cost_str = chat
+        .session_usage
+        .has_known_cost
+        .then(|| format_usd(chat.session_usage.cost_usd));
+    let budget = chat
+        .user_settings
+        .budget_usd
+        .filter(|b| b.is_finite() && *b > 0.0);
+    let pct_str = if let Some(b) = budget
+        && chat.session_usage.has_known_cost
+    {
+        let pct = ((chat.session_usage.cost_usd / b) * 100.0).clamp(0.0, 999.0);
+        Some(format!("{pct:.0}%"))
+    } else {
+        ctx.map(|(win, used, _)| format!("{}%", used.saturating_mul(100) / win))
+    };
+
+    match chat.user_settings.usage_display_mode {
+        UsageDisplayPreference::Tokens => format!("{prefix} {tok_str}"),
+        UsageDisplayPreference::Cost => {
+            if chat.selected_provider == AiProviderKind::OllamaCompat {
+                format!("{prefix} Local ($0.00)")
+            } else if let Some(cost) = cost_str {
+                format!("{prefix} {cost}")
+            } else {
+                format!("{prefix} $— ({tok_str})")
+            }
+        }
+        UsageDisplayPreference::Percent => pct_str.map_or_else(
+            || format!("{prefix} {tok_str}"),
+            |pct| format!("{prefix} {pct}"),
+        ),
+        UsageDisplayPreference::Auto => {
+            if chat.selected_provider == AiProviderKind::OllamaCompat {
+                format!("{prefix} {tok_str} (Local)")
+            } else if matches!(chat.selected_provider, AiProviderKind::Plugin { .. }) {
+                if let Some(cost) = cost_str {
+                    format!("{prefix} {tok_str} ({cost})")
+                } else if let Some(pct) = pct_str {
+                    format!("{prefix} {tok_str} ({pct})")
+                } else {
+                    format!("{prefix} {tok_str}")
+                }
+            } else if let Some(cost) = cost_str {
+                format!("{prefix} {tok_str} ({cost})")
+            } else {
+                format!("{prefix} {tok_str}")
+            }
+        }
+    }
+}
+
+fn format_remaining_openrouter(chat: &AiChatState, ctx_label: Option<&str>) -> String {
+    let prefix = tr("ai.usage_remaining");
+    if chat.is_openrouter_credits_loading() {
+        return format!("{prefix} {}", tr("ai.usage_loading"));
+    }
+    if let Some(credits) = &chat.openrouter_credits {
+        let usd = format_usd(credits.remaining_usd);
+        return match chat.user_settings.usage_display_mode {
+            UsageDisplayPreference::Tokens => {
+                ctx_label.map_or_else(|| format!("{prefix} {usd}"), |c| format!("{prefix} {c}"))
+            }
+            UsageDisplayPreference::Cost => format!("{prefix} {usd}"),
+            UsageDisplayPreference::Percent => credits.remaining_percent.map_or_else(
+                || format!("{prefix} {usd}"),
+                |p| format!("{prefix} {p:.0}%"),
+            ),
+            UsageDisplayPreference::Auto => credits.remaining_percent.map_or_else(
+                || format!("{prefix} {usd}"),
+                |p| format!("{prefix} {usd} ({p:.0}%)"),
+            ),
+        };
+    }
+    if chat.openrouter_credits_error.is_some() {
+        let err_label = tr("ai.usage_credits_err");
+        return ctx_label.map_or_else(
+            || format!("{prefix} {err_label}"),
+            |ctx| format!("{prefix} {ctx} / {err_label}"),
+        );
+    }
+    if let Some(ctx) = ctx_label {
+        return format!("{prefix} {ctx}");
+    }
+    if chat.has_cached_credentials() {
+        format!("{prefix} {}", tr("ai.usage_credits_unfetched"))
+    } else {
+        format!("{prefix} {}", tr("ai.usage_key_missing"))
+    }
+}
+
+fn format_remaining_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) -> String {
+    let prefix = tr("ai.usage_remaining");
+    let ctx_label = ctx.map(|(win, _, rem)| {
+        let rem_pct = rem.saturating_mul(100) / win;
+        format!("Ctx {} ({rem_pct}%)", format_compact_tokens(rem))
+    });
+    let budget_rem = chat
+        .user_settings
+        .budget_usd
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .map(|budget| {
+            let rem = (budget - chat.session_usage.cost_usd).max(0.0);
+            let pct = ((rem / budget) * 100.0).clamp(0.0, 100.0);
+            (format_usd(rem), format!("{pct:.0}%"))
+        });
+
+    match &chat.selected_provider {
+        AiProviderKind::OpenRouter => format_remaining_openrouter(chat, ctx_label.as_deref()),
+        AiProviderKind::OllamaCompat => {
+            let detail = ctx_label.unwrap_or_else(|| tr("ai.usage_local_free"));
+            format!("{prefix} {detail} / Local")
+        }
+        AiProviderKind::Plugin { .. } => {
+            let cli_label = tr("ai.usage_cli_managed");
+            ctx_label.map_or_else(
+                || format!("{prefix} {cli_label}"),
+                |ctx_str| format!("{prefix} {ctx_str} / {cli_label}"),
+            )
+        }
+        AiProviderKind::Mock => ctx_label.map_or_else(
+            || format!("{prefix} Mock"),
+            |ctx_str| format!("{prefix} {ctx_str}"),
+        ),
+        AiProviderKind::OpenAi | AiProviderKind::Gemini | AiProviderKind::Anthropic => {
+            match chat.user_settings.usage_display_mode {
+                UsageDisplayPreference::Tokens => {
+                    ctx_label.map_or_else(|| format!("{prefix} —"), |c| format!("{prefix} {c}"))
+                }
+                UsageDisplayPreference::Cost => {
+                    if let Some((usd, _)) = budget_rem {
+                        format!("{prefix} {usd}")
+                    } else if let Some(c) = ctx_label {
+                        format!("{prefix} {c}")
+                    } else {
+                        format!("{prefix} {}", tr("ai.usage_budget_unset"))
+                    }
+                }
+                UsageDisplayPreference::Percent => {
+                    if let Some((_, pct)) = budget_rem {
+                        format!("{prefix} {pct}")
+                    } else if let Some((win, _, rem)) = ctx {
+                        format!("{prefix} {}%", rem.saturating_mul(100) / win)
+                    } else {
+                        format!("{prefix} —")
+                    }
+                }
+                UsageDisplayPreference::Auto => match (budget_rem, ctx_label) {
+                    (Some((usd, _)), Some(c)) => format!("{prefix} {usd} / {c}"),
+                    (Some((usd, pct)), None) => format!("{prefix} {usd} ({pct})"),
+                    (None, Some(c)) => format!("{prefix} {c}"),
+                    (None, None) => format!("{prefix} {}", tr("ai.usage_budget_unset")),
+                },
+            }
+        }
+    }
+}
+
+/// 送信ボタン下フッタに表示する `(セッション使用量文字列, 残量文字列)` をプロバイダ別形式で生成する。
+#[must_use]
+pub fn format_usage_footer_parts(chat: &AiChatState) -> (String, String) {
+    let ctx = context_usage_info(chat);
+    (
+        format_session_used_footer(chat, ctx),
+        format_remaining_footer(chat, ctx),
+    )
+}
+
+fn render_usage_footer(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let (session_str, remaining_str) = format_usage_footer_parts(chat);
+
+    let mut right = h_flex().items_center().gap_1().child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(remaining_str),
+    );
+    if chat.selected_provider == AiProviderKind::OpenRouter {
+        right = right.child(
+            Button::new("ai-usage-refresh-credits")
+                .xsmall()
+                .ghost()
+                .label("↻")
+                .disabled(chat.is_openrouter_credits_loading())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller.ai_chat.refresh_openrouter_credits_async();
+                    cx.notify();
+                })),
+        );
+    }
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_1()
+        .flex_wrap()
+        .pt_0p5()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(session_str),
+        )
+        .child(right)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AiApprovalMode, AiChatState, apply_at_completion, build_provider_select_items,
-        find_trailing_at_query, format_at_mention_token, format_model_menu_label,
+        find_trailing_at_query, format_at_mention_token, format_usage_footer_parts,
         matching_at_mention_names, provider_safety_notice, provider_select_index,
     };
-    use crate::ai::provider::{AiProviderKind, AiThinkingLevel};
+    use crate::ai::provider::{AiProviderKind, AiThinkingLevel, AiTokenUsage};
     use crate::ai::providers::mock::MockAiProvider;
+    use crate::ai::providers::openai_compat::OpenRouterCreditsSnapshot;
+    use crate::ai::settings::UsageDisplayPreference;
     use crate::core::ids::ClipId;
     use crate::ui::app_controller::AppController;
 
@@ -2674,16 +3474,18 @@ mod tests {
         // 思考レベルを持たないモデル (Orchestrator) へ切替時は Auto に戻り選択肢も空になる
         chat.select_model("gemini-pro-orchestrator-g1-pro", AiThinkingLevel::High);
         assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
-        assert_eq!(chat.active_thinking_options(), []);
+        assert_eq!(chat.active_thinking_options(), Vec::new());
         assert_eq!(chat.active_model_label(), "Orchestrator (Argon)");
 
         chat.select_thinking_level(AiThinkingLevel::High);
         assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
 
-        let hydrogen = agy
-            .model_preset("gemini-4-hydrogen")
+        let models = chat.resolved_models_for_provider(&agy);
+        let hydrogen = models
+            .iter()
+            .find(|m| m.id == "gemini-4-hydrogen")
             .ok_or("hydrogen preset missing")?;
-        let formatted = format_model_menu_label(hydrogen, true, AiThinkingLevel::Extra);
+        let formatted = hydrogen.format_menu_label(true, AiThinkingLevel::Extra);
         assert!(formatted.contains("Gemini 4 Hydrogen"));
         assert!(formatted.contains("Extra"));
         assert!(formatted.contains("[New]"));
@@ -2728,15 +3530,58 @@ mod tests {
         assert_eq!(chat.model_name, "gemini-4-hydrogen");
         assert_eq!(chat.thinking_level, AiThinkingLevel::Medium);
 
-        let hydrogen = agy
-            .model_preset("gemini-4-hydrogen")
+        let models = chat.resolved_models_for_provider(&agy);
+        let hydrogen = models
+            .iter()
+            .find(|m| m.id == "gemini-4-hydrogen")
             .ok_or("hydrogen preset missing")?;
-        let unselected_label = format_model_menu_label(hydrogen, false, AiThinkingLevel::Extra);
+        let unselected_label = hydrogen.format_menu_label(false, AiThinkingLevel::Extra);
         assert!(unselected_label.contains("Medium"));
 
         chat.select_model_default_medium("gemini-pro-orchestrator-g1-pro");
         assert_eq!(chat.thinking_level, AiThinkingLevel::Auto);
         Ok(())
+    }
+
+    #[test]
+    fn usage_footer_formats_across_providers_and_preferences() {
+        let mut chat = AiChatState::default();
+        chat.select_provider(AiProviderKind::OpenRouter);
+        chat.openrouter_credits = Some(OpenRouterCreditsSnapshot {
+            total_credits_usd: 10.0,
+            total_usage_usd: 5.18,
+            remaining_usd: 4.82,
+            remaining_percent: Some(48.2),
+        });
+        chat.record_turn_usage(&AiTokenUsage {
+            input_tokens: 1_200,
+            output_tokens: 300,
+            total_tokens: 1_500,
+            cost_usd: Some(0.015),
+            is_estimated: false,
+        });
+        let (left, right) = format_usage_footer_parts(&chat);
+        assert!(left.contains("1.5k tok") && left.contains("$0.015"));
+        assert!(right.contains("$4.82") && right.contains("48%"));
+
+        chat.user_settings.usage_display_mode = UsageDisplayPreference::Tokens;
+        let (tok_left, tok_right) = format_usage_footer_parts(&chat);
+        assert!(!tok_left.contains("$0.015"));
+        assert!(tok_right.contains("Ctx"));
+
+        chat.user_settings.usage_display_mode = UsageDisplayPreference::Percent;
+        let (_pct_left, pct_right) = format_usage_footer_parts(&chat);
+        assert!(pct_right.contains("48%"));
+
+        chat.user_settings.usage_display_mode = UsageDisplayPreference::Auto;
+        chat.select_provider(AiProviderKind::OllamaCompat);
+        let (loc_left, loc_right) = format_usage_footer_parts(&chat);
+        assert!(loc_left.contains("Local"));
+        assert!(loc_right.contains("Local"));
+
+        chat.user_settings.usage_display_mode = UsageDisplayPreference::Cost;
+        let (loc_cost_left, _) = format_usage_footer_parts(&chat);
+        assert!(loc_cost_left.contains("Local ($0.00)"));
     }
 
     #[test]
@@ -2800,6 +3645,7 @@ mod tests {
         controller.ai_chat.running_job = Some(super::AiChatJobHandle {
             rx,
             prompt: "テスト指示".to_owned(),
+            estimated_input_chars: 0,
             cancelled: std::sync::Arc::clone(&cancelled),
         });
         controller.ai_chat.streaming_preview = "{\"type\":\"batch\"".to_owned();
@@ -2882,6 +3728,7 @@ mod tests {
             turns: Vec::new(),
             pending_question: None,
             agent_memory: serde_json::Value::Null,
+            session_usage: crate::ai::session_store::AiSessionUsage::default(),
         };
         store.save_session(&rec)?;
 

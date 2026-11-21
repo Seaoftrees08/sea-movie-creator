@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
-    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiToolCall, AiTurnMessage,
-    SecretString,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, AiToolCall,
+    AiTurnMessage, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
@@ -241,16 +241,19 @@ impl AiProvider for GeminiProvider {
             body: &body,
             timeout_secs: self.config.timeout_secs,
         };
+        let mut sse_usage: Option<AiTokenUsage> = None;
+        let mut sync_usage: Option<AiTokenUsage> = None;
         let raw_text = post_json_streaming_or_sync(
             &http_req,
-            parse_gemini_json_text,
-            parse_gemini_sync_text,
+            |payload| parse_gemini_json_text(payload, &mut sse_usage),
+            |val| parse_gemini_sync_text(val, &mut sync_usage),
             on_event,
         )?;
 
         let response = AiResponse {
             raw_text,
             model: self.config.model.clone(),
+            usage: sse_usage.or(sync_usage),
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
@@ -382,18 +385,62 @@ fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
         tool_calls,
         model: model.to_owned(),
         finish_reason: candidate["finishReason"].as_str().map(ToOwned::to_owned),
+        usage: extract_gemini_usage(val),
     })
 }
 
-fn parse_gemini_json_text(payload: &str) -> Result<Option<String>, AiError> {
+fn parse_gemini_json_text(
+    payload: &str,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<Option<String>, AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("Gemini SSE JSON parse failed: {err}")))?;
+    if let Some(usage) = extract_gemini_usage(&val) {
+        *captured_usage = Some(usage);
+    }
     Ok(extract_candidate_text(&val))
 }
 
-fn parse_gemini_sync_text(val: &Value) -> Result<String, AiError> {
+fn parse_gemini_sync_text(
+    val: &Value,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<String, AiError> {
+    if let Some(usage) = extract_gemini_usage(val) {
+        *captured_usage = Some(usage);
+    }
     extract_candidate_text(val)
         .ok_or_else(|| AiError::ParseFailed("Gemini response missing candidates text".to_owned()))
+}
+
+fn extract_gemini_usage(val: &Value) -> Option<AiTokenUsage> {
+    let meta = val.get("usageMetadata")?.as_object()?;
+    let input_tokens = meta
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let candidates = meta
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let thoughts = meta
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = candidates.saturating_add(thoughts);
+    let total_tokens = meta
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(AiTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cost_usd: None,
+        is_estimated: false,
+    })
 }
 
 fn extract_candidate_text(val: &Value) -> Option<String> {
@@ -417,7 +464,7 @@ mod tests {
 
     #[test]
     fn gemini_sync_and_header_work_against_mock_server() -> Result<(), Box<dyn std::error::Error>> {
-        let body = r#"{"candidates":[{"content":{"parts":[{"text":"{\"type\":\"rename_layer\",\"layer_id\":\"L1\"}"}]}}]}"#;
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"{\"type\":\"rename_layer\",\"layer_id\":\"L1\"}"}]}}],"usageMetadata":{"promptTokenCount":80,"candidatesTokenCount":30,"thoughtsTokenCount":15,"totalTokenCount":125}}"#;
         let (addr, server) = spawn_single_response_server("application/json", body)?;
 
         let mut cfg = GeminiConfig::new(
@@ -441,6 +488,10 @@ mod tests {
             res.raw_text,
             "{\"type\":\"rename_layer\",\"layer_id\":\"L1\"}"
         );
+        let usage = res.usage.as_ref().ok_or("expected Gemini usage")?;
+        assert_eq!(usage.input_tokens, 80);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.total_tokens, 125);
 
         let captured = server
             .join()

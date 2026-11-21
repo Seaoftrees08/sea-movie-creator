@@ -186,7 +186,7 @@ impl AiThinkingLevel {
 }
 
 /// UI のモデル選択メニューに表示するモデル定義。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AiModelPreset {
     /// API / プラグインへ渡すモデル識別子（または ACP プロファイル名）。
     pub id: &'static str,
@@ -198,6 +198,12 @@ pub struct AiModelPreset {
     pub thinking_levels: &'static [AiThinkingLevel],
     /// このモデル選択時の既定思考レベル。
     pub default_thinking: AiThinkingLevel,
+    /// コンテキストウィンドウ上限トークン数（不明時は `None`）。
+    pub context_window_tokens: Option<u64>,
+    /// 100 万入力トークンあたりの概算単価（USD、不明・無料時は `None`）。
+    pub input_price_per_1m_usd: Option<f64>,
+    /// 100 万出力トークンあたりの概算単価（USD、不明・無料時は `None`）。
+    pub output_price_per_1m_usd: Option<f64>,
 }
 
 const THINKING_AUTO_TO_HIGH: &[AiThinkingLevel] = &[
@@ -227,6 +233,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_047_576),
+        input_price_per_1m_usd: Some(0.40),
+        output_price_per_1m_usd: Some(1.60),
     },
     AiModelPreset {
         id: "gpt-4.1",
@@ -234,6 +243,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_047_576),
+        input_price_per_1m_usd: Some(2.00),
+        output_price_per_1m_usd: Some(8.00),
     },
     AiModelPreset {
         id: "gpt-5",
@@ -241,6 +253,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(400_000),
+        input_price_per_1m_usd: Some(1.25),
+        output_price_per_1m_usd: Some(10.00),
     },
     AiModelPreset {
         id: "gpt-5-mini",
@@ -248,6 +263,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(400_000),
+        input_price_per_1m_usd: Some(0.25),
+        output_price_per_1m_usd: Some(2.00),
     },
     AiModelPreset {
         id: "o4-mini",
@@ -255,6 +273,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(1.10),
+        output_price_per_1m_usd: Some(4.40),
     },
     AiModelPreset {
         id: "o3",
@@ -262,6 +283,9 @@ const OPENAI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(2.00),
+        output_price_per_1m_usd: Some(8.00),
     },
 ];
 
@@ -272,6 +296,9 @@ const OPENROUTER_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "google/gemini-2.5-pro",
@@ -279,6 +306,9 @@ const OPENROUTER_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_048_576),
+        input_price_per_1m_usd: Some(1.25),
+        output_price_per_1m_usd: Some(10.00),
     },
     AiModelPreset {
         id: "anthropic/claude-sonnet-4",
@@ -286,6 +316,9 @@ const OPENROUTER_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(3.00),
+        output_price_per_1m_usd: Some(15.00),
     },
     AiModelPreset {
         id: "openai/gpt-5",
@@ -293,6 +326,9 @@ const OPENROUTER_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(400_000),
+        input_price_per_1m_usd: Some(1.25),
+        output_price_per_1m_usd: Some(10.00),
     },
     AiModelPreset {
         id: "openai/gpt-4.1-mini",
@@ -300,6 +336,9 @@ const OPENROUTER_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_047_576),
+        input_price_per_1m_usd: Some(0.40),
+        output_price_per_1m_usd: Some(1.60),
     },
 ];
 
@@ -310,6 +349,9 @@ const OLLAMA_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(32_768),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "qwen3:8b",
@@ -317,6 +359,9 @@ const OLLAMA_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(32_768),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "deepseek-r1:8b",
@@ -324,6 +369,9 @@ const OLLAMA_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(32_768),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "gemma3:12b",
@@ -331,6 +379,9 @@ const OLLAMA_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(32_768),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
 ];
 
@@ -341,6 +392,9 @@ const GEMINI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_048_576),
+        input_price_per_1m_usd: Some(0.15),
+        output_price_per_1m_usd: Some(0.60),
     },
     AiModelPreset {
         id: "gemini-2.5-pro",
@@ -348,6 +402,9 @@ const GEMINI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_048_576),
+        input_price_per_1m_usd: Some(1.25),
+        output_price_per_1m_usd: Some(10.00),
     },
     AiModelPreset {
         id: "gemini-2.5-flash-lite",
@@ -355,6 +412,9 @@ const GEMINI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_048_576),
+        input_price_per_1m_usd: Some(0.10),
+        output_price_per_1m_usd: Some(0.40),
     },
 ];
 
@@ -365,6 +425,9 @@ const ANTHROPIC_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(3.00),
+        output_price_per_1m_usd: Some(15.00),
     },
     AiModelPreset {
         id: "claude-opus-4-1-20250805",
@@ -372,6 +435,9 @@ const ANTHROPIC_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(15.00),
+        output_price_per_1m_usd: Some(75.00),
     },
     AiModelPreset {
         id: "claude-3-7-sonnet-20250219",
@@ -379,6 +445,9 @@ const ANTHROPIC_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: Some(3.00),
+        output_price_per_1m_usd: Some(15.00),
     },
 ];
 
@@ -389,6 +458,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(1_000_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "gemini-4-hydrogen",
@@ -396,6 +468,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: THINKING_LOW_TO_EXTRA,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(1_000_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "gemini-pro-orchestrator-g1-pro",
@@ -403,6 +478,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(1_000_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "gemini-3.8-flash",
@@ -410,6 +488,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(1_000_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "claude-opus-5-5",
@@ -417,6 +498,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "claude-sonnet-5-5",
@@ -424,6 +508,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: Some("New"),
         thinking_levels: THINKING_LOW_TO_HIGH,
         default_thinking: AiThinkingLevel::Medium,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "gpt-oss-120b-medium",
@@ -431,6 +518,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(128_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "plugin-default",
@@ -438,6 +528,9 @@ const ANTIGRAVITY_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: None,
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
 ];
 
@@ -448,6 +541,9 @@ const ACP_CLI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "codex",
@@ -455,6 +551,9 @@ const ACP_CLI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: THINKING_AUTO_TO_HIGH,
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: Some(200_000),
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
     AiModelPreset {
         id: "copilot",
@@ -462,6 +561,9 @@ const ACP_CLI_MODELS: &[AiModelPreset] = &[
         badge: None,
         thinking_levels: &[],
         default_thinking: AiThinkingLevel::Auto,
+        context_window_tokens: None,
+        input_price_per_1m_usd: None,
+        output_price_per_1m_usd: None,
     },
 ];
 
@@ -471,6 +573,9 @@ const MOCK_MODELS: &[AiModelPreset] = &[AiModelPreset {
     badge: None,
     thinking_levels: &[],
     default_thinking: AiThinkingLevel::Auto,
+    context_window_tokens: Some(32_000),
+    input_price_per_1m_usd: None,
+    output_price_per_1m_usd: None,
 }];
 
 /// 利用可能な組み込み HTTP・プラグイン AI プロバイダ種別。
@@ -571,6 +676,44 @@ impl AiProviderKind {
             Self::Anthropic => Some("anthropic_api_key"),
             Self::Mock | Self::Plugin { .. } => None,
         }
+    }
+
+    /// AI プラグインの実行時はプラグイン ID に応じた既定プロファイルがあるかを考慮し、
+    /// `ai_settings.json` 等で使用する統一識別キー (`settings_key`) を返す。
+    #[must_use]
+    pub fn settings_key(&self) -> String {
+        match self {
+            Self::OpenAi => "open_ai".to_owned(),
+            Self::OpenRouter => "open_router".to_owned(),
+            Self::OllamaCompat => "ollama_compat".to_owned(),
+            Self::Gemini => "gemini".to_owned(),
+            Self::Anthropic => "anthropic".to_owned(),
+            Self::Plugin { plugin_id } => format!("plugin:{plugin_id}"),
+            Self::Mock => "mock".to_owned(),
+        }
+    }
+
+    /// 手書き JSON 等で指定されたプロバイダキー文字列（エイリアス含む）を正規 `settings_key` へ統一する。
+    #[must_use]
+    pub fn normalize_settings_key(raw: &str) -> String {
+        let trimmed = raw.trim().to_ascii_lowercase();
+        match trimmed.as_str() {
+            "openai" | "open_ai" => "open_ai".to_owned(),
+            "openrouter" | "open_router" => "open_router".to_owned(),
+            "ollama" | "ollama_compat" | "local" => "ollama_compat".to_owned(),
+            "google_gemini" | "gemini" => "gemini".to_owned(),
+            "claude" | "anthropic" => "anthropic".to_owned(),
+            _ => trimmed,
+        }
+    }
+
+    /// ユーザーが設定画面や JSON から自由にモデルを追加・編集できるプロバイダかを返す。
+    #[must_use]
+    pub const fn supports_custom_models(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenAi | Self::OpenRouter | Self::OllamaCompat | Self::Gemini | Self::Anthropic
+        )
     }
 
     /// UI の API 切り替えコンボボックスに表示するプロバイダ一覧を返す。
@@ -688,17 +831,106 @@ pub struct AiRequest {
     pub stream: bool,
 }
 
+impl AiRequest {
+    /// システム指示・スキーマ・タイムライン要約・履歴・ユーザー指示を含む推定入力文字数を返す。
+    #[must_use]
+    pub fn estimated_input_chars(&self) -> usize {
+        let history_chars: usize = self
+            .history
+            .iter()
+            .map(|msg| msg.content.chars().count().saturating_add(16))
+            .sum();
+        let schema_chars = self.command_schema_json.to_string().chars().count();
+        let summary_chars = self.context_summary.to_string().chars().count();
+        self.system_prompt
+            .chars()
+            .count()
+            .saturating_add(schema_chars)
+            .saturating_add(summary_chars)
+            .saturating_add(history_chars)
+            .saturating_add(self.user_prompt.chars().count())
+    }
+}
+
+/// AI 応答 1 ターン分のトークン使用量・概算コストメタデータ。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiTokenUsage {
+    /// 入力（プロンプト／コンテキスト）トークン数。
+    pub input_tokens: u64,
+    /// 出力（生成・推論）トークン数。
+    pub output_tokens: u64,
+    /// 合計トークン数。
+    pub total_tokens: u64,
+    /// プロバイダから直接返された利用額（USD、例: `OpenRouter` の `usage.cost`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// プロバイダ非返却のため文字数等から推定した値なら `true`。
+    pub is_estimated: bool,
+}
+
+impl AiTokenUsage {
+    /// 文字数から概算トークン使用量を推定する（外部 CLI 等が usage を返さない場合用）。
+    #[must_use]
+    pub fn estimate_from_chars(input_chars: usize, output_chars: usize) -> Self {
+        let input_tokens = estimate_tokens_for_char_count(input_chars);
+        let output_tokens = estimate_tokens_for_char_count(output_chars);
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd: None,
+            is_estimated: true,
+        }
+    }
+
+    /// モデル単価（100 万トークンあたり USD）を用いてこのターンの概算コスト（USD）を算出する。
+    #[must_use]
+    pub fn resolved_cost_usd(
+        &self,
+        input_price_per_1m_usd: Option<f64>,
+        output_price_per_1m_usd: Option<f64>,
+    ) -> Option<f64> {
+        if let Some(exact) = self.cost_usd
+            && exact.is_finite()
+            && exact >= 0.0
+        {
+            return Some(exact);
+        }
+        let in_price = input_price_per_1m_usd?;
+        let out_price = output_price_per_1m_usd?;
+        let cost = (tokens_to_f64(self.input_tokens) * in_price
+            + tokens_to_f64(self.output_tokens) * out_price)
+            / 1_000_000.0;
+        cost.is_finite().then_some(cost.max(0.0))
+    }
+}
+
+fn estimate_tokens_for_char_count(char_count: usize) -> u64 {
+    if char_count == 0 {
+        0
+    } else {
+        u64::try_from(char_count.div_ceil(4)).unwrap_or(u64::MAX)
+    }
+}
+
+fn tokens_to_f64(tokens: u64) -> f64 {
+    f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
+}
+
 /// AI プロバイダからの完了応答。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AiResponse {
     /// モデルが出力した生テキスト（通常は `EditCommand` JSON を含む）。
     pub raw_text: String,
     /// 実際に応答を返したモデル名／プロバイダ名。
     pub model: String,
+    /// 抽出または推定されたトークン使用量メタデータ。
+    pub usage: Option<AiTokenUsage>,
 }
 
 /// ストリーミング受信・非同期処理中に通知されるイベント。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AiStreamEvent {
     /// 接続中・待機中などの状態変化通知。
     Status(String),
@@ -900,8 +1132,37 @@ pub struct AiAgentTurnRequest {
     pub temperature: Option<f32>,
 }
 
+impl AiAgentTurnRequest {
+    /// システム指示および会話・ツール結果列から推定入力文字数（Unicode スカラー値数）を返す。
+    #[must_use]
+    pub fn estimated_input_chars(&self) -> usize {
+        let messages_chars: usize = self
+            .messages
+            .iter()
+            .map(|m| match m {
+                AiTurnMessage::System { text } => text.chars().count(),
+                AiTurnMessage::User { parts } => parts
+                    .iter()
+                    .map(|p| match p {
+                        AiContentPart::Text { text } => text.chars().count(),
+                        AiContentPart::ImageData { base64_data, .. } => base64_data.len() / 16,
+                    })
+                    .sum(),
+                AiTurnMessage::Assistant { text, .. } => {
+                    text.as_ref().map_or(0, |s| s.chars().count()) + 64
+                }
+                AiTurnMessage::ToolResult { content_json, .. } => content_json.chars().count(),
+            })
+            .sum();
+        self.system_prompt
+            .chars()
+            .count()
+            .saturating_add(messages_chars)
+    }
+}
+
 /// マルチモーダル・ツール呼び出し対応の AI エージェントターン応答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAgentTurnResponse {
     /// テキスト応答（存在する場合）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -914,6 +1175,20 @@ pub struct AiAgentTurnResponse {
     /// プロバイダが返した終了理由（任意）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// トークン使用量・コストメタデータ（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AiTokenUsage>,
+}
+
+impl AiAgentTurnResponse {
+    /// 応答テキスト・ツール呼び出し数から推定出力文字数を返す。
+    #[must_use]
+    pub fn estimated_output_chars(&self) -> usize {
+        self.text
+            .as_ref()
+            .map_or(0, |s| s.chars().count())
+            .saturating_add(self.tool_calls.len().saturating_mul(120))
+    }
 }
 
 /// 組み込み HTTP・Mock・外部プラグインを統一的に扱う AI プロバイダトレイト。
@@ -1046,7 +1321,9 @@ fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
         stream: false,
     };
     let resp = provider.send_streaming(&legacy_req, on_event)?;
-    Ok(parse_fallback_agent_response(&resp.raw_text, &resp.model))
+    let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
+    parsed.usage = resp.usage;
+    Ok(parsed)
 }
 
 fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
@@ -1129,6 +1406,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                 tool_calls: parsed_calls,
                 model: model.to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
             };
         }
     }
@@ -1138,6 +1416,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
         tool_calls: Vec::new(),
         model: model.to_owned(),
         finish_reason: Some("stop".to_owned()),
+        usage: None,
     }
 }
 

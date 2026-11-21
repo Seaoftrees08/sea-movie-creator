@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 const EXTERNAL_TOOLS_FILE_NAME: &str = "external_tools.json";
 
-/// 外部ツール設定（`%APPDATA%\sea-movie-creator\external_tools.json` 等へ保存）。
+/// 外部ツール設定（`<settings_dir>/external_tools.json` 等へ保存）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalToolsConfig {
     /// ユーザーが設定した外部 `ffmpeg` 実行ファイルパスまたはコマンド名。
@@ -18,7 +18,7 @@ pub struct ExternalToolsConfig {
 }
 
 impl ExternalToolsConfig {
-    /// 既定の設定保存パス (`%APPDATA%\sea-movie-creator\external_tools.json` 等) を返す。
+    /// 既定の設定保存パス (`<settings_dir>/external_tools.json`) を返す。
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
         crate::core::user_config_file_path(EXTERNAL_TOOLS_FILE_NAME)
@@ -35,10 +35,10 @@ impl ExternalToolsConfig {
         serde_json::from_str(&text).map_err(|e| format!("外部ツール設定 JSON 解析失敗: {e}"))
     }
 
-    /// 既定パスが存在すれば読み込み、未作成・破損時は空設定を返す。
+    /// 既定パス（未作成時は旧保存先フォールバック含む）が存在すれば読み込み、未作成・破損時は空設定を返す。
     #[must_use]
     pub fn load_or_default() -> Self {
-        Self::default_path()
+        crate::core::user_config_read_path(EXTERNAL_TOOLS_FILE_NAME)
             .and_then(|p| Self::load_from_path(&p).ok())
             .unwrap_or_default()
     }

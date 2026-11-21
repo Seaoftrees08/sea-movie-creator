@@ -77,6 +77,8 @@ actions!(
         OpenKeyConfigAction,
         /// 外部ツール (`ffmpeg`) 設定モーダルを開く。
         OpenExternalToolsAction,
+        /// AI 設定モーダルを開く。
+        OpenAiSettingsAction,
         /// プレビュー枠・アンカー・ハンドル表示を切り替える。
         TogglePreviewGuidesAction,
         /// プレビューグリッド表示を切り替える。
@@ -402,6 +404,7 @@ fn build_settings_menu(state: MenuCheckState) -> Menu {
             MenuItem::separator(),
             MenuItem::action(tr("menu.settings.external_tools"), OpenExternalToolsAction),
             MenuItem::action(tr("menu.settings.key_config"), OpenKeyConfigAction),
+            MenuItem::action(tr("menu.settings.ai_settings"), OpenAiSettingsAction),
         ],
         disabled: false,
     }

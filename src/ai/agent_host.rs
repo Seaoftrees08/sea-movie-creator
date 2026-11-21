@@ -27,7 +27,7 @@ use crate::ai::media_inspector::{AllowedFolderScope, encode_thumbnail_jpeg_base6
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::provider::{
     AgentRuntimeSettings, AiAgentTurnRequest, AiApprovalMode, AiContentPart, AiError, AiProvider,
-    AiProviderKind, AiThinkingLevel, AiToolCall, AiToolDefinition, AiTurnMessage,
+    AiProviderKind, AiThinkingLevel, AiTokenUsage, AiToolCall, AiToolDefinition, AiTurnMessage,
 };
 
 const MAX_CHAT_IMAGE_PATHS: usize = 16;
@@ -388,6 +388,11 @@ pub enum AgentHostEvent {
     MemoryUpdated {
         /// 最新 `agent_memory`。
         agent_memory: Value,
+    },
+    /// 1 回のエージェント LLM 呼び出し完了時に報告されるトークン使用量。
+    UsageReported {
+        /// 抽出または推定された使用量メタデータ。
+        usage: AiTokenUsage,
     },
     /// エージェントまたはホスト側ブリッジで発生したエラー。
     AgentError {
@@ -949,6 +954,9 @@ impl CoordinatorState {
     ) {
         let prev_count = self.tool_registry.list_descriptors().len();
         let result = {
+            let mut on_usage = |usage| {
+                let _ = event_tx.send(AgentHostEvent::UsageReported { usage });
+            };
             let mut ctx = ToolExecutionContext {
                 folder_scope: &self.folder_scope,
                 sandbox: &mut self.sandbox,
@@ -963,6 +971,7 @@ impl CoordinatorState {
                         total_steps: None,
                     });
                 },
+                on_usage: Some(&mut on_usage),
                 extra_extensions: self.extra_extensions.clone(),
             };
             self.tool_registry.execute(tool_name, arguments, &mut ctx)
@@ -1387,6 +1396,15 @@ fn send_agent_llm_turn_and_reply(
 
     match state.provider.send_agent_turn(req, &mut on_stream_event) {
         Ok(resp) => {
+            let reported_usage = resp.usage.clone().unwrap_or_else(|| {
+                AiTokenUsage::estimate_from_chars(
+                    req.estimated_input_chars(),
+                    resp.estimated_output_chars(),
+                )
+            });
+            let _ = event_tx.send(AgentHostEvent::UsageReported {
+                usage: reported_usage,
+            });
             let tool_calls = resp
                 .tool_calls
                 .into_iter()

@@ -27,6 +27,9 @@ use crate::timeline::document::TimelineLengthMode;
 use crate::ui::ai_chat_panel::{
     AiProviderSelectItem, build_provider_select_items, provider_select_index,
 };
+use crate::ui::ai_settings_modal::{
+    AiSettingsModalState, AiSettingsTab, render_ai_settings_modal_overlay,
+};
 use crate::ui::app_controller::{
     AppController, PreviewZoomMode, RightPanelTab, clamp_right_panel_width,
 };
@@ -43,18 +46,19 @@ use crate::ui::menu_bar::{
     AddMidpointAction, AddSubtitleAction, ClearSelectionRange, CopyClip, CutClip, CycleClipAction,
     DeleteClip, DuplicateClip, ExportSelectionDialogAction, ImportMedia, MenuCheckState,
     NewProject, NextBoundaryAction, NudgeDownAction, NudgeLeftAction, NudgeRightAction,
-    NudgeUpAction, OpenExportDialog, OpenExternalToolsAction, OpenKeyConfigAction, OpenProject,
-    PasteClip, PrevBoundaryAction, PreviewOverlayChecks, PreviewZoom50Action, PreviewZoom100Action,
-    PreviewZoom200Action, PreviewZoomFitAction, QuitApp, RedoAction, ReloadLanguagePacksAction,
-    RemoveMidpointAction, RotateLeftAction, RotateRightAction, SaveProject, SaveProjectAs, SeekEnd,
-    SeekStart, SelectAllClips, SelectLanguageAction, SetSelectionEndAction,
-    SetSelectionStartAction, SetTimelineLengthAction, ShowTabAiChatAction,
-    ShowTabClipInspectorAction, ShowTabLayerListAction, ShowTabProjectInfoAction,
-    SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction, StepBackOneFrame,
-    StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction, TimelineZoomIn,
-    TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause, TogglePreviewGridAction,
-    TogglePreviewGuidesAction, TogglePreviewWaveformAction, ToggleReturnToStartOnStopAction,
-    UndoAction, apply_key_config_bindings, setup_menus, update_app_menus,
+    NudgeUpAction, OpenAiSettingsAction, OpenExportDialog, OpenExternalToolsAction,
+    OpenKeyConfigAction, OpenProject, PasteClip, PrevBoundaryAction, PreviewOverlayChecks,
+    PreviewZoom50Action, PreviewZoom100Action, PreviewZoom200Action, PreviewZoomFitAction, QuitApp,
+    RedoAction, ReloadLanguagePacksAction, RemoveMidpointAction, RotateLeftAction,
+    RotateRightAction, SaveProject, SaveProjectAs, SeekEnd, SeekStart, SelectAllClips,
+    SelectLanguageAction, SetSelectionEndAction, SetSelectionStartAction, SetTimelineLengthAction,
+    ShowTabAiChatAction, ShowTabClipInspectorAction, ShowTabLayerListAction,
+    ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction,
+    StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction,
+    TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause,
+    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction,
+    ToggleReturnToStartOnStopAction, UndoAction, apply_key_config_bindings, setup_menus,
+    update_app_menus,
 };
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
@@ -126,6 +130,8 @@ pub struct SeaEditorWindow {
     pub(crate) timeline_length_modal: Option<TimelineLengthModalState>,
     /// 外部ツール (`ffmpeg`) 設定モーダルの状態（`None` なら閉）。
     pub(crate) external_tools_modal: Option<ExternalToolsModalState>,
+    /// VS Code 風 AI 設定モーダルの状態（`None` なら閉）。
+    pub(crate) ai_settings_modal: Option<AiSettingsModalState>,
     /// ショートカット設定モーダルの状態（`None` なら閉）。
     pub(crate) key_config_modal: Option<KeyConfigModalState>,
     /// ウィンドウ終了時の未保存確認モーダル／終了確定状態。
@@ -227,6 +233,7 @@ impl SeaEditorWindow {
             layer_rename_input: None,
             timeline_length_modal: None,
             external_tools_modal: None,
+            ai_settings_modal: None,
             key_config_modal: None,
             close_prompt: ClosePromptState::Idle,
             extra_google_font_results: Vec::new(),
@@ -542,6 +549,7 @@ impl SeaEditorWindow {
             && &self.controller.ai_chat.selected_provider != kind
         {
             self.controller.ai_chat.select_provider(kind.clone());
+            self.controller.ai_chat.refresh_active_provider_side_data();
             cx.notify();
         }
     }
@@ -718,6 +726,10 @@ impl SeaEditorWindow {
                 .external_tools_modal
                 .as_ref()
                 .is_some_and(|m| m.input.read(cx).focus_handle(cx).is_focused(window))
+            || self
+                .ai_settings_modal
+                .as_ref()
+                .is_some_and(|m| m.is_any_input_focused(window, cx))
             || self.ai_ask_inputs.as_ref().is_some_and(|(_, fields)| {
                 fields
                     .iter()
@@ -732,6 +744,7 @@ impl SeaEditorWindow {
             && self.close_prompt != ClosePromptState::ConfirmModal
             && self.key_config_modal.is_none()
             && self.external_tools_modal.is_none()
+            && self.ai_settings_modal.is_none()
             && !self.controller.export_dialog.is_open
             && self.timeline_length_modal.is_none()
     }
@@ -789,6 +802,9 @@ impl SeaEditorWindow {
             } else {
                 self.key_config_modal = None;
             }
+        } else if self.ai_settings_modal.is_some() {
+            self.close_ai_settings_modal();
+            window.focus(&self.workspace_focus, cx);
         } else if self.external_tools_modal.is_some() {
             self.close_external_tools_modal();
             window.focus(&self.workspace_focus, cx);
@@ -1132,6 +1148,9 @@ impl SeaEditorWindow {
                     this.open_external_tools_modal(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenAiSettingsAction, window, cx| {
+                this.open_ai_settings_modal(AiSettingsTab::ApiKeys, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &TogglePreviewGuidesAction, _, cx| {
                 this.controller.show_preview_guides = !this.controller.show_preview_guides;
                 this.reload_app_menus(cx);
@@ -1529,6 +1548,12 @@ impl Render for SeaEditorWindow {
 
         if self.close_prompt == ClosePromptState::ConfirmModal {
             root.child(render_unsaved_close_modal_overlay(cx))
+        } else if let Some(modal) = &self.ai_settings_modal {
+            root.child(render_ai_settings_modal_overlay(
+                modal,
+                &self.controller.ai_chat,
+                cx,
+            ))
         } else if let Some(modal) = &self.external_tools_modal {
             root.child(render_external_tools_modal_overlay(modal, cx))
         } else if let Some(modal) = &self.key_config_modal {
