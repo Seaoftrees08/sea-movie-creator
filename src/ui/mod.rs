@@ -2,6 +2,7 @@
 
 pub mod ai_agent_widgets;
 pub mod ai_chat_panel;
+pub mod ai_settings_modal;
 pub mod app_controller;
 pub mod export_dialog;
 pub mod external_tools_modal;
