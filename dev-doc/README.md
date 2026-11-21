@@ -45,4 +45,4 @@
 | 010 | PR 前コード品質ゲート・自動テスト基盤 | Implemented | [`completed/010-pre-pr-quality-gates.md`](completed/010-pre-pr-quality-gates.md) |
 | 011 | 外部プラグイン向け SDK・プロトコル互換性ポリシー | Draft | [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md) |
 | 012 | 自律エージェントプラグイン基盤＆構成コンパイラ設計書 | Implemented | [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md) |
-| 013 | AI チャット UI 改修・VS Code 風設定画面・起動時状態復元・モデル管理・トークン残量表示設計書 | Draft | [`013-ai-ui-settings-and-usage.md`](013-ai-ui-settings-and-usage.md) |
+| 013 | AI チャット UI 改修・VS Code 風設定画面・起動時状態復元・モデル管理・トークン残量表示設計書 | Implemented | [`completed/013-ai-ui-settings-and-usage.md`](completed/013-ai-ui-settings-and-usage.md) |
