@@ -8,6 +8,7 @@
   - 初期実装設計書 Phase C（完了済み）: [`completed/initial-implementation/PhaseC.md`](completed/initial-implementation/PhaseC.md)
   - 自律エージェントプラグイン基盤設計書（完了済み）: [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md)
   - Phase P0 設計書（API キーガイド関連）: [`004-phase-p0-core-prerequisites.md`](004-phase-p0-core-prerequisites.md)
+  - プラグインプロトコル互換性ポリシー: [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md)
   - 導入・ビルド・起動方法: [`../docs/getting-started.md`](../docs/getting-started.md)
   - AI 連携・MCP・AI CLI プラグイン開発ガイド: [`../docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md)
 
@@ -40,7 +41,7 @@
 ### 対象（In Scope）
 
 - **本体機能モジュール側（`src/`）**:
-  - 実行ファイル配置フォルダ基準のポータブル設定ディレクトリ（`<起動位置>/settings/`）解決基盤（[`src/core/mod.rs`](../src/core/mod.rs)）およびドキュメント反映（[`docs/getting-started.md`](../docs/getting-started.md), [`.gitignore`](../.gitignore)）。
+  - 実行ファイル配置フォルダ基準のポータブル設定ディレクトリ（`<起動位置>/settings/`）解決基盤（[`src/core/mod.rs`](../src/core/mod.rs) `user_config_file_path` / `user_config_read_path` / `legacy_user_config_file_path`）、既存単一ファイル設定の初回フォールバック読込対応（[`src/ui/key_config.rs`](../src/ui/key_config.rs), [`src/export/external_tools.rs`](../src/export/external_tools.rs), [`src/ui/i18n.rs`](../src/ui/i18n.rs)）、およびドキュメント反映（[`docs/getting-started.md`](../docs/getting-started.md), [`.gitignore`](../.gitignore)）。
   - ユーザー AI 設定永続化（新規機能モジュール `src/ai/settings.rs` -> `settings/ai_settings.json`）：前回選択状態、カスタムモデル定義、任意 API キー（JSON 直接設定用）、予算上限、表示形式、エージェント実行設定。
   - 認証解決の拡張（[`src/ai/providers/credentials.rs`](../src/ai/providers/credentials.rs)）：`settings/ai_settings.json` 参照対応、解決元診断 (`CredentialSource`)、Keyring 削除 (`delete_secret_from_keyring`)。
   - トークン使用量・コストメタデータ (`AiTokenUsage`) の抽出（OpenAI / OpenRouter / Gemini / Anthropic の HTTP/SSE 応答、エージェントターン [`src/ai/agent_host.rs`](../src/ai/agent_host.rs) 経由の逐次通知）、および OpenRouter クレジット残高照会（`GET /credits`）。
@@ -49,8 +50,9 @@
   - AI チャットパネル改修（[`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs)）：ヘッダ見切れ修正、モデル選択メニュー拡張、プロバイダ別残量・セッション利用量フッタ。
   - VS Code 風 AI 設定モーダル（新規機能モジュール `src/ui/ai_settings_modal.rs`）：旧 [`render_agent_settings_drawer`](../src/ui/ai_agent_widgets.rs) の統合、カテゴリ別 GUI 設定と `{ } JSON` 直接編集の切替。
   - メニューバー項目追加・ウィンドウ統合・多言語キー追加（[`src/ui/menu_bar.rs`](../src/ui/menu_bar.rs), [`src/ui/window.rs`](../src/ui/window.rs), [`lang/ja.json`](../lang/ja.json), [`lang/en.json`](../lang/en.json)）。
-- **別プロセス AI CLI プラグイン側（`plugins_src/`）**:
+- **別プロセス AI CLI プラグイン・プロトコル文書側（`plugins_src/`・`docs/plugins/`）**:
   - [`plugins_src/sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs) および [`plugins_src/sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs) における `sea_ai_v1` の `"method": "list_models"` 対応、および応答内 `usage` メタデータの転記。
+  - [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md) のドキュメント同期義務に基づき、[`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md) へ `sea_ai_v1` の `"method": "list_models"`・`models` イベント・`completed.usage` 仕様を同時更新する。
 
 ### 対象外（Out of Scope）
 
@@ -79,7 +81,7 @@
    - カスタマイズ可能プロバイダ（OpenRouter / OpenAI / Google Gemini / Anthropic Claude / Ollama 等）は、設定画面または `settings/ai_settings.json` から任意モデル ID・表示名・Thinking 対応・コンテキスト長・単価を追加・編集・削除できること。
    - 固定モデル CLI プラグイン（`sea.ai.antigravity`, `sea.ai.acp`）は、自由追加 UI を出さず、外部 CLI プローブにより現在アカウント・環境で利用可能なモデル（または検出された CLI プロファイル）を表示し、未取得・未導入時は既定カタログへ安全フォールバックしつつ状態注記を出すこと。
 6. **送信ボタン下のプロバイダ別トークン・価格・残量表示**:
-   - チャットコンポーザ内の送信ボタンの下に、接続プロバイダ別の形式で **残量（残トークン / 残クレジット価格 / 残%）」** と **「今回セッション利用量（トークン数 / 価格 / 予算%）」** を表示すること。
+   - チャットコンポーザ内の送信ボタンの下に、接続プロバイダ別の形式で **「残量（残トークン / 残クレジット価格 / 残%）」** と **「今回セッション利用量（トークン数 / 価格 / 予算%）」** を表示すること。
    - 単発チャットおよび自律エージェント（[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)）の複数ターン実行の両方でセッション利用量が累積され、セッション保存・再開（[`src/ai/session_store.rs`](../src/ai/session_store.rs)）でも維持されること。
 
 ### 非機能要件（互換性・セキュリティ・保守性）
@@ -88,7 +90,7 @@
 - **シークレットマスクと漏洩防止**: `AiUserSettings` の `Debug` 実装では `api_keys` の値を `***REDACTED***` でマスクし、ログやエラー文言へ生キーを出力しない。また、リポジトリに `settings/` が混入しないよう `.gitignore` に `/settings/` を追加し、テストコード内のダミー値も [`tests/quality_gates/repository_rules.rs`](../tests/quality_gates/repository_rules.rs) のスキャン規則に抵触しない表記を用いる。
 - **既存データとの後方互換性**:
   - 既存の `ai_sessions/*.json` には `session_usage` フィールドが存在しないため、`#[serde(default)]` を付与して既存セッション読込を破壊しないこと。
-  - 既存の `settings/agent_settings.json` や旧保存先（`%APPDATA%\sea-movie-creator\`）が存在する場合は、`AiUserSettings::load_or_default()` 時に `runtime` 設定を引き継げること。
+  - 旧 `%APPDATA%\sea-movie-creator\` からの設定移行方針（4.3 節詳細）：単一 JSON 設定ファイル（`agent_settings.json` → `ai_settings.json` の `runtime` 引き継ぎ、および `key_config.json` / `external_tools.json` / `language.json`）は、新 `settings/` に未作成かつ `SEA_SETTINGS_DIR` 未設定の初回読込時のみ旧パスへフォールバックし、次回保存時に新 `settings/` へ移行する。一方、ディレクトリ系（`ai_sessions/`, 追加 `lang/`, `fonts/`）は Alpha 開発版として新 `settings/` 配下で新規運用する。
 - **品質ゲート準拠**: ルート [`Cargo.toml`](../Cargo.toml) の `[workspace.lints]`（`unsafe_code = "deny"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `missing_docs = "deny"`, `dead_code = "deny"`）を遵守する。
 - **ショートカット競合防止**: 設定モーダル表示中およびモーダル内テキスト入力欄フォーカス時は、[`SeaEditorWindow::allow_editor_shortcut`](../src/ui/window.rs) / `is_any_text_input_focused` により単キーショートカット（`Space`, `S`, `T`, `Delete` 等）が誤発火しないこと。
 - **i18n 整合性**: [`lang/ja.json`](../lang/ja.json) と [`lang/en.json`](../lang/en.json) のキー集合および `{placeholder}` を完全に一致させること。
@@ -121,7 +123,8 @@ flowchart LR
 
 | 区分 | ファイル | 責務 |
 | :--- | :--- | :--- |
-| 機能モジュール (Core) | [`src/core/mod.rs`](../src/core/mod.rs) | 起動位置相対 `<起動位置>/settings/` パス解決 (`app_settings_dir`, `user_config_file_path`) と旧設定参照 (`legacy_user_config_file_path`) |
+| 機能モジュール (Core) | [`src/core/mod.rs`](../src/core/mod.rs) | 起動位置相対 `<起動位置>/settings/` パス解決 (`app_settings_dir`, `user_config_file_path`)、旧パス解決 (`legacy_user_config_file_path`)、単一設定向け初回読込フォールバック (`user_config_read_path`) |
+| 機能モジュール (UI/Export 読込側) | [`src/ui/key_config.rs`](../src/ui/key_config.rs), [`src/export/external_tools.rs`](../src/export/external_tools.rs), [`src/ui/i18n.rs`](../src/ui/i18n.rs) | 単一設定 JSON の読込パスを `user_config_read_path` へ切替（保存先は新 `user_config_file_path` を使用） |
 | 機能モジュール (AI) | `src/ai/settings.rs` [NEW] | `AiUserSettings` の JSON 永続化・検証・カスタムモデル管理・モデル一覧解決・`Debug` マスク |
 | 機能モジュール (AI) | [`src/ai/providers/credentials.rs`](../src/ai/providers/credentials.rs) | `CredentialSource` 判定付きキー解決 (`resolve_api_key_with_source`)、Keyring 削除 (`delete_secret_from_keyring`) |
 | 機能モジュール (AI) | [`src/ai/provider.rs`](../src/ai/provider.rs) | `AiTokenUsage`、プリセットモデルのコンテキスト長・単価情報、`settings_key` / `supports_custom_models` |
@@ -133,7 +136,7 @@ flowchart LR
 | 機能モジュール (UI) | `src/ui/ai_settings_modal.rs` [NEW] | VS Code 風 AI 設定モーダル（カテゴリナビ、APIキー・接続 / モデル管理 / エージェント・予算 / `{ } JSON` 切替） |
 | 機能モジュール (UI) | [`src/ui/ai_agent_widgets.rs`](../src/ui/ai_agent_widgets.rs), [`src/ui/menu_bar.rs`](../src/ui/menu_bar.rs), [`src/ui/window.rs`](../src/ui/window.rs) | 旧 `render_agent_settings_drawer` 削除、`OpenAiSettingsAction` 追加、モーダル表示・フォーカス監視・`Esc` 処理統合 |
 | プラグイン | [`plugins_src/sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs), [`plugins_src/sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs) | `"method": "list_models"` による利用可能モデル/CLI 動的列挙、ACP `usage` 抽出 |
-| ドキュメント・設定 | [`docs/getting-started.md`](../docs/getting-started.md), [`.gitignore`](../.gitignore), [`lang/ja.json`](../lang/ja.json), [`lang/en.json`](../lang/en.json) | `settings/` フォルダ説明追記、`/settings/` Git 除外、日英 UI 文言追加 |
+| ドキュメント・設定 | [`docs/getting-started.md`](../docs/getting-started.md), [`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md), [`.gitignore`](../.gitignore), [`lang/ja.json`](../lang/ja.json), [`lang/en.json`](../lang/en.json) | `settings/` フォルダ説明追記、`sea_ai_v1` プロトコル仕様同期（`011` 規約準拠）、`/settings/` Git 除外、日英 UI 文言追加 |
 
 ### 4.3 ポータブル `settings/` ディレクトリ設計
 
@@ -143,19 +146,45 @@ flowchart LR
   1. 環境変数 `SEA_SETTINGS_DIR` が設定されており空白以外であればそのパス。
   2. `std::env::current_exe()` の親ディレクトリが取得できれば `<exe_dir>/settings`。
   3. 取得できない環境（特殊テストランナー等）では `std::env::current_dir()/settings`。
-- **格納されるファイル群**:
-  - `settings/ai_settings.json`（AI 接続設定・前回使用 AI/モデル・カスタムモデル・予算・ランタイム設定）
-  - `settings/ai_sessions/`（セッション履歴 JSON 群）
-  - `settings/key_config.json`（既存のキーコンフィグ）
-  - `settings/external_tools.json`（既存の `ffmpeg` パス設定）
-  - `settings/language.json`（既存の表示言語設定）
-  - `settings/fonts/`（既存のダウンロードフォント保存先）
-- **既存環境からの移行互換**:
-  - `legacy_user_config_file_path(file_name)` を用意し、`settings/ai_settings.json` が未作成の初回起動時には旧 `%APPDATA%\sea-movie-creator\agent_settings.json`（または `settings/agent_settings.json`）から `AgentRuntimeSettings` を自動引き継ぎします。
+- **実行環境（配布パッケージ vs `cargo run`）と `.gitignore` の意図**:
+  - **配布パッケージ実行時**（`<配布フォルダ>/sea-movie-creator.exe`）: `std::env::current_exe()` の親フォルダが配布フォルダとなるため、`<配布フォルダ>/settings/` が参照されます（`plugins/`・`lang/` と同階層）。
+  - **開発時（`cargo run`）実行時**: `std::env::current_exe()` は `target/debug/sea-movie-creator.exe`（または `target/release/sea-movie-creator.exe`）となるため、既定では `target/debug/settings/` が参照されます。開発ビルドと配布フォルダ・リポジトリ直下を分離する目的でそのまま `target/` 配下を既定とします（リポジトリ直下の永続フォルダを使いたい場合は `SEA_SETTINGS_DIR=./settings` を指定して上書き可能）。
+  - **`.gitignore` への `/settings/` 追加意図**: 開発者が `SEA_SETTINGS_DIR=./settings` で起動した際や、リリース配置確認でリポジトリ直下に `settings/` を作成した場合に、API キーを含む設定ファイルが誤って Git コミットされるのを防ぐためです。この挙動差（配布時 `<配布フォルダ>/settings/` と `cargo run` 時 `target/debug/settings/`）も [`docs/getting-started.md`](../docs/getting-started.md) に明記します。
+- **既存環境からの移行方針（全 `user_config_file_path` 呼び出し箇所の扱い）**:
+  - [`src/core/mod.rs`](../src/core/mod.rs) に読込専用ヘルパ `user_config_read_path(file_name)` を新設します。新パス（`user_config_file_path(file_name)`）が存在すればそれを返し、存在しないかつ環境変数 **`SEA_SETTINGS_DIR` が未設定の場合のみ** 旧パス `legacy_user_config_file_path(file_name)`（`%APPDATA%\sea-movie-creator\<file_name>` 等）に存在すればフォールバックとして返します（テストやポータブル分離環境で `SEA_SETTINGS_DIR` を指定した場合にホスト側の旧設定を誤読しないための安全策）。書き込み時は常に新パス `user_config_file_path` へ保存します。
+  - 各呼び出し箇所ごとの移行ポリシーは以下の通り割り切り・明文化します：
+
+| 対象ファイル / フォルダ | 呼び出し元 | 移行方針（旧 `%APPDATA%\sea-movie-creator\` からの扱い） |
+| :--- | :--- | :--- |
+| `settings/ai_settings.json` | `src/ai/settings.rs` [NEW] | 新ファイル未作成かつ `SEA_SETTINGS_DIR` 未設定時、`settings/agent_settings.json` → 旧 `legacy_user_config_file_path("agent_settings.json")` の順で `AgentRuntimeSettings` を自動引き継ぎ。 |
+| `settings/key_config.json` | [`src/ui/key_config.rs`](../src/ui/key_config.rs) | 単一設定 JSON のため `load_or_default()` で `user_config_read_path("key_config.json")` を使用し初回のみ旧パスへフォールバック読込（次回保存時に新 `settings/` へ移行）。 |
+| `settings/external_tools.json` | [`src/export/external_tools.rs`](../src/export/external_tools.rs) | 単一設定 JSON のため `load_or_default()` で `user_config_read_path("external_tools.json")` を使用し初回のみ旧パスへフォールバック読込（次回保存時に新 `settings/` へ移行）。 |
+| `settings/language.json` | [`src/ui/i18n.rs`](../src/ui/i18n.rs) | 単一設定 JSON のため `load_saved_language_preference()` で `user_config_read_path("language.json")` を使用し初回のみ旧パスへフォールバック読込（保存時に新 `settings/` へ移行）。 |
+| `settings/ai_sessions/` | [`src/ai/session_store.rs`](../src/ai/session_store.rs) | Alpha 開発版のためディレクトリ自動移行は対象外とし、`<起動位置>/settings/ai_sessions/` で新規作成（過去履歴を引き継ぎたい場合はユーザーが旧フォルダから手動コピー）。 |
+| `settings/lang/` | [`src/ui/i18n.rs`](../src/ui/i18n.rs) | 同上（Alpha 開発版のため追加言語ディレクトリは自動移行対象外。なお実行ファイル同階層の `<exe_dir>/lang/` は従来通り最優先で読込）。 |
+| `settings/fonts/` | [`src/media/google_fonts.rs`](../src/media/google_fonts.rs) | キャッシュ／ダウンロード済みフォント領域のため自動移行対象外（必要時に再取得または手動コピー）。 |
 
 ### 4.4 データ構造と JSON スキーマ
 
-#### 主要 Rust 型定義
+#### プロバイダ識別キー（`AiProviderKind::settings_key`）の統一仕様
+
+`last_selection.provider`（[`AiProviderKind`](../src/ai/provider.rs) の `#[serde(rename_all = "snake_case")]`）と `api_keys` / `custom_models` / `custom_base_urls` のマップキーの揺れを防ぎ、ユーザーの手編集ミスを無くすため、正規キーを以下のように統一します。
+
+| `AiProviderKind` バリアント | 正規 `settings_key()` | 読込時の許容エイリアス（正規化対象） | `supports_custom_models()` |
+| :--- | :--- | :--- | :--- |
+| `OpenAi` | `"open_ai"` | `"openai"` → `"open_ai"` | `true` |
+| `OpenRouter` | `"open_router"` | `"openrouter"` → `"open_router"` | `true` |
+| `OllamaCompat` | `"ollama_compat"` | `"ollama"` → `"ollama_compat"` | `true` |
+| `Gemini` | `"gemini"` | `"google_gemini"` → `"gemini"` | `true` |
+| `Anthropic` | `"anthropic"` | `"claude"` → `"anthropic"` | `true` |
+| `Plugin { plugin_id }` | `"plugin:<plugin_id>"`（例: `"plugin:sea.ai.antigravity"`, `"plugin:sea.ai.acp"`） | — | `false`（CLI 動的列挙） |
+| `Mock` | `"mock"` | — | `false` |
+
+- シリアライズ時は常に正規 `settings_key()`（`"open_router"` 等、`snake_case` と一致）を出力し、手書き JSON の読込時・参照時はトリム＋小文字化＋上記エイリアス正規化を適用して寛容に受け付けます。
+
+#### 主要 Rust 型定義（最小手書き JSON 対応の `#[serde(default)]`）
+
+ユーザーが `{ } JSON` タブや外部エディタで `api_keys` や `custom_models` だけを手書きした最小 JSON（例: `{"api_keys": {"open_router": "..."}}`）でもそのまま読み込めるよう、`AiUserSettings`・`AiLastSelection`・`AiCustomModelConfig` の各省略可能フィールドには `#[serde(default)]` を明示的に付与します。
 
 ```rust
 // src/ai/settings.rs [NEW]
@@ -170,32 +199,45 @@ pub enum UsageDisplayPreference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiLastSelection {
     pub provider: AiProviderKind,          // Default: AiProviderKind::OpenAi
     pub model_name: String,                // Default: "gpt-4.1-mini"
     pub thinking_level: AiThinkingLevel,   // Default: Auto
     pub approval_mode: AiApprovalMode,     // Default: Manual
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_agent_id: Option<String>, // Default: None
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_base_urls: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiCustomModelConfig {
-    pub id: String,
+    pub id: String,                        // モデル追加時の必須識別子
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thinking_levels: Vec<AiThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking: Option<AiThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_price_per_1m_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_1m_usd: Option<f64>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiUserSettings {
-    pub schema_version: u32,
+    pub schema_version: u32,               // Default: 1
     pub last_selection: AiLastSelection,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub api_keys: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_models: BTreeMap<String, Vec<AiCustomModelConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
     pub usage_display_mode: UsageDisplayPreference,
     pub runtime: AgentRuntimeSettings,
@@ -205,6 +247,7 @@ pub struct AiUserSettings {
 ```rust
 // src/ai/provider.rs 拡張
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -215,6 +258,7 @@ pub struct AiTokenUsage {
 
 // src/ai/session_store.rs 拡張
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiSessionUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -242,10 +286,10 @@ pub struct AiSessionUsage {
     }
   },
   "api_keys": {
-    "openrouter": "your-openrouter-api-key-if-stored-in-json"
+    "open_router": "your-openrouter-api-key-if-stored-in-json"
   },
   "custom_models": {
-    "openrouter": [
+    "open_router": [
       {
         "id": "deepseek/deepseek-r1",
         "display_name": "DeepSeek R1",
@@ -291,15 +335,19 @@ pub struct AiSessionUsage {
 +------------------------------------------------------------------------+
 | AI 設定   settings/ai_settings.json     [{ } JSON] [📁 フォルダ] [×]    |
 +------------------+-----------------------------------------------------+
-| [API キー・接続] |  OpenRouter API               [未設定 / OS Keyring] |
-|  モデル管理      |  API Key: [••••••••••••••••••••••• 👁] [Keyring保存] |
-|  エージェント・  |  [JSON保存] [クリア]                                |
-|  予算            |  Base URL: [https://openrouter.ai/api/v1         ]  |
+| [API キー・接続] |  OpenRouter API    [現在有効: 環境変数 OPENROUTER...] |
+|  モデル管理      |  ⚠ 環境変数が設定されているため Keyring/JSON より優先 |
+|  エージェント・  |  API Key: [••••••••••••••••••••••• 👁] [Keyring保存] |
+|  予算            |  [JSON保存] [クリア]                                |
+|                  |  Base URL: [https://openrouter.ai/api/v1         ]  |
 |                  |-----------------------------------------------------|
 |                  |  OpenAI API / Google Gemini / Anthropic / Local ... |
 +------------------+-----------------------------------------------------+
 ```
 
+- **`API キー・接続` タブの解決元表示と環境変数優先時の注記**:
+  - 各プロバイダカードの右上に現在の `CredentialSource` バッジ（`環境変数 (OPENROUTER_API_KEY)` / `settings/ai_settings.json` / `OS Keyring` / `一時上書き` / `未設定`）を明示表示します。
+  - `CredentialSource::EnvVar(env_name)` が有効な場合、ユーザーが GUI から `[Keyring保存]` または `[JSON保存]` で別キーを保存しても環境変数が最優先され続けるため、カード内に **「環境変数 `{env_name}` が設定されているため、Keyring / JSON へ保存したキーより環境変数が優先されます」** という警告・案内バナーを表示して混乱を防ぎます。
 - **右上 `{ } JSON` トグルボタン**:
   - VS Code の「Open Settings (JSON)」と同様に、ワンクリックでモーダル内をマルチライン JSON エディタ（`TextareaState`）へ切り替えられます。
   - JSON モードでは `整形 (Format)`・`ファイルから再読込`・`検証して保存` ボタンを提供し、構文不正時は赤バナーで具体的なパースエラー箇所を通知します。
@@ -351,7 +399,7 @@ flowchart TD
 
 ### 5.1 `sea_ai_v1` プラグインプロトコル拡張（後方互換）
 
-既存の `"method": "generate_command"` に加え、以下の任意メソッドを追加します。
+既存の `"method": "generate_command"` に加え、以下の任意メソッドを追加します。また、[`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md) で定められたドキュメント同期義務に従い、[`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs) の変更と同時に [`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md) へ下記メソッドおよび `models` / `completed.usage` 仕様を反映します。
 
 1. **リクエスト（ホスト -> プラグイン `stdin` 1行 JSON）**:
    ```json
@@ -389,6 +437,8 @@ flowchart TD
 3. `<起動位置>/settings/ai_settings.json` 内の `api_keys.<settings_key>`
 4. OS 資格情報ストア（`keyring` サービス名 `sea-movie-creator`）
 
+- 解決結果と併せて `CredentialSource`（`RuntimeOverride` / `EnvVar(&'static str)` / `SettingsJson` / `Keyring` / `Missing`）を返却し、GUI 上（4.5 節 (2)）では現在の有効取得元を表示します。環境変数がすでに設定されている状態でユーザーが GUI から Keyring または `settings/ai_settings.json` に別キーを保存した場合は、環境変数が優先中であることを明示案内して設定が反映されないと誤解されるのを防ぎます。
+
 ### 5.4 メニュー・多言語キー
 
 - [`src/ui/menu_bar.rs`](../src/ui/menu_bar.rs): `OpenAiSettingsAction` を新設し、`設定` メニューへ配置。
@@ -415,17 +465,17 @@ flowchart TD
 
 ### 段階的実装フェーズ
 
-- **Phase 1**: ポータブル `settings/` 基盤 (`src/core/mod.rs`)、`.gitignore`、`docs/getting-started.md`、`src/ai/settings.rs`、`credentials.rs` 拡張＋単体テスト
+- **Phase 1**: ポータブル `settings/` 基盤 (`src/core/mod.rs` の `user_config_read_path` 等)、単一設定ファイル群（[`src/ui/key_config.rs`](../src/ui/key_config.rs), [`src/export/external_tools.rs`](../src/export/external_tools.rs), [`src/ui/i18n.rs`](../src/ui/i18n.rs)）のフォールバック読込対応、`.gitignore`、[`docs/getting-started.md`](../docs/getting-started.md)（配布時・`cargo run` 時の配置説明含む）、`src/ai/settings.rs`、`credentials.rs` 拡張＋単体テスト
 - **Phase 2**: `AiTokenUsage`、HTTP/SSE（OpenAI / OpenRouter / Gemini / Anthropic）使用量抽出、OpenRouter `/credits`、`AgentHostEvent::UsageReported`、`AiSessionUsage` 永続化＋単体テスト
-- **Phase 3**: `sea-ai-antigravity` / `sea-ai-acp` の `list_models` 実装、ホスト側プローブ＋単体テスト
-- **Phase 4**: AI チャットヘッダ見切れ修正、モデルメニュー拡張、送信ボタン下プロバイダ別残量バー、VS Code 風 AI 設定モーダル、`lang/*.json`、結合テスト (`tests/phase_ai_settings_ui.rs` + `tests/phase_ai_settings_ui/mod.rs`)
+- **Phase 3**: `sea-ai-antigravity` / `sea-ai-acp` の `list_models` 実装、ホスト側プローブ、[`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md) 同期更新（`011` 規約準拠）＋単体テスト
+- **Phase 4**: AI チャットヘッダ見切れ修正、モデルメニュー拡張、送信ボタン下プロバイダ別残量バー、VS Code 風 AI 設定モーダル（`CredentialSource`・環境変数優先注記含む）、`lang/*.json`、結合テスト (`tests/phase_ai_settings_ui.rs` + `tests/phase_ai_settings_ui/mod.rs`)
 
 ### テスト項目
 
 - **単体テスト（各 `.rs` 末尾）**:
-  - `resolve_settings_dir_from` の環境変数 / 実行ファイル親ディレクトリ / CWD フォールバック検証。
-  - `AiUserSettings` の JSON 往復・不正 JSON エラー・`Debug` シークレットマスク・カスタムモデル追加/削除・固定モデルプロバイダ拒否検証。
-  - `resolve_api_key_with_source` の優先順位検証（実 Keyring 書込テストは `#[ignore]` 分離）。
+  - `resolve_settings_dir_from` の環境変数 / 実行ファイル親ディレクトリ / CWD フォールバック検証、および `user_config_read_path` の初回旧パスフォールバックと `SEA_SETTINGS_DIR` 設定時のフォールバック抑止検証。
+  - `AiUserSettings` の JSON 往復・最小手書き JSON（`#[serde(default)]`）読込・`settings_key` 正規化およびエイリアス（`"openrouter"` / `"open_router"` 等）解決・不正 JSON エラー・`Debug` シークレットマスク・カスタムモデル追加/削除・固定モデルプロバイダ拒否検証。
+  - `resolve_api_key_with_source` の優先順位および `CredentialSource::EnvVar` 判定検証（実 Keyring 書込テストは `#[ignore]` 分離）。
   - モック HTTP サーバを用いた OpenAI / OpenRouter / Gemini / Anthropic の SSE・Sync `usage` 抽出および OpenRouter クレジット計算テスト。
   - `sea-ai-antigravity` / `sea-ai-acp` の ACP `session/new` `configOptions` パース・`list_models` 単体テスト。
   - `format_usage_footer` のプロバイダ別フォーマット出力テスト。
