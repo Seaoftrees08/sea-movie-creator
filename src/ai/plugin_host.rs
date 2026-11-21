@@ -472,6 +472,7 @@ impl AiPluginProvider {
                 .model_override
                 .clone()
                 .unwrap_or_else(|| self.plugin_id.clone()),
+            usage: None,
         });
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
@@ -573,6 +574,7 @@ impl AiPluginProvider {
         let response = AiResponse {
             raw_text: final_text,
             model: self.plugin_id.clone(),
+            usage: None,
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
@@ -638,6 +640,7 @@ fn read_sea_ai_v1_events(
                 final_response = Some(AiResponse {
                     raw_text: chosen,
                     model,
+                    usage: None,
                 });
             }
             AiPluginHostEvent::Error { code, message } => {

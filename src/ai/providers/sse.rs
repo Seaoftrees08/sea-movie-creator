@@ -26,6 +26,49 @@ pub struct HttpJsonRequest<'a> {
     pub timeout_secs: u64,
 }
 
+/// JSON GET 要求パラメータ。
+pub struct HttpGetRequest<'a> {
+    /// リクエスト先完全 URL。
+    pub url: &'a str,
+    /// HTTP ヘッダ一覧。
+    pub headers: &'a [(&'a str, &'a str)],
+    /// 全体タイムアウト（秒）。
+    pub timeout_secs: u64,
+}
+
+/// 指定 URL へ JSON GET を行い、2xx 以外のステータス時に本文付き [`AiError::HttpStatus`] を返す。
+///
+/// # Errors
+///
+/// URL 検証失敗・通信失敗・HTTP 4xx/5xx エラー・JSON 解析失敗時に [`AiError`] を返す。
+pub fn get_json_sync(request: &HttpGetRequest<'_>) -> Result<Value, AiError> {
+    validate_http_url_and_headers(request.url, request.headers)?;
+    let agent = cached_ureq_agent(request.timeout_secs);
+    let mut req = agent.get(request.url).header("Accept", "application/json");
+    for (name, val) in request.headers {
+        req = req.header(*name, *val);
+    }
+
+    let mut resp = req
+        .call()
+        .map_err(|err| AiError::Transport(err.to_string()))?;
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let err_body = resp
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|_| "<unreadable error body>".to_owned());
+        let snippet: String = err_body.chars().take(600).collect();
+        return Err(AiError::HttpStatus {
+            status,
+            body: snippet,
+        });
+    }
+    resp.body_mut()
+        .read_json()
+        .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))
+}
+
 /// 指定 URL へ JSON POST を行い、2xx 以外のステータス時に本文付き [`AiError::HttpStatus`] を返す。
 ///
 /// ストリーミング応答時は `text/event-stream` 行単位パーサを呼び出し、非 SSE の JSON 応答へも自動フォールバックする。

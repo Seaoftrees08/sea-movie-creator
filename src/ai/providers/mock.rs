@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiError, AiProvider, AiRequest, AiResponse,
-    AiStreamEvent,
+    AiStreamEvent, AiTokenUsage,
 };
 
 type MockHandler = Arc<dyn Fn(&AiRequest) -> Result<String, AiError> + Send + Sync>;
@@ -205,9 +205,17 @@ impl AiProvider for MockAiProvider {
             on_event(AiStreamEvent::DeltaText(chunk));
         }
 
+        let usage = AiTokenUsage::estimate_from_chars(
+            request
+                .system_prompt
+                .len()
+                .saturating_add(request.user_prompt.len()),
+            raw_text.len(),
+        );
         let response = AiResponse {
             raw_text,
             model: "mock-editor-v1".to_owned(),
+            usage: Some(usage),
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)

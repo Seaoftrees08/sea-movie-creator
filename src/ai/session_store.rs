@@ -11,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::ai::provider::{
-    AgentRuntimeSettings, AiApprovalMode, AiProviderKind, AiRole, AiThinkingLevel,
+    AgentRuntimeSettings, AiApprovalMode, AiProviderKind, AiRole, AiThinkingLevel, AiTokenUsage,
 };
 use crate::core::user_config_file_path;
 
@@ -71,6 +71,54 @@ pub struct PendingAgentQuestionSnapshot {
     pub allow_skip: bool,
 }
 
+/// 1 セッション内で累積されたトークン使用量・直近コンテキストサイズ・概算コスト。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSessionUsage {
+    /// セッション内の累計入力トークン数。
+    pub input_tokens: u64,
+    /// セッション内の累計出力トークン数。
+    pub output_tokens: u64,
+    /// セッション内の累計合計トークン数。
+    pub total_tokens: u64,
+    /// 直近ターンのコンテキスト消費量（入力＋出力トークン）。
+    pub last_context_tokens: u64,
+    /// 累積コスト（USD）。
+    pub cost_usd: f64,
+    /// 実際の API 単価またはカスタム設定単価から算出されたコストが 1 回以上含まれるか。
+    pub has_known_cost: bool,
+    /// 文字数概算等の推定トークン数を含むか。
+    pub has_estimated_tokens: bool,
+}
+
+impl AiSessionUsage {
+    /// 1 ターン分の [`AiTokenUsage`] と任意のモデル単価概算コスト（USD）をセッション累計へ加算する。
+    pub fn record_turn(&mut self, usage: &AiTokenUsage, fallback_cost_usd: Option<f64>) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        let turn_total = if usage.total_tokens > 0 {
+            usage.total_tokens
+        } else {
+            usage.input_tokens.saturating_add(usage.output_tokens)
+        };
+        self.total_tokens = self.total_tokens.saturating_add(turn_total);
+        self.last_context_tokens = usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .max(turn_total);
+        if let Some(cost) = usage.cost_usd.or(fallback_cost_usd)
+            && cost.is_finite()
+            && cost >= 0.0
+        {
+            self.cost_usd += cost;
+            self.has_known_cost = true;
+        }
+        if usage.is_estimated {
+            self.has_estimated_tokens = true;
+        }
+    }
+}
+
 /// 1 つのチャット／エージェントセッションの完全な永続状態。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiSessionRecord {
@@ -114,6 +162,9 @@ pub struct AiSessionRecord {
     /// エージェントプラグインが保持・更新する構造化メモリ（解析済み画像要約や最新設計等）。
     #[serde(default)]
     pub agent_memory: Value,
+    /// このセッションで累積されたトークン使用量・コスト（旧セッション JSON 互換）。
+    #[serde(default)]
+    pub session_usage: AiSessionUsage,
 }
 
 /// セッション一覧 UI 向けの軽量メタデータ要約。
@@ -537,6 +588,7 @@ mod tests {
             }],
             pending_question: None,
             agent_memory: json!({"analyzed_count": 12}),
+            session_usage: AiSessionUsage::default(),
         };
         store.save_session(&rec1)?;
 
@@ -600,9 +652,26 @@ mod tests {
         )?;
         let loaded = store.load_session("sess_legacy")?;
         assert_eq!(loaded.created_at_unix_secs, 0);
+        assert_eq!(loaded.session_usage, AiSessionUsage::default());
         let list = store.list_sessions()?;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_id, "sess_legacy");
+
+        let mut usage = AiSessionUsage::default();
+        usage.record_turn(
+            &AiTokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                total_tokens: 1500,
+                cost_usd: None,
+                is_estimated: false,
+            },
+            Some(0.012),
+        );
+        assert_eq!(usage.total_tokens, 1500);
+        assert_eq!(usage.last_context_tokens, 1500);
+        assert!(usage.has_known_cost);
+        assert!((usage.cost_usd - 0.012).abs() < 1e-8);
         Ok(())
     }
 }

@@ -831,17 +831,85 @@ pub struct AiRequest {
     pub stream: bool,
 }
 
+/// AI 応答 1 ターン分のトークン使用量・概算コストメタデータ。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiTokenUsage {
+    /// 入力（プロンプト／コンテキスト）トークン数。
+    pub input_tokens: u64,
+    /// 出力（生成・推論）トークン数。
+    pub output_tokens: u64,
+    /// 合計トークン数。
+    pub total_tokens: u64,
+    /// プロバイダから直接返された利用額（USD、例: `OpenRouter` の `usage.cost`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// プロバイダ非返却のため文字数等から推定した値なら `true`。
+    pub is_estimated: bool,
+}
+
+impl AiTokenUsage {
+    /// 文字数から概算トークン使用量を推定する（外部 CLI 等が usage を返さない場合用）。
+    #[must_use]
+    pub fn estimate_from_chars(input_chars: usize, output_chars: usize) -> Self {
+        let input_tokens = estimate_tokens_for_char_count(input_chars);
+        let output_tokens = estimate_tokens_for_char_count(output_chars);
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cost_usd: None,
+            is_estimated: true,
+        }
+    }
+
+    /// モデル単価（100 万トークンあたり USD）を用いてこのターンの概算コスト（USD）を算出する。
+    #[must_use]
+    pub fn resolved_cost_usd(
+        &self,
+        input_price_per_1m_usd: Option<f64>,
+        output_price_per_1m_usd: Option<f64>,
+    ) -> Option<f64> {
+        if let Some(exact) = self.cost_usd
+            && exact.is_finite()
+            && exact >= 0.0
+        {
+            return Some(exact);
+        }
+        let in_price = input_price_per_1m_usd?;
+        let out_price = output_price_per_1m_usd?;
+        let cost = (tokens_to_f64(self.input_tokens) * in_price
+            + tokens_to_f64(self.output_tokens) * out_price)
+            / 1_000_000.0;
+        cost.is_finite().then_some(cost.max(0.0))
+    }
+}
+
+fn estimate_tokens_for_char_count(char_count: usize) -> u64 {
+    if char_count == 0 {
+        0
+    } else {
+        u64::try_from(char_count.div_ceil(4)).unwrap_or(u64::MAX)
+    }
+}
+
+fn tokens_to_f64(tokens: u64) -> f64 {
+    f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
+}
+
 /// AI プロバイダからの完了応答。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AiResponse {
     /// モデルが出力した生テキスト（通常は `EditCommand` JSON を含む）。
     pub raw_text: String,
     /// 実際に応答を返したモデル名／プロバイダ名。
     pub model: String,
+    /// 抽出または推定されたトークン使用量メタデータ。
+    pub usage: Option<AiTokenUsage>,
 }
 
 /// ストリーミング受信・非同期処理中に通知されるイベント。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AiStreamEvent {
     /// 接続中・待機中などの状態変化通知。
     Status(String),
@@ -1044,7 +1112,7 @@ pub struct AiAgentTurnRequest {
 }
 
 /// マルチモーダル・ツール呼び出し対応の AI エージェントターン応答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAgentTurnResponse {
     /// テキスト応答（存在する場合）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1125,9 @@ pub struct AiAgentTurnResponse {
     /// プロバイダが返した終了理由（任意）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// トークン使用量・コストメタデータ（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AiTokenUsage>,
 }
 
 /// 組み込み HTTP・Mock・外部プラグインを統一的に扱う AI プロバイダトレイト。
@@ -1189,7 +1260,9 @@ fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
         stream: false,
     };
     let resp = provider.send_streaming(&legacy_req, on_event)?;
-    Ok(parse_fallback_agent_response(&resp.raw_text, &resp.model))
+    let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
+    parsed.usage = resp.usage;
+    Ok(parsed)
 }
 
 fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
@@ -1272,6 +1345,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                 tool_calls: parsed_calls,
                 model: model.to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
             };
         }
     }
@@ -1281,6 +1355,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
         tool_calls: Vec::new(),
         model: model.to_owned(),
         finish_reason: Some("stop".to_owned()),
+        usage: None,
     }
 }
 

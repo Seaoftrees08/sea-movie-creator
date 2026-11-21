@@ -27,7 +27,7 @@ use crate::ai::media_inspector::{AllowedFolderScope, encode_thumbnail_jpeg_base6
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::provider::{
     AgentRuntimeSettings, AiAgentTurnRequest, AiApprovalMode, AiContentPart, AiError, AiProvider,
-    AiProviderKind, AiThinkingLevel, AiToolCall, AiToolDefinition, AiTurnMessage,
+    AiProviderKind, AiThinkingLevel, AiTokenUsage, AiToolCall, AiToolDefinition, AiTurnMessage,
 };
 
 const MAX_CHAT_IMAGE_PATHS: usize = 16;
@@ -388,6 +388,11 @@ pub enum AgentHostEvent {
     MemoryUpdated {
         /// 最新 `agent_memory`。
         agent_memory: Value,
+    },
+    /// 1 回のエージェント LLM 呼び出し完了時に報告されるトークン使用量。
+    UsageReported {
+        /// 抽出または推定された使用量メタデータ。
+        usage: AiTokenUsage,
     },
     /// エージェントまたはホスト側ブリッジで発生したエラー。
     AgentError {
@@ -1387,6 +1392,38 @@ fn send_agent_llm_turn_and_reply(
 
     match state.provider.send_agent_turn(req, &mut on_stream_event) {
         Ok(resp) => {
+            let reported_usage = resp.usage.clone().unwrap_or_else(|| {
+                let in_chars = req.system_prompt.len().saturating_add(
+                    req.messages
+                        .iter()
+                        .map(|m| match m {
+                            AiTurnMessage::System { text } => text.len(),
+                            AiTurnMessage::User { parts } => parts
+                                .iter()
+                                .map(|p| match p {
+                                    AiContentPart::Text { text } => text.len(),
+                                    AiContentPart::ImageData { base64_data, .. } => {
+                                        base64_data.len() / 16
+                                    }
+                                })
+                                .sum(),
+                            AiTurnMessage::Assistant { text, .. } => {
+                                text.as_ref().map_or(0, String::len) + 64
+                            }
+                            AiTurnMessage::ToolResult { content_json, .. } => content_json.len(),
+                        })
+                        .sum::<usize>(),
+                );
+                let out_chars = resp
+                    .text
+                    .as_ref()
+                    .map_or(0, String::len)
+                    .saturating_add(resp.tool_calls.len().saturating_mul(120));
+                AiTokenUsage::estimate_from_chars(in_chars, out_chars)
+            });
+            let _ = event_tx.send(AgentHostEvent::UsageReported {
+                usage: reported_usage,
+            });
             let tool_calls = resp
                 .tool_calls
                 .into_iter()

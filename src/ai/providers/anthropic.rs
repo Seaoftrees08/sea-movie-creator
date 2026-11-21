@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
-    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiToolCall, AiTurnMessage,
-    SecretString,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, AiToolCall,
+    AiTurnMessage, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
@@ -234,16 +234,19 @@ impl AiProvider for AnthropicProvider {
             body: &body,
             timeout_secs: self.config.timeout_secs,
         };
+        let mut sse_usage: Option<AiTokenUsage> = None;
+        let mut sync_usage: Option<AiTokenUsage> = None;
         let raw_text = post_json_streaming_or_sync(
             &http_req,
-            parse_anthropic_sse_chunk,
-            parse_anthropic_sync_text,
+            |payload| parse_anthropic_sse_chunk(payload, &mut sse_usage),
+            |val| parse_anthropic_sync_text(val, &mut sync_usage),
             on_event,
         )?;
 
         let response = AiResponse {
             raw_text,
             model: self.config.model.clone(),
+            usage: sse_usage.or(sync_usage),
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
@@ -376,10 +379,14 @@ fn parse_anthropic_agent_response(
         tool_calls,
         model: model.to_owned(),
         finish_reason: val["stop_reason"].as_str().map(ToOwned::to_owned),
+        usage: extract_anthropic_usage_obj(val.get("usage")),
     })
 }
 
-fn parse_anthropic_sse_chunk(payload: &str) -> Result<Option<String>, AiError> {
+fn parse_anthropic_sse_chunk(
+    payload: &str,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<Option<String>, AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("Anthropic SSE JSON parse failed: {err}")))?;
     if val["type"].as_str() == Some("error") {
@@ -387,6 +394,15 @@ fn parse_anthropic_sse_chunk(payload: &str) -> Result<Option<String>, AiError> {
             .as_str()
             .unwrap_or("Anthropic SSE error");
         return Err(AiError::ParseFailed(format!("Anthropic SSE error: {msg}")));
+    }
+    if val["type"].as_str() == Some("message_start")
+        && let Some(msg_usage) = extract_anthropic_usage_obj(val["message"].get("usage"))
+    {
+        merge_anthropic_usage(captured_usage, &msg_usage);
+    } else if val["type"].as_str() == Some("message_delta")
+        && let Some(delta_usage) = extract_anthropic_usage_obj(val.get("usage"))
+    {
+        merge_anthropic_usage(captured_usage, &delta_usage);
     }
     if val["type"].as_str() == Some("content_block_delta")
         && val["delta"]["type"].as_str() == Some("text_delta")
@@ -396,7 +412,17 @@ fn parse_anthropic_sse_chunk(payload: &str) -> Result<Option<String>, AiError> {
     Ok(None)
 }
 
-fn parse_anthropic_sync_text(val: &Value) -> Result<String, AiError> {
+fn parse_anthropic_sync_text(
+    val: &Value,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<String, AiError> {
+    if let Some(u) = extract_anthropic_usage_obj(val.get("usage")) {
+        *captured_usage = Some(u);
+    }
+    extract_anthropic_content_text(val)
+}
+
+fn extract_anthropic_content_text(val: &Value) -> Result<String, AiError> {
     let blocks = val["content"].as_array().ok_or_else(|| {
         AiError::ParseFailed("Anthropic response missing content array".to_owned())
     })?;
@@ -411,6 +437,40 @@ fn parse_anthropic_sync_text(val: &Value) -> Result<String, AiError> {
     Ok(joined)
 }
 
+fn extract_anthropic_usage_obj(usage_opt: Option<&Value>) -> Option<AiTokenUsage> {
+    let usage = usage_opt?.as_object()?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    Some(AiTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        cost_usd: None,
+        is_estimated: false,
+    })
+}
+
+fn merge_anthropic_usage(acc: &mut Option<AiTokenUsage>, incoming: &AiTokenUsage) {
+    let target = acc.get_or_insert_with(AiTokenUsage::default);
+    if incoming.input_tokens > 0 {
+        target.input_tokens = incoming.input_tokens;
+    }
+    if incoming.output_tokens > 0 {
+        target.output_tokens = incoming.output_tokens;
+    }
+    target.total_tokens = target.input_tokens.saturating_add(target.output_tokens);
+    target.is_estimated = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,10 +479,14 @@ mod tests {
     #[test]
     fn anthropic_sse_deltas_parse_accurately() -> Result<(), Box<dyn std::error::Error>> {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":210}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"type\\\":\"}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\"undo\\\"}\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":55}}\n\n",
         );
         let (addr, server) = spawn_single_response_server("text/event-stream", sse)?;
 
@@ -443,6 +507,10 @@ mod tests {
         };
         let res = provider.send_streaming(&req, &mut |_| {})?;
         assert_eq!(res.raw_text, "{\"type\":\"undo\"}");
+        let usage = res.usage.as_ref().ok_or("expected Anthropic usage")?;
+        assert_eq!(usage.input_tokens, 210);
+        assert_eq!(usage.output_tokens, 55);
+        assert_eq!(usage.total_tokens, 265);
 
         let captured = server
             .join()
@@ -566,12 +634,20 @@ mod tests {
             "content": [
                 { "type": "thinking", "thinking": "secret", "text": "ignored" },
                 { "type": "text", "text": "{\"ok\":1}" }
-            ]
+            ],
+            "usage": { "input_tokens": 50, "output_tokens": 12 }
         });
-        assert_eq!(parse_anthropic_sync_text(&sync_val)?, "{\"ok\":1}");
+        let mut sync_usage = None;
+        assert_eq!(
+            parse_anthropic_sync_text(&sync_val, &mut sync_usage)?,
+            "{\"ok\":1}"
+        );
+        assert_eq!(sync_usage.as_ref().map(|u| u.total_tokens), Some(62));
+        let mut err_usage = None;
         assert!(
             parse_anthropic_sse_chunk(
-                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+                &mut err_usage,
             )
             .is_err()
         );

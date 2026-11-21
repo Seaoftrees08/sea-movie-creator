@@ -4,11 +4,13 @@ use serde_json::{Value, json};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
-    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiToolCall, AiTurnMessage,
-    SecretString, format_tools_fallback_instructions, parse_fallback_agent_response,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, AiToolCall,
+    AiTurnMessage, SecretString, format_tools_fallback_instructions, parse_fallback_agent_response,
 };
 use crate::ai::providers::credentials::require_api_key;
-use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
+use crate::ai::providers::sse::{
+    HttpGetRequest, HttpJsonRequest, get_json_sync, post_json_streaming_or_sync, post_json_sync,
+};
 
 /// `OpenAI` 互換チャット補完 API クライアント設定。
 #[derive(Debug, Clone)]
@@ -153,6 +155,9 @@ impl OpenAiCompatProvider {
             AiProviderKind::OpenAi | AiProviderKind::OpenRouter
         ) {
             body["response_format"] = json!({ "type": "json_object" });
+            if stream {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
         }
         body
     }
@@ -316,16 +321,19 @@ impl AiProvider for OpenAiCompatProvider {
             timeout_secs: self.config.timeout_secs,
         };
 
+        let mut sse_usage: Option<AiTokenUsage> = None;
+        let mut sync_usage: Option<AiTokenUsage> = None;
         let raw_text = post_json_streaming_or_sync(
             &http_req,
-            parse_openai_sse_chunk,
-            parse_openai_sync_json,
+            |payload| parse_openai_sse_chunk(payload, &mut sse_usage),
+            |val| parse_openai_sync_json(val, &mut sync_usage),
             on_event,
         )?;
 
         let response = AiResponse {
             raw_text,
             model: self.config.model.clone(),
+            usage: sse_usage.or(sync_usage),
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
@@ -362,8 +370,11 @@ impl AiProvider for OpenAiCompatProvider {
         if self.supports_native_tools() {
             parse_openai_agent_response(&val, &self.config.model)
         } else {
-            let text = parse_openai_sync_json(&val)?;
-            Ok(parse_fallback_agent_response(&text, &self.config.model))
+            let mut captured_usage: Option<AiTokenUsage> = None;
+            let text = parse_openai_sync_json(&val, &mut captured_usage)?;
+            let mut parsed = parse_fallback_agent_response(&text, &self.config.model);
+            parsed.usage = captured_usage;
+            Ok(parsed)
         }
     }
 }
@@ -489,25 +500,146 @@ fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
         tool_calls,
         model: model.to_owned(),
         finish_reason: choice["finish_reason"].as_str().map(ToOwned::to_owned),
+        usage: extract_openai_usage(val),
     })
 }
 
-fn parse_openai_sse_chunk(payload: &str) -> Result<Option<String>, AiError> {
+fn parse_openai_sse_chunk(
+    payload: &str,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<Option<String>, AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("OpenAI SSE JSON parse failed: {err}")))?;
+    if let Some(usage) = extract_openai_usage(&val) {
+        *captured_usage = Some(usage);
+    }
     let delta = val["choices"][0]["delta"]["content"]
         .as_str()
         .map(ToOwned::to_owned);
     Ok(delta)
 }
 
-fn parse_openai_sync_json(val: &Value) -> Result<String, AiError> {
+fn parse_openai_sync_json(
+    val: &Value,
+    captured_usage: &mut Option<AiTokenUsage>,
+) -> Result<String, AiError> {
+    if let Some(usage) = extract_openai_usage(val) {
+        *captured_usage = Some(usage);
+    }
     val["choices"][0]["message"]["content"]
         .as_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             AiError::ParseFailed("OpenAI response missing choices[0].message.content".to_owned())
         })
+}
+
+fn extract_openai_usage(val: &Value) -> Option<AiTokenUsage> {
+    let usage = val.get("usage")?.as_object()?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    let cost_usd = usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|c| c.is_finite() && *c >= 0.0);
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 && cost_usd.is_none() {
+        return None;
+    }
+    Some(AiTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cost_usd,
+        is_estimated: false,
+    })
+}
+
+/// `OpenRouter` `GET /credits` API から取得するクレジット残高スナップショット。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenRouterCreditsSnapshot {
+    /// 累計購入・付与クレジット（USD）。
+    pub total_credits_usd: f64,
+    /// 累計消費クレジット（USD）。
+    pub total_usage_usd: f64,
+    /// 残クレジット額（USD）。
+    pub remaining_usd: f64,
+    /// 残割合（0.0..=100.0、`total_credits_usd <= 0` 時は `None`）。
+    pub remaining_percent: Option<f64>,
+}
+
+/// `OpenRouter` `GET /credits` 応答 JSON を [`OpenRouterCreditsSnapshot`] へ変換する。
+///
+/// # Errors
+///
+/// `data.total_credits` または `data.total_usage` が数値として読み取れない場合。
+pub fn parse_openrouter_credits_json(val: &Value) -> Result<OpenRouterCreditsSnapshot, AiError> {
+    let data = val.get("data").unwrap_or(val);
+    let total_credits_usd = data
+        .get("total_credits")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| {
+            AiError::ParseFailed(
+                "OpenRouter /credits response missing data.total_credits".to_owned(),
+            )
+        })?;
+    let total_usage_usd = data
+        .get("total_usage")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| {
+            AiError::ParseFailed("OpenRouter /credits response missing data.total_usage".to_owned())
+        })?;
+    let remaining_usd = (total_credits_usd - total_usage_usd).max(0.0);
+    let remaining_percent = if total_credits_usd > 0.0 {
+        Some(((remaining_usd / total_credits_usd) * 100.0).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+    Ok(OpenRouterCreditsSnapshot {
+        total_credits_usd,
+        total_usage_usd,
+        remaining_usd,
+        remaining_percent,
+    })
+}
+
+/// `OpenRouter` の `GET {base_url}/credits` を呼び出して残クレジットを取得する。
+///
+/// # Errors
+///
+/// 通信失敗・認証/HTTP エラー・JSON 解析エラー時に [`AiError`] を返す。
+pub fn fetch_openrouter_credits(
+    base_url: &str,
+    api_key: &SecretString,
+    timeout_secs: u64,
+) -> Result<OpenRouterCreditsSnapshot, AiError> {
+    let base = base_url.trim().trim_end_matches('/');
+    let url = format!("{base}/credits");
+    let auth = format!("Bearer {}", api_key.expose());
+    let headers = [
+        ("Authorization", auth.as_str()),
+        ("HTTP-Referer", "https://github.com/sea-movie-creator"),
+        ("X-Title", "sea-movie-creator"),
+    ];
+    let val = get_json_sync(&HttpGetRequest {
+        url: &url,
+        headers: &headers,
+        timeout_secs,
+    })?;
+    parse_openrouter_credits_json(&val)
 }
 
 #[cfg(test)]
@@ -531,6 +663,7 @@ mod tests {
         let sse_body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"type\\\":\\\"rename_layer\\\"\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\",\\\"layer_id\\\":\\\"L1\\\"}\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":45,\"total_tokens\":165,\"cost\":0.0025}}\n\n",
             "data: [DONE]\n\n",
         );
         let (addr, server) = spawn_single_response_server("text/event-stream", sse_body)?;
@@ -556,11 +689,18 @@ mod tests {
             reply.raw_text,
             "{\"type\":\"rename_layer\",\"layer_id\":\"L1\"}"
         );
+        let usage = reply.usage.as_ref().ok_or("expected SSE usage")?;
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.total_tokens, 165);
+        assert!(usage.cost_usd.is_some_and(|c| (c - 0.0025).abs() < 1e-8));
+        assert!(!usage.is_estimated);
 
         let captured_req = server.join().map_err(|_| "server join failed")??;
         let captured_lower = captured_req.to_ascii_lowercase();
         assert!(captured_lower.contains("authorization: bearer or-secret-test"));
         assert!(captured_lower.contains("x-title: sea-movie-creator"));
+        assert!(captured_lower.contains("include_usage"));
 
         let openai_thinking = OpenAiCompatProvider::new(
             OpenAiCompatConfig::openai("o4-mini", None).with_thinking_level(AiThinkingLevel::High),
@@ -575,6 +715,31 @@ mod tests {
         )
         .build_request_body(&sample_request(false), false);
         assert_eq!(router_thinking["reasoning"]["effort"], json!("medium"));
+        Ok(())
+    }
+
+    #[test]
+    fn openrouter_credits_fetch_and_parse_work_with_mock_server()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credits_body = r#"{"data":{"total_credits":10.0,"total_usage":2.5}}"#;
+        let (addr, server) = spawn_single_response_server("application/json", credits_body)?;
+        let snap = fetch_openrouter_credits(
+            &format!("http://{addr}/api/v1"),
+            &SecretString::new("demo-or-key"),
+            5,
+        )?;
+        assert!((snap.total_credits_usd - 10.0).abs() < 1e-6);
+        assert!((snap.total_usage_usd - 2.5).abs() < 1e-6);
+        assert!((snap.remaining_usd - 7.5).abs() < 1e-6);
+        assert!(
+            snap.remaining_percent
+                .is_some_and(|p| (p - 75.0).abs() < 1e-6)
+        );
+
+        let req = server.join().map_err(|_| "server join")??;
+        let lower = req.to_ascii_lowercase();
+        assert!(lower.starts_with("get /api/v1/credits"));
+        assert!(lower.contains("authorization: bearer demo-or-key"));
         Ok(())
     }
 

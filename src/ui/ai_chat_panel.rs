@@ -31,7 +31,7 @@ use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::plugin_host::AiPluginRegistry;
 use crate::ai::provider::{
     AgentRuntimeSettings, AiChatMessage, AiError, AiModelPreset, AiProvider, AiProviderKind,
-    AiRequest, AiRole, AiStreamEvent, AiThinkingLevel, SecretString,
+    AiRequest, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, SecretString,
 };
 use crate::ai::providers::anthropic::{AnthropicConfig, AnthropicProvider};
 use crate::ai::providers::credentials::resolve_api_key;
@@ -39,7 +39,8 @@ use crate::ai::providers::gemini::{GeminiConfig, GeminiProvider};
 use crate::ai::providers::mock::MockAiProvider;
 use crate::ai::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::ai::session_store::{
-    AiSessionRecord, AiSessionStore, AiSessionSummary, PendingAgentQuestionSnapshot, StoredChatTurn,
+    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage,
+    PendingAgentQuestionSnapshot, StoredChatTurn,
 };
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
@@ -191,6 +192,8 @@ pub struct AiChatState {
     pub pending_tool_approval: Option<PendingAgentToolApproval>,
     /// 常駐エージェントの永続メモリ（画像解析キャッシュ・前回設計等）。
     pub agent_memory: Value,
+    /// 現在セッションで累積されたトークン・概算コスト利用量。
+    pub session_usage: AiSessionUsage,
     /// ステップ上限・最小呼出間隔・Vision 設定。
     pub runtime_settings: AgentRuntimeSettings,
     /// セッション保存先ストア（ライブウィンドウ起動時に設定、テストでも任意注入可）。
@@ -252,6 +255,7 @@ impl Default for AiChatState {
             ask_field_values: BTreeMap::new(),
             pending_tool_approval: None,
             agent_memory: json!({}),
+            session_usage: AiSessionUsage::default(),
             runtime_settings: AgentRuntimeSettings::default(),
             session_store: None,
             active_drawer: AiChatDrawer::None,
@@ -405,6 +409,15 @@ impl AiChatState {
         }
     }
 
+    /// 現在のターンのトークン使用量（およびモデル単価からの概算コスト）をセッション累計へ反映する。
+    pub fn record_turn_usage(&mut self, usage: &AiTokenUsage) {
+        let preset = self.selected_provider.model_preset(&self.model_name);
+        let fallback_cost = preset.and_then(|p| {
+            usage.resolved_cost_usd(p.input_price_per_1m_usd, p.output_price_per_1m_usd)
+        });
+        self.session_usage.record_turn(usage, fallback_cost);
+    }
+
     /// 現在のチャット／エージェント状態をセッションストアへ保存する。
     pub fn persist_session(&mut self) {
         let Some(store) = &self.session_store else {
@@ -444,6 +457,7 @@ impl AiChatState {
                 .collect(),
             pending_question: self.pending_question.clone(),
             agent_memory: self.agent_memory.clone(),
+            session_usage: self.session_usage.clone(),
         };
         if store.save_session(&rec).is_ok() {
             self.refresh_session_history();
@@ -586,6 +600,7 @@ impl AiChatState {
         self.can_one_click_undo = false;
         self.attached_clip_ids.clear();
         self.attached_folders.clear();
+        self.session_usage = AiSessionUsage::default();
         self.agent_provider_override = None;
         "自然言語で編集指示を入力してください（フォルダ添付で自律構成も可能）"
             .clone_into(&mut self.status_banner);
@@ -750,6 +765,9 @@ impl AppController {
         self.ai_chat.streaming_preview = streamed_buf;
         if !status_buf.is_empty() {
             self.ai_chat.status_banner = status_buf;
+        }
+        if let Some(usage) = &response.usage {
+            self.ai_chat.record_turn_usage(usage);
         }
         self.finalize_ai_response(trimmed, &response.model, &response.raw_text)
     }
@@ -1175,6 +1193,7 @@ impl AppController {
         self.ai_chat.pending_question = None;
         self.ai_chat.ask_field_values.clear();
         self.ai_chat.agent_memory = rec.agent_memory;
+        self.ai_chat.session_usage = rec.session_usage;
         self.ai_chat.active_drawer = AiChatDrawer::None;
     }
 
@@ -1331,6 +1350,9 @@ impl AppController {
             }
 
             if let Some(resp) = completed {
+                if let Some(usage) = &resp.usage {
+                    self.ai_chat.record_turn_usage(usage);
+                }
                 let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
                 self.ai_chat.persist_session();
                 return true;
@@ -1404,6 +1426,10 @@ impl AppController {
                 self.ai_chat.agent_memory = agent_memory;
                 (false, true)
             }
+            AgentHostEvent::UsageReported { usage } => {
+                self.ai_chat.record_turn_usage(&usage);
+                (false, true)
+            }
             AgentHostEvent::AskUser {
                 request_id,
                 title,
@@ -1452,22 +1478,7 @@ impl AppController {
                 code,
                 message,
                 recoverable,
-            } => {
-                self.ai_chat.agent_busy = false;
-                self.ai_chat.agent_step_status = None;
-                let formatted = format!("[{code}] {message}");
-                self.ai_chat.last_error = Some(formatted.clone());
-                self.ai_chat.turns.push(AiChatTurn {
-                    role: AiRole::Assistant,
-                    text: format!("エラー: {formatted}"),
-                });
-                self.ai_chat.status_banner = if recoverable {
-                    format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
-                } else {
-                    format!("致命的エラー: {formatted}")
-                };
-                (!recoverable, true)
-            }
+            } => self.handle_agent_error_event(&code, &message, recoverable),
             AgentHostEvent::Exited { reason } => {
                 self.ai_chat.agent_busy = false;
                 self.ai_chat.agent_step_status = None;
@@ -1477,6 +1488,28 @@ impl AppController {
                 (true, true)
             }
         }
+    }
+
+    fn handle_agent_error_event(
+        &mut self,
+        code: &str,
+        message: &str,
+        recoverable: bool,
+    ) -> (bool, bool) {
+        self.ai_chat.agent_busy = false;
+        self.ai_chat.agent_step_status = None;
+        let formatted = format!("[{code}] {message}");
+        self.ai_chat.last_error = Some(formatted.clone());
+        self.ai_chat.turns.push(AiChatTurn {
+            role: AiRole::Assistant,
+            text: format!("エラー: {formatted}"),
+        });
+        self.ai_chat.status_banner = if recoverable {
+            format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
+        } else {
+            format!("致命的エラー: {formatted}")
+        };
+        (!recoverable, true)
     }
 
     fn handle_agent_ask_user_event(&mut self, snap: PendingAgentQuestionSnapshot) {
@@ -2882,6 +2915,7 @@ mod tests {
             turns: Vec::new(),
             pending_question: None,
             agent_memory: serde_json::Value::Null,
+            session_usage: crate::ai::session_store::AiSessionUsage::default(),
         };
         store.save_session(&rec)?;
 

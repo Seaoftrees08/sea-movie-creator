@@ -158,6 +158,7 @@ fn mock_vision_batch_reply(
         tool_calls: Vec::new(),
         model: "mock-vision-v1".to_owned(),
         finish_reason: Some("stop".to_owned()),
+        usage: None,
     }
 }
 
@@ -186,6 +187,7 @@ fn build_wedding_mock_provider(
                 tool_calls: Vec::new(),
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("stop".to_owned()),
+                usage: None,
             });
         }
 
@@ -232,6 +234,7 @@ fn build_wedding_mock_provider(
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
+            usage: None,
         })
     }))
 }
@@ -265,6 +268,7 @@ fn verify_session_reload_and_followup(
                 }],
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
             });
         }
         Ok(AiAgentTurnResponse {
@@ -272,6 +276,7 @@ fn verify_session_reload_and_followup(
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
+            usage: None,
         })
     }));
 
@@ -495,6 +500,7 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
                 }],
                 model: "mock-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
             });
         }
         Ok(AiAgentTurnResponse {
@@ -502,6 +508,7 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
             tool_calls: Vec::new(),
             model: "mock-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
+            usage: None,
         })
     }));
 

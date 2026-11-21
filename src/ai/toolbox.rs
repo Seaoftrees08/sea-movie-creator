@@ -971,23 +971,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_toolbox_supports_dynamic_registration_vision_and_draft_sandbox()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let guard = TempDirGuard::new("toolbox")?;
-        let p1 = guard.0.join("memory1.png");
-        write_png(&p1)?;
-
-        let mut registry = HostToolRegistry::with_builtin_tools();
-        // 将来ツールの動的登録をテスト
-        registry.register(Box::new(DummyCustomExtensionTool));
-        assert!(registry.find_descriptor("future_silence_cut").is_some());
-
-        let live_doc = ProjectDocument::new("ToolboxTest");
-        let mut sandbox = DraftSandbox::new(live_doc.clone());
-        let scope = AllowedFolderScope::from_folders([&guard.0]);
-        let settings = AgentRuntimeSettings::default();
-        let mock_vision = MockAiProvider::with_agent_turns([AiAgentTurnResponse {
+    fn sample_vision_mock_response() -> AiAgentTurnResponse {
+        AiAgentTurnResponse {
             text: Some(
                 json!({
                     "analyses": [{
@@ -1004,7 +989,27 @@ mod tests {
             tool_calls: Vec::new(),
             model: "mock-vision".to_owned(),
             finish_reason: Some("stop".to_owned()),
-        }]);
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn host_toolbox_supports_dynamic_registration_vision_and_draft_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::new("toolbox")?;
+        let p1 = guard.0.join("memory1.png");
+        write_png(&p1)?;
+
+        let mut registry = HostToolRegistry::with_builtin_tools();
+        // 将来ツールの動的登録をテスト
+        registry.register(Box::new(DummyCustomExtensionTool));
+        assert!(registry.find_descriptor("future_silence_cut").is_some());
+
+        let live_doc = ProjectDocument::new("ToolboxTest");
+        let mut sandbox = DraftSandbox::new(live_doc.clone());
+        let scope = AllowedFolderScope::from_folders([&guard.0]);
+        let settings = AgentRuntimeSettings::default();
+        let mock_vision = MockAiProvider::with_agent_turns([sample_vision_mock_response()]);
 
         let mut logs = Vec::new();
         let mut progress = |msg: &str| logs.push(msg.to_owned());
