@@ -279,3 +279,60 @@ fn session_usage_persists_and_footer_adapts_per_provider() -> Result<(), Box<dyn
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[test]
+fn session_restore_preserves_custom_base_url_and_footer_shows_credit_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sea_movie_creator::ai::session_store::{AiSessionRecord, AiSessionStore, AiSessionUsage};
+
+    let dir = make_temp_settings_dir("restore_base_url")?;
+    let mut controller = AppController::new();
+    controller.ai_chat.enable_settings_in_dir(&dir);
+
+    let mut next = controller.ai_chat.user_settings.clone();
+    next.set_base_url(&AiProviderKind::OllamaCompat, "http://127.0.0.1:22434/v1");
+    controller.ai_chat.save_explicit_user_settings(next)?;
+
+    let store =
+        AiSessionStore::with_paths(dir.join("ai_sessions"), dir.join("agent_settings.json"));
+    let rec = AiSessionRecord {
+        schema_version: 1,
+        session_id: "sess_custom_ollama".to_owned(),
+        title: "Ollama Session".to_owned(),
+        created_at_unix_secs: 1,
+        updated_at_unix_secs: 2,
+        provider: Some(AiProviderKind::OllamaCompat),
+        agent_plugin_id: None,
+        model_name: "llama3.2".to_owned(),
+        thinking_level: AiThinkingLevel::Auto,
+        approval_mode: AiApprovalMode::Manual,
+        attached_folders: Vec::new(),
+        turns: Vec::new(),
+        pending_question: None,
+        agent_memory: serde_json::Value::Null,
+        session_usage: AiSessionUsage::default(),
+    };
+    store.save_session(&rec)?;
+
+    controller.open_saved_ai_session("sess_custom_ollama")?;
+    assert_eq!(
+        controller.ai_chat.selected_provider,
+        AiProviderKind::OllamaCompat
+    );
+    assert_eq!(
+        controller.ai_chat.custom_base_url,
+        "http://127.0.0.1:22434/v1"
+    );
+
+    // OpenRouter クレジット取得エラー時でもフッタが明確にエラー状態を表示する
+    controller
+        .ai_chat
+        .select_provider(AiProviderKind::OpenRouter);
+    controller.ai_chat.openrouter_credits = None;
+    controller.ai_chat.openrouter_credits_error = Some("401 unauthorized".to_owned());
+    let (_left, err_right) = format_usage_footer_parts(&controller.ai_chat);
+    assert!(err_right.contains("残高取得失敗"));
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}

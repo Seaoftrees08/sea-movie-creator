@@ -100,6 +100,7 @@ pub use crate::ai::provider::AiApprovalMode;
 struct AiChatJobHandle {
     rx: mpsc::Receiver<AiStreamEvent>,
     prompt: String,
+    estimated_input_chars: usize,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -221,6 +222,8 @@ pub struct AiChatState {
     pub plugin_models_note: BTreeMap<String, String>,
     /// CLI プラグインのプローブ実行中フラグ。
     pub plugin_models_probing: BTreeMap<String, bool>,
+    /// プロバイダごとの診断済み認証ソースキャッシュ（UI 毎フレーム描画での Keyring IPC 回避用）。
+    pub(crate) cached_credential_sources: BTreeMap<String, CredentialSource>,
     /// セッション保存先ストア（ライブウィンドウ起動時に設定、テストでも任意注入可）。
     pub session_store: Option<AiSessionStore>,
     /// 上部に開いている補助ドロワー。
@@ -292,6 +295,7 @@ impl Default for AiChatState {
             discovered_plugin_models: BTreeMap::new(),
             plugin_models_note: BTreeMap::new(),
             plugin_models_probing: BTreeMap::new(),
+            cached_credential_sources: BTreeMap::new(),
             session_store: None,
             active_drawer: AiChatDrawer::None,
             agent_step_status: None,
@@ -375,7 +379,8 @@ impl AiChatState {
         );
         self.session_store = Some(store);
         self.settings_path = Some(settings_dir.join(AI_SETTINGS_FILE_NAME));
-        let (settings, warn) = AiUserSettings::load_or_default_at(settings_dir, true);
+        // テスト・隔離環境では端末ホストの旧 %APPDATA% 設定を誤読しないようレガシーフォールバックを無効化する
+        let (settings, warn) = AiUserSettings::load_or_default_at(settings_dir, false);
         self.settings_load_warning = warn;
         self.apply_user_settings_snapshot(settings);
         self.refresh_discovered_agents();
@@ -403,6 +408,7 @@ impl AiChatState {
         self.normalize_thinking_level_for_active_model(last.thinking_level);
         self.agent_provider_override = None;
         self.last_error = None;
+        self.refresh_all_credential_sources();
     }
 
     /// 現在のプロバイダ／モデル／思考／エージェント設定を [`AiUserSettings`] へ反映し、安全ならディスク保存する。
@@ -456,6 +462,7 @@ impl AiChatState {
                 .clone_into(&mut self.custom_base_url);
         }
         self.user_settings = next;
+        self.refresh_all_credential_sources();
         Ok(())
     }
 
@@ -637,6 +644,8 @@ impl AiChatState {
         self.agent_provider_override = None;
         self.last_error = None;
         self.sync_active_agent_runtime();
+        let active_provider = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active_provider);
         self.sync_selection_and_persist();
     }
 
@@ -737,6 +746,49 @@ impl AiChatState {
         }
     }
 
+    /// 指定プロバイダの有効な認証情報取得元を再診断して UI 描画用キャッシュへ保存する。
+    pub fn refresh_credential_source_for(&mut self, kind: &AiProviderKind) -> CredentialSource {
+        let runtime = if &self.selected_provider == kind {
+            self.runtime_api_key.as_ref()
+        } else {
+            None
+        };
+        let source = diagnose_credential_source(kind, runtime, Some(&self.user_settings));
+        self.cached_credential_sources
+            .insert(kind.settings_key(), source.clone());
+        source
+    }
+
+    /// UI 選択対象となる全プロバイダの認証情報取得元キャッシュを更新する。
+    pub fn refresh_all_credential_sources(&mut self) {
+        for kind in AiProviderKind::ui_selectable_providers() {
+            self.refresh_credential_source_for(&kind);
+        }
+        let active = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active);
+    }
+
+    /// UI 描画向けにキャッシュ済みの認証情報取得元を返す（Keyring IPC を発生させない）。
+    #[must_use]
+    pub fn cached_credential_source_for(&self, kind: &AiProviderKind) -> CredentialSource {
+        if &self.selected_provider == kind && self.runtime_api_key.is_some() {
+            return CredentialSource::RuntimeOverride;
+        }
+        self.cached_credential_sources
+            .get(&kind.settings_key())
+            .cloned()
+            .unwrap_or(CredentialSource::Missing)
+    }
+
+    /// キャッシュ済みの情報に基づき現在選択中プロバイダ向けの認証情報が有効か返す。
+    #[must_use]
+    pub fn has_cached_credentials(&self) -> bool {
+        if !self.selected_provider.requires_api_key() {
+            return true;
+        }
+        self.cached_credential_source_for(&self.selected_provider) != CredentialSource::Missing
+    }
+
     /// 指定プロバイダに対する現在の有効な認証情報取得元を診断して返す。
     #[must_use]
     pub fn credential_source_for(&self, kind: &AiProviderKind) -> CredentialSource {
@@ -758,6 +810,8 @@ impl AiChatState {
     pub fn set_runtime_api_key(&mut self, key: Option<SecretString>) {
         self.runtime_api_key = key;
         self.agent_provider_override = None;
+        let active = self.selected_provider.clone();
+        self.refresh_credential_source_for(&active);
         self.sync_active_agent_runtime();
     }
 
@@ -1150,7 +1204,7 @@ impl AppController {
         }
         let usage = response.usage.clone().unwrap_or_else(|| {
             AiTokenUsage::estimate_from_chars(
-                trimmed.chars().count(),
+                req.estimated_input_chars(),
                 response.raw_text.chars().count(),
             )
         });
@@ -1188,6 +1242,7 @@ impl AppController {
         }
 
         let req = self.prepare_ai_request_and_turn(&trimmed)?;
+        let estimated_input_chars = req.estimated_input_chars();
         if self.ai_chat.session_title == "新しいセッション" {
             self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(&trimmed);
         }
@@ -1213,6 +1268,7 @@ impl AppController {
         self.ai_chat.running_job = Some(AiChatJobHandle {
             rx,
             prompt: trimmed,
+            estimated_input_chars,
             cancelled: cancel_flag,
         });
         Ok(())
@@ -1529,6 +1585,7 @@ impl AppController {
             provider.unwrap_or_else(|| Arc::from(self.ai_chat.build_provider()));
         self.spawn_resumed_agent_if_needed(resolved_provider, plugin_override);
         self.ai_chat.refresh_session_history();
+        self.ai_chat.refresh_active_provider_side_data();
         "セッションを復元しました（続けて調整指示を出せます）"
             .clone_into(&mut self.ai_chat.status_banner);
         Ok(())
@@ -1550,7 +1607,10 @@ impl AppController {
                 p.preferred_default_model()
                     .clone_into(&mut self.ai_chat.model_name);
             }
-            p.default_base_url()
+            self.ai_chat
+                .user_settings
+                .base_url_for(&p)
+                .unwrap_or_else(|| p.default_base_url())
                 .clone_into(&mut self.ai_chat.custom_base_url);
             self.ai_chat.selected_provider = p;
         }
@@ -1581,6 +1641,7 @@ impl AppController {
         self.ai_chat.agent_memory = rec.agent_memory;
         self.ai_chat.session_usage = rec.session_usage;
         self.ai_chat.active_drawer = AiChatDrawer::None;
+        self.ai_chat.refresh_all_credential_sources();
     }
 
     fn spawn_resumed_agent_if_needed(
@@ -1738,7 +1799,7 @@ impl AppController {
             if let Some(resp) = completed {
                 let usage = resp.usage.clone().unwrap_or_else(|| {
                     AiTokenUsage::estimate_from_chars(
-                        handle.prompt.chars().count(),
+                        handle.estimated_input_chars,
                         resp.raw_text.chars().count(),
                     )
                 });
@@ -2241,15 +2302,15 @@ pub fn render_ai_chat_panel(
         .child(render_prompt_composer(controller, ai_chat_input, cx))
 }
 
-fn format_cred_label(chat: &AiChatState) -> String {
-    if !chat.selected_provider.requires_api_key() {
-        return match &chat.selected_provider {
+fn format_cred_label(provider: &AiProviderKind, has_cred: bool) -> String {
+    if !provider.requires_api_key() {
+        return match provider {
             AiProviderKind::OllamaCompat => tr("ai.cred_local"),
             AiProviderKind::Plugin { .. } => tr("ai.cred_cli"),
             _ => "認証不要".to_owned(),
         };
     }
-    if chat.has_resolved_credentials() {
+    if has_cred {
         tr("ai.cred_ok")
     } else {
         tr("ai.cred_missing")
@@ -2262,8 +2323,8 @@ fn render_compact_header(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let missing_required =
-        chat.selected_provider.requires_api_key() && !chat.has_resolved_credentials();
+    let has_cred = chat.has_cached_credentials();
+    let missing_required = chat.selected_provider.requires_api_key() && !has_cred;
     let cred_color = if missing_required {
         theme.danger
     } else {
@@ -2292,7 +2353,7 @@ fn render_compact_header(
         .rounded(px(4.))
         .hover(|s| s.bg(theme.secondary))
         .text_color(cred_color)
-        .child(format_cred_label(chat))
+        .child(format_cred_label(&chat.selected_provider, has_cred))
         .on_click(cx.listener(|this, _, window, cx| {
             this.open_ai_settings_modal(AiSettingsTab::ApiKeys, window, cx);
         }));
@@ -3203,7 +3264,7 @@ fn format_session_used_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) 
 fn format_remaining_openrouter(chat: &AiChatState, ctx_label: Option<&str>) -> String {
     let prefix = tr("ai.usage_remaining");
     if chat.is_openrouter_credits_loading() {
-        return format!("{prefix} 残高取得中...");
+        return format!("{prefix} {}", tr("ai.usage_loading"));
     }
     if let Some(credits) = &chat.openrouter_credits {
         let usd = format_usd(credits.remaining_usd);
@@ -3222,13 +3283,20 @@ fn format_remaining_openrouter(chat: &AiChatState, ctx_label: Option<&str>) -> S
             ),
         };
     }
+    if chat.openrouter_credits_error.is_some() {
+        let err_label = tr("ai.usage_credits_err");
+        return ctx_label.map_or_else(
+            || format!("{prefix} {err_label}"),
+            |ctx| format!("{prefix} {ctx} / {err_label}"),
+        );
+    }
     if let Some(ctx) = ctx_label {
         return format!("{prefix} {ctx}");
     }
-    if chat.has_resolved_credentials() {
-        format!("{prefix} 残高未取得")
+    if chat.has_cached_credentials() {
+        format!("{prefix} {}", tr("ai.usage_credits_unfetched"))
     } else {
-        format!("{prefix} キー未設定")
+        format!("{prefix} {}", tr("ai.usage_key_missing"))
     }
 }
 
@@ -3251,13 +3319,16 @@ fn format_remaining_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) -> 
     match &chat.selected_provider {
         AiProviderKind::OpenRouter => format_remaining_openrouter(chat, ctx_label.as_deref()),
         AiProviderKind::OllamaCompat => {
-            let detail = ctx_label.unwrap_or_else(|| "無料".to_owned());
+            let detail = ctx_label.unwrap_or_else(|| tr("ai.usage_local_free"));
             format!("{prefix} {detail} / Local")
         }
-        AiProviderKind::Plugin { .. } => ctx_label.map_or_else(
-            || format!("{prefix} CLI管理"),
-            |ctx_str| format!("{prefix} {ctx_str} / CLI管理"),
-        ),
+        AiProviderKind::Plugin { .. } => {
+            let cli_label = tr("ai.usage_cli_managed");
+            ctx_label.map_or_else(
+                || format!("{prefix} {cli_label}"),
+                |ctx_str| format!("{prefix} {ctx_str} / {cli_label}"),
+            )
+        }
         AiProviderKind::Mock => ctx_label.map_or_else(
             || format!("{prefix} Mock"),
             |ctx_str| format!("{prefix} {ctx_str}"),
@@ -3273,7 +3344,7 @@ fn format_remaining_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) -> 
                     } else if let Some(c) = ctx_label {
                         format!("{prefix} {c}")
                     } else {
-                        format!("{prefix} 予算未設定")
+                        format!("{prefix} {}", tr("ai.usage_budget_unset"))
                     }
                 }
                 UsageDisplayPreference::Percent => {
@@ -3289,7 +3360,7 @@ fn format_remaining_footer(chat: &AiChatState, ctx: Option<(u64, u64, u64)>) -> 
                     (Some((usd, _)), Some(c)) => format!("{prefix} {usd} / {c}"),
                     (Some((usd, pct)), None) => format!("{prefix} {usd} ({pct})"),
                     (None, Some(c)) => format!("{prefix} {c}"),
-                    (None, None) => format!("{prefix} 予算未設定"),
+                    (None, None) => format!("{prefix} {}", tr("ai.usage_budget_unset")),
                 },
             }
         }
@@ -3310,6 +3381,26 @@ fn render_usage_footer(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) ->
     let theme = cx.theme().clone();
     let (session_str, remaining_str) = format_usage_footer_parts(chat);
 
+    let mut right = h_flex().items_center().gap_1().child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(remaining_str),
+    );
+    if chat.selected_provider == AiProviderKind::OpenRouter {
+        right = right.child(
+            Button::new("ai-usage-refresh-credits")
+                .xsmall()
+                .ghost()
+                .label("↻")
+                .disabled(chat.is_openrouter_credits_loading())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller.ai_chat.refresh_openrouter_credits_async();
+                    cx.notify();
+                })),
+        );
+    }
+
     h_flex()
         .w_full()
         .items_center()
@@ -3325,12 +3416,7 @@ fn render_usage_footer(chat: &AiChatState, cx: &mut Context<SeaEditorWindow>) ->
                 .text_color(theme.muted_foreground)
                 .child(session_str),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(remaining_str),
-        )
+        .child(right)
 }
 
 #[cfg(test)]
@@ -3559,6 +3645,7 @@ mod tests {
         controller.ai_chat.running_job = Some(super::AiChatJobHandle {
             rx,
             prompt: "テスト指示".to_owned(),
+            estimated_input_chars: 0,
             cancelled: std::sync::Arc::clone(&cancelled),
         });
         controller.ai_chat.streaming_preview = "{\"type\":\"batch\"".to_owned();
