@@ -24,6 +24,7 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
 
 ## AI 回答・実装時のチェックリスト
 
+- ユーザーの指示が「設計（`dev-doc/` 作成）」か「実装（コード編集）」かを正しく判別し、設計指示や設計書未承認の段階でソースコードへ触れていないか（`/plan` の一時計画と `dev-doc/` 設計書を混同していないか）
 - 作業開始前に `git branch --show-current` を確認し、`main` / `master` 上であれば直接編集せず `.worktrees/` に worktree と作業ブランチを作成したか（親側 `main` のファイルを直接書き換えていないか）
 - 変更対象ファイルの関連設計書が `dev-doc/` に存在するか確認したか
 - 「プラグイン（無くても本体が起動できる）」と「機能モジュール（本体が依存する）」の区分・用語を正しく使い分けているか
@@ -52,7 +53,9 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
 - **すでに作業ブランチ／worktree 内にいる場合**:
   - 作業開始時に `git branch --show-current` が `main` / `master` **以外**（例：`feat/...` や既存の隔離 worktree 内）であれば、新しい worktree は作らずそのブランチ・ディレクトリで作業してよい。
 
-### `main` / `master` 上で実装を頼まれたときの `git worktree` 作成・作業手順
+### `main` / `master` 上でファイル変更（設計書作成・実装）を頼まれたときの `git worktree` 作成・作業手順
+
+- 設計書（`dev-doc/`）の作成・更新のみを行う場合は `docs/<対象名>` ブランチ（例：`docs/ai-ui-settings-design`）を作成して `dev-doc/` のみを編集し、実装指示を受ける前にソースコードへ触れないこと。
 
 1. **事前確認（編集より先に実行）**:
    - `git branch --show-current`、`git worktree list`、`git status --short` を確認する。
