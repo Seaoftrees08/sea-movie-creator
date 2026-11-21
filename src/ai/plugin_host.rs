@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiStreamEvent,
+    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiStreamEvent, AiThinkingLevel,
+    AiTokenUsage,
 };
+use crate::ai::settings::ProbedModelEntry;
 use crate::core::PluginAiHints;
 use crate::export::registry::resolve_plugin_executable;
 
@@ -133,7 +135,8 @@ pub struct AiPluginRequestEnvelope {
 }
 
 /// AI プラグイン呼び出しパラメータ。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiPluginCallParams {
     /// システムプロンプト。
     pub system_prompt: String,
@@ -161,6 +164,54 @@ pub struct AiPluginCallParams {
     pub external_args: Vec<String>,
 }
 
+/// `"method": "list_models"` により AI プラグインから取得された利用可能モデル／CLI 情報。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredAiModel {
+    /// モデルまたはプロファイル識別子。
+    pub id: String,
+    /// 人間向け表示名。
+    pub display_name: String,
+    /// 補助バッジ（`"New"` 等、任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+    /// サポートする思考レベル一覧。
+    #[serde(default)]
+    pub thinking_levels: Vec<AiThinkingLevel>,
+    /// 既定思考レベル。
+    #[serde(default)]
+    pub default_thinking: AiThinkingLevel,
+    /// 現在の環境で実行・選択可能か。
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// 状態補足メモ（例: `"ACP利用可能"` / `"CLI未検出"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// コンテキストウィンドウ上限トークン数（既知の場合）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl DiscoveredAiModel {
+    /// 設定・UI 側の共通プローブモデル項目 [`ProbedModelEntry`] へ変換する。
+    #[must_use]
+    pub fn to_probed_entry(&self) -> ProbedModelEntry {
+        ProbedModelEntry {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            badge: self.badge.clone(),
+            thinking_levels: self.thinking_levels.clone(),
+            default_thinking: self.default_thinking,
+            context_window_tokens: self.context_window_tokens,
+            available: self.available,
+            note: self.note.clone(),
+        }
+    }
+}
+
 /// AI プラグイン (`sea_ai_v1`) が標準出力へ 1 行ずつ返す NDJSON イベント。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -175,12 +226,21 @@ pub enum AiPluginHostEvent {
         /// 追記テキスト。
         text: String,
     },
+    /// 利用可能モデル・プロファイル一覧応答 (`"method": "list_models"` 用)。
+    Models {
+        /// 検出されたモデル一覧。
+        #[serde(default)]
+        models: Vec<DiscoveredAiModel>,
+    },
     /// 生成完了と最終テキスト。
     Completed {
         /// 最終応答生テキスト。
         raw_text: String,
         /// 応答モデル・アダプタ名。
         model: String,
+        /// トークン使用量・コストメタデータ（外部 CLI が返却した場合）。
+        #[serde(default)]
+        usage: Option<AiTokenUsage>,
     },
     /// エラー通知。
     Error {
@@ -390,6 +450,78 @@ impl AiPluginProvider {
         self
     }
 
+    /// プラグインへ `"method": "list_models"` を送信し、現在利用可能なモデル・CLI 一覧を取得する。
+    ///
+    /// # Errors
+    ///
+    /// プロセス起動失敗、プロトコル不正、または外部 CLI 未検出・認証エラー時に [`AiError`] を返す。
+    pub fn probe_available_models(&self) -> Result<Vec<DiscoveredAiModel>, AiError> {
+        if self.protocol != AiPluginProtocol::SeaAiV1 {
+            return Ok(Vec::new());
+        }
+        let mut cmd = Command::new(&self.executable_path);
+        sea_export_protocol::apply_background_process_flags(&mut cmd);
+        cmd.args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in &self.extra_env {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd.spawn().map_err(|err| {
+            AiError::PluginError(format!(
+                "failed to spawn AI plugin `{}` for list_models ({}): {err}",
+                self.plugin_id,
+                self.executable_path.display()
+            ))
+        })?;
+
+        let envelope = AiPluginRequestEnvelope {
+            protocol: "sea_ai_v1".to_owned(),
+            method: "list_models".to_owned(),
+            params: AiPluginCallParams {
+                external_cli: self.external_cli_override.clone(),
+                external_args: self.external_args_override.clone(),
+                ..AiPluginCallParams::default()
+            },
+        };
+        let payload = serde_json::to_string(&envelope).map_err(|err| {
+            AiError::ParseFailed(format!("list_models request serialize error: {err}"))
+        })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            writeln!(stdin, "{payload}")?;
+            stdin.flush()?;
+        }
+
+        let Some(stdout) = child.stdout.take() else {
+            return Err(AiError::PluginError(
+                "AI plugin stdout pipe unavailable".to_owned(),
+            ));
+        };
+        let mut noop = |_ev: AiStreamEvent| {};
+        let output = read_sea_ai_v1_events(&self.plugin_id, stdout, &mut child, &mut noop)?;
+
+        let status = child.wait_with_output()?;
+        if !status.status.success() {
+            let stderr_text = String::from_utf8_lossy(&status.stderr).trim().to_owned();
+            let msg = if stderr_text.is_empty() {
+                format!(
+                    "AI plugin `{}` list_models exited with {}",
+                    self.plugin_id, status.status
+                )
+            } else {
+                format!(
+                    "AI plugin `{}` list_models exited with {}: {stderr_text}",
+                    self.plugin_id, status.status
+                )
+            };
+            return Err(AiError::PluginError(msg));
+        }
+
+        Ok(output.discovered_models)
+    }
+
     fn run_sea_ai_v1(
         &self,
         request: &AiRequest,
@@ -443,8 +575,9 @@ impl AiPluginProvider {
                 "AI plugin stdout pipe unavailable".to_owned(),
             ));
         };
-        let (streamed_text, final_response) =
-            read_sea_ai_v1_events(&self.plugin_id, stdout, &mut child, on_event)?;
+        let sea_out = read_sea_ai_v1_events(&self.plugin_id, stdout, &mut child, on_event)?;
+        let streamed_text = sea_out.streamed_text;
+        let final_response = sea_out.final_response;
 
         let output_status = child.wait_with_output()?;
         if !output_status.status.success() {
@@ -602,15 +735,22 @@ impl AiProvider for AiPluginProvider {
     }
 }
 
+struct SeaAiV1EventsOutput {
+    streamed_text: String,
+    final_response: Option<AiResponse>,
+    discovered_models: Vec<DiscoveredAiModel>,
+}
+
 fn read_sea_ai_v1_events(
     plugin_id: &str,
     stdout: std::process::ChildStdout,
     child: &mut std::process::Child,
     on_event: &mut dyn FnMut(AiStreamEvent),
-) -> Result<(String, Option<AiResponse>), AiError> {
+) -> Result<SeaAiV1EventsOutput, AiError> {
     let reader = BufReader::new(stdout);
     let mut streamed_text = String::new();
     let mut final_response: Option<AiResponse> = None;
+    let mut discovered_models: Vec<DiscoveredAiModel> = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -631,7 +771,14 @@ fn read_sea_ai_v1_events(
                 streamed_text.push_str(&text);
                 on_event(AiStreamEvent::DeltaText(text));
             }
-            AiPluginHostEvent::Completed { raw_text, model } => {
+            AiPluginHostEvent::Models { models } => {
+                discovered_models = models;
+            }
+            AiPluginHostEvent::Completed {
+                raw_text,
+                model,
+                usage,
+            } => {
                 let chosen = if raw_text.is_empty() {
                     streamed_text.clone()
                 } else {
@@ -640,7 +787,7 @@ fn read_sea_ai_v1_events(
                 final_response = Some(AiResponse {
                     raw_text: chosen,
                     model,
-                    usage: None,
+                    usage,
                 });
             }
             AiPluginHostEvent::Error { code, message } => {
@@ -651,7 +798,11 @@ fn read_sea_ai_v1_events(
             }
         }
     }
-    Ok((streamed_text, final_response))
+    Ok(SeaAiV1EventsOutput {
+        streamed_text,
+        final_response,
+        discovered_models,
+    })
 }
 
 struct AcpCollectedResult {
@@ -854,6 +1005,38 @@ mod tests {
             Some(exe_path.as_path())
         );
         let _provider = reg.resolve_provider("test.ai.local")?;
+        Ok(())
+    }
+
+    #[test]
+    fn sea_ai_v1_models_event_and_completed_usage_deserialize_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let list_req_json = r#"{"protocol":"sea_ai_v1","method":"list_models","params":{}}"#;
+        let env: AiPluginRequestEnvelope = serde_json::from_str(list_req_json)?;
+        assert_eq!(env.method, "list_models");
+        assert_eq!(env.params.user_prompt, "");
+
+        let models_line = r#"{"event":"models","models":[{"id":"gemini-4-argon","display_name":"Gemini 4 Argon","thinking_levels":["low","medium","high"],"default_thinking":"medium","available":true,"note":"ACP利用可能"}]}"#;
+        let parsed_models: AiPluginHostEvent = serde_json::from_str(models_line)?;
+        let AiPluginHostEvent::Models { models } = parsed_models else {
+            return Err("expected models event".into());
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-4-argon");
+        assert!(models[0].available);
+        assert_eq!(
+            models[0].to_probed_entry().note.as_deref(),
+            Some("ACP利用可能")
+        );
+
+        let completed_line = r#"{"event":"completed","raw_text":"{}","model":"antigravity:gemini-4-argon","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"is_estimated":false}}"#;
+        let parsed_done: AiPluginHostEvent = serde_json::from_str(completed_line)?;
+        let AiPluginHostEvent::Completed { usage, .. } = parsed_done else {
+            return Err("expected completed event".into());
+        };
+        let u = usage.ok_or("expected usage payload")?;
+        assert_eq!(u.total_tokens, 165);
+        assert!(!u.is_estimated);
         Ok(())
     }
 }

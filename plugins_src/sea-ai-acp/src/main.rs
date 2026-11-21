@@ -23,20 +23,25 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 struct RequestEnvelope {
+    #[serde(default = "default_method")]
+    method: String,
+    #[serde(default)]
     params: CallParams,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_method() -> String {
+    "generate_command".to_owned()
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct CallParams {
     system_prompt: String,
     command_schema_json: Value,
     context_summary: Value,
     user_prompt: String,
-    #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
     external_cli: Option<String>,
-    #[serde(default)]
     external_args: Vec<String>,
 }
 
@@ -195,6 +200,88 @@ fn read_until_response<R: BufRead>(
     }
 }
 
+fn extract_acp_usage(prompt_resp: &Value) -> Option<Value> {
+    let usage = prompt_resp["result"].get("usage")?;
+    let obj = usage.as_object()?;
+    let input_tokens = obj
+        .get("inputTokens")
+        .or_else(|| obj.get("input_tokens"))
+        .or_else(|| obj.get("promptTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = obj
+        .get("outputTokens")
+        .or_else(|| obj.get("output_tokens"))
+        .or_else(|| obj.get("completionTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = obj
+        .get("totalTokens")
+        .or_else(|| obj.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": null,
+        "is_estimated": false,
+    }))
+}
+
+fn probe_acp_profiles(params: &CallParams) -> Vec<Value> {
+    let profiles: [(&str, &str, &str, &[&str]); 3] = [
+        ("claude", "Claude Code (ACP)", "claude", &[]),
+        (
+            "codex",
+            "OpenAI Codex CLI (ACP)",
+            "codex",
+            &["auto", "low", "medium", "high"],
+        ),
+        ("copilot", "GitHub Copilot CLI (ACP)", "copilot", &[]),
+    ];
+    let explicit_cli = params
+        .external_cli
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    profiles
+        .iter()
+        .map(|(id, label, default_bin, levels)| {
+            let candidate = explicit_cli.unwrap_or(default_bin);
+            let detected = resolve_executable_in_path(candidate);
+            let available = detected.is_some();
+            let note = if let Some(path) = detected {
+                format!("ACP 利用可能 ({})", path.display())
+            } else {
+                format!("`{candidate}` が PATH 上に未検出")
+            };
+            let default_thinking = if levels.is_empty() { "auto" } else { "medium" };
+            json!({
+                "id": id,
+                "display_name": label,
+                "badge": null,
+                "thinking_levels": levels,
+                "default_thinking": default_thinking,
+                "available": available,
+                "note": note,
+            })
+        })
+        .collect()
+}
+
+fn run_list_models(params: &CallParams) {
+    let models = probe_acp_profiles(params);
+    emit_event(&json!({
+        "event": "models",
+        "models": models,
+    }));
+}
+
 fn run_acp_session(params: &CallParams) -> Result<(), String> {
     let (agent_bin, agent_args, profile) = resolve_agent_command(params).map_err(|msg| {
         emit_event(&json!({
@@ -291,11 +378,15 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
     } else {
         streamed
     };
-    emit_event(&json!({
+    let mut completed = json!({
         "event": "completed",
         "raw_text": raw_text,
         "model": format!("acp:{profile}"),
-    }));
+    });
+    if let Some(usage) = extract_acp_usage(&prompt_resp) {
+        completed["usage"] = usage;
+    }
+    emit_event(&completed);
     Ok(())
 }
 
@@ -317,6 +408,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if req.method == "list_models" {
+        run_list_models(&req.params);
+        return ExitCode::SUCCESS;
+    }
     if let Err(err) = run_acp_session(&req.params) {
         emit_event(&json!({ "event": "error", "code": "execution_failed", "message": err }));
         return ExitCode::FAILURE;
@@ -351,6 +446,27 @@ mod tests {
         assert_eq!(
             extract_acp_update_text(&note).as_deref(),
             Some("{\"type\":\"undo\"}")
+        );
+    }
+
+    #[test]
+    fn list_models_request_and_acp_profile_probe_work() {
+        let req: RequestEnvelope =
+            serde_json::from_str(r#"{"protocol":"sea_ai_v1","method":"list_models","params":{}}"#)
+                .expect("valid list_models json");
+        assert_eq!(req.method, "list_models");
+        let profiles = probe_acp_profiles(&req.params);
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles[0]["id"], json!("claude"));
+        assert_eq!(profiles[1]["id"], json!("codex"));
+        assert_eq!(profiles[2]["id"], json!("copilot"));
+
+        let usage = extract_acp_usage(&json!({
+            "result": { "usage": { "input_tokens": 18, "output_tokens": 7 } }
+        }));
+        assert_eq!(
+            usage.as_ref().and_then(|u| u["total_tokens"].as_u64()),
+            Some(25)
         );
     }
 }

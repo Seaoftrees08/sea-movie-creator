@@ -98,6 +98,11 @@ fn antigravity_plugin_streams_agy_output_and_errors_cleanly_when_missing()
         .with_external_cli(fixture_bin.display().to_string())
         .with_env("SEA_AI_FIXTURE_MODE", "acp-agy-sandbox");
 
+    let probed_models = provider.probe_available_models()?;
+    assert_eq!(probed_models.len(), 2);
+    assert_eq!(probed_models[0].id, "gemini-4-argon");
+    assert_eq!(probed_models[1].id, "gemini-4-hydrogen");
+
     let doc = ProjectDocument::new("Antigravity Test");
     let req = build_ai_request(&doc, FrameIndex::ZERO, None, None, &[], "Add Agy layer")?;
     let mut deltas = Vec::new();

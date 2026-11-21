@@ -110,6 +110,7 @@ sea-movie-creator mcp --project path/to/project.smc.json
 リファレンス実装は [`plugins_src/sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs) と [`plugins_src/sea-ai-acp/src/main.rs`](../../plugins_src/sea-ai-acp/src/main.rs) です。
 
 1. **ホスト → プラグイン（`stdin` 1 行 JSON）**:
+   - `method` は既定の `"generate_command"` に加え、任意で `"list_models"`（現在利用可能なモデル・プロファイル一覧の動的照会）を指定できます（`CallParams` のプロンプト系フィールドは `#[serde(default)]` のため `list_models` 時は省略可能）。
    ```json
    {
      "protocol": "sea_ai_v1",
@@ -128,12 +129,24 @@ sea-movie-creator mcp --project path/to/project.smc.json
      }
    }
    ```
+   ```json
+   {
+     "protocol": "sea_ai_v1",
+     "method": "list_models",
+     "params": {
+       "external_cli": null,
+       "external_args": []
+     }
+   }
+   ```
    - `thinking_level` は `"low"` / `"medium"` / `"high"` / `"xhigh"` 等が渡される場合があります（未指定時は省略）。
 2. **プラグイン → ホスト（`stdout` NDJSON イベント）**:
    - 状態通知: `{"event":"status","message":"接続中..."}`
    - ストリーミング差分: `{"event":"delta","text":"{\"type\":\"add_layer\","}`
-   - 生成完了: `{"event":"completed","raw_text":"{\"type\":\"add_layer\",\"name\":\"...\"}","model":"example:model-1"}`
+   - 利用可能モデル一覧（`list_models` 用）: `{"event":"models","models":[{"id":"gemini-4-argon","display_name":"Gemini 4 Argon","badge":null,"thinking_levels":["low","medium","high"],"default_thinking":"medium","available":true,"note":"ACP利用可能"}]}`
+   - 生成完了: `{"event":"completed","raw_text":"{\"type\":\"add_layer\",\"name\":\"...\"}","model":"example:model-1","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"cost_usd":null,"is_estimated":false}}`
      - `raw_text` が空文字の場合、ホストはそれまでに受信した `delta` の連結文字列を最終応答として採用します。
+     - `usage` フィールドは任意（`#[serde(default)]`）であり、省略時は後方互換としてホスト側が推定・未指定扱いにフォールバックします。
    - エラー通知: `{"event":"error","code":"missing_external_cli","message":"詳細説明"}`
 
 ### 2.3 プロトコル B: `acp_stdio`（直接 ACP JSON-RPC 2.0）

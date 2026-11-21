@@ -53,22 +53,26 @@ impl Drop for TempSandboxDir {
 
 #[derive(Debug, Deserialize)]
 struct RequestEnvelope {
+    #[serde(default = "default_method")]
+    method: String,
+    #[serde(default)]
     params: CallParams,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_method() -> String {
+    "generate_command".to_owned()
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct CallParams {
     system_prompt: String,
     command_schema_json: Value,
     context_summary: Value,
     user_prompt: String,
-    #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
     thinking_level: Option<String>,
-    #[serde(default)]
     external_cli: Option<String>,
-    #[serde(default)]
     external_args: Vec<String>,
 }
 
@@ -390,13 +394,159 @@ fn extract_fallback_result_text(prompt_resp: &Value) -> String {
     String::new()
 }
 
+fn extract_acp_usage(prompt_resp: &Value) -> Option<Value> {
+    let usage = prompt_resp["result"].get("usage")?;
+    let obj = usage.as_object()?;
+    let input_tokens = obj
+        .get("inputTokens")
+        .or_else(|| obj.get("input_tokens"))
+        .or_else(|| obj.get("promptTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = obj
+        .get("outputTokens")
+        .or_else(|| obj.get("output_tokens"))
+        .or_else(|| obj.get("completionTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = obj
+        .get("totalTokens")
+        .or_else(|| obj.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": null,
+        "is_estimated": false,
+    }))
+}
+
+fn map_acp_thought_level_name(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some("auto"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "extra" => Some("extra"),
+        _ => None,
+    }
+}
+
+fn extract_models_from_session_new(session_resp: &Value) -> Vec<Value> {
+    let config_options = session_resp["result"]["configOptions"].as_array();
+    let thought_levels: Vec<&'static str> = config_options
+        .and_then(|opts| {
+            opts.iter()
+                .find(|opt| opt["id"].as_str() == Some("thought_level"))
+        })
+        .and_then(|opt| opt["options"].as_array())
+        .map(|vals| {
+            vals.iter()
+                .filter_map(|v| v["value"].as_str().and_then(map_acp_thought_level_name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let default_thinking = if thought_levels.contains(&"medium") {
+        "medium"
+    } else if thought_levels.is_empty() {
+        "auto"
+    } else {
+        thought_levels[0]
+    };
+
+    if let Some(model_opt) =
+        config_options.and_then(|opts| opts.iter().find(|opt| opt["id"].as_str() == Some("model")))
+        && let Some(vals) = model_opt["options"].as_array()
+        && !vals.is_empty()
+    {
+        return vals
+            .iter()
+            .filter_map(|entry| {
+                let id = entry["value"].as_str().or_else(|| entry.as_str())?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let label = entry["name"]
+                    .as_str()
+                    .or_else(|| entry["label"].as_str())
+                    .unwrap_or(id);
+                Some(json!({
+                    "id": id,
+                    "display_name": label,
+                    "badge": null,
+                    "thinking_levels": thought_levels,
+                    "default_thinking": default_thinking,
+                    "available": true,
+                    "note": "agy CLI 利用可能",
+                }))
+            })
+            .collect();
+    }
+
+    if let Some(avail) = session_resp["result"]["models"]["availableModels"].as_array()
+        && !avail.is_empty()
+    {
+        return avail
+            .iter()
+            .filter_map(|entry| {
+                let id = entry["modelId"]
+                    .as_str()
+                    .or_else(|| entry["id"].as_str())?
+                    .trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let name = entry["name"].as_str().unwrap_or(id);
+                Some(json!({
+                    "id": id,
+                    "display_name": name,
+                    "badge": null,
+                    "thinking_levels": thought_levels,
+                    "default_thinking": default_thinking,
+                    "available": true,
+                    "note": "agy CLI 利用可能",
+                }))
+            })
+            .collect();
+    }
+
+    if let Some(cur) = session_resp["result"]["models"]["currentModelId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return vec![json!({
+            "id": cur,
+            "display_name": cur,
+            "badge": null,
+            "thinking_levels": thought_levels,
+            "default_thinking": default_thinking,
+            "available": true,
+            "note": "agy CLI 利用可能",
+        })];
+    }
+
+    Vec::new()
+}
+
+struct AcpConversationOutcome {
+    fallback_text: String,
+    active_model: String,
+    usage: Option<Value>,
+}
+
 fn execute_acp_conversation(
     reader: &mut BufReader<std::process::ChildStdout>,
     stdin: &mut ChildStdin,
     sandbox_cwd: &Path,
     params: &CallParams,
     streamed: &mut String,
-) -> Result<(String, String), String> {
+) -> Result<AcpConversationOutcome, String> {
     write_jsonrpc_line(stdin, &build_initialize_request(1))?;
     let _init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
 
@@ -448,7 +598,73 @@ fn execute_acp_conversation(
         None => base_model.to_owned(),
     };
 
-    Ok((extract_fallback_result_text(&prompt_resp), active_model))
+    Ok(AcpConversationOutcome {
+        fallback_text: extract_fallback_result_text(&prompt_resp),
+        active_model,
+        usage: extract_acp_usage(&prompt_resp),
+    })
+}
+
+fn run_list_models(params: &CallParams) -> Result<(), String> {
+    let agy_bin = resolve_agy_cli(params.external_cli.as_deref()).map_err(|msg| {
+        emit_event(&json!({
+            "event": "error",
+            "code": "missing_external_cli",
+            "message": msg,
+        }));
+        msg
+    })?;
+
+    let sandbox_dir = TempSandboxDir::create()?;
+    let args = build_agy_acp_args(&params.external_args);
+    let mut cmd = Command::new(&agy_bin);
+    apply_background_process_flags(&mut cmd);
+    let mut child = cmd
+        .args(&args)
+        .current_dir(sandbox_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("`agy acp` 起動に失敗しました: {err}"))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "`agy acp` stdin パイプ取得失敗".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "`agy acp` stdout パイプ取得失敗".to_owned())?;
+    let mut reader = BufReader::new(stdout);
+    let mut streamed = String::new();
+
+    write_jsonrpc_line(&mut child_stdin, &build_initialize_request(1))?;
+    let _init = read_acp_until_response(&mut reader, &mut child_stdin, 1, &mut streamed)?;
+    write_jsonrpc_line(
+        &mut child_stdin,
+        &build_session_new_request(2, sandbox_dir.path()),
+    )?;
+    let session_resp = read_acp_until_response(&mut reader, &mut child_stdin, 2, &mut streamed)?;
+    drop(child_stdin);
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(format!(
+            "`agy acp` モデル取得が終了コード {} で失敗しました: {stderr}",
+            output.status
+        ));
+    }
+
+    let models = extract_models_from_session_new(&session_resp);
+    emit_event(&json!({
+        "event": "models",
+        "models": models,
+    }));
+    Ok(())
 }
 
 fn run_request(params: &CallParams) -> Result<(), String> {
@@ -505,7 +721,7 @@ fn run_request(params: &CallParams) -> Result<(), String> {
         .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 
-    let (fallback_text, active_model) = match conv_res {
+    let outcome = match conv_res {
         Ok(res) => res,
         Err(err) => {
             if stderr.is_empty() {
@@ -523,15 +739,19 @@ fn run_request(params: &CallParams) -> Result<(), String> {
     }
 
     let raw_text = if streamed.is_empty() {
-        fallback_text
+        outcome.fallback_text
     } else {
         streamed
     };
-    emit_event(&json!({
+    let mut completed = json!({
         "event": "completed",
         "raw_text": raw_text,
-        "model": format!("antigravity:{active_model}"),
-    }));
+        "model": format!("antigravity:{}", outcome.active_model),
+    });
+    if let Some(usage) = outcome.usage {
+        completed["usage"] = usage;
+    }
+    emit_event(&completed);
     Ok(())
 }
 
@@ -553,7 +773,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(err) = run_request(&req.params) {
+    let res = match req.method.as_str() {
+        "list_models" => run_list_models(&req.params),
+        _ => run_request(&req.params),
+    };
+    if let Err(err) = res {
         emit_event(&json!({ "event": "error", "code": "execution_failed", "message": err }));
         return ExitCode::FAILURE;
     }
@@ -657,7 +881,8 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_normalization_and_config_option_checks_work() {
+    fn thinking_level_normalization_and_config_option_checks_work()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(normalize_requested_thinking_level(None), None);
         assert_eq!(normalize_requested_thinking_level(Some("auto")), None);
         assert_eq!(
@@ -685,5 +910,23 @@ mod tests {
         assert!(session_has_config_option(&cfg, "model"));
         assert!(config_option_allows_value(&cfg, "thought_level", "xhigh"));
         assert!(!config_option_allows_value(&cfg, "thought_level", "auto"));
+
+        let extracted = extract_models_from_session_new(&cfg);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0]["id"], json!("gemini-4-hydrogen"));
+        assert_eq!(
+            extracted[0]["thinking_levels"],
+            json!(["low", "medium", "high", "extra"])
+        );
+        assert_eq!(extracted[0]["available"].as_bool(), Some(true));
+
+        let usage_resp = json!({
+            "result": {
+                "usage": { "inputTokens": 40, "outputTokens": 15, "totalTokens": 55 }
+            }
+        });
+        let parsed_usage = extract_acp_usage(&usage_resp).ok_or("missing usage")?;
+        assert_eq!(parsed_usage["total_tokens"], json!(55));
+        Ok(())
     }
 }
