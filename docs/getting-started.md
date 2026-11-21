@@ -8,7 +8,7 @@
 
 ### 必要なフォルダ配置
 
-アプリは実行ファイルと同じ階層（またはカレントディレクトリ）の `plugins/` と `lang/` を自動検出します。配布フォルダ直下には起動ソフト (`sea-movie-creator.exe`) のみを置き、プラグイン・音声隔離ホスト実行ファイルは `plugins/` 配下へ整理されています。
+アプリは実行ファイルと同じ階層（またはカレントディレクトリ）の `plugins/` と `lang/` を自動検出し、ユーザー設定は実行ファイルと同階層の `settings/` フォルダへ保存します。配布フォルダ直下には起動ソフト (`sea-movie-creator.exe`) のみを置き、プラグイン・音声隔離ホスト実行ファイル・設定ファイルはそれぞれサブフォルダへ整理されています。
 
 ```text
 <配布フォルダ>/
@@ -18,6 +18,12 @@
 ├── lang/                        # 多言語ファイル（`<code >.json` を追加するだけで言語追加可能）
 │   ├── ja.json
 │   └── en.json
+├── settings/                    # ポータブル設定フォルダ（初回起動・設定変更時に自動生成）
+│   ├── ai_settings.json         # AI 接続設定（前回選択AI/モデル・カスタムモデル・任意APIキー・予算）
+│   ├── ai_sessions/             # AI チャット履歴 JSON 群
+│   ├── key_config.json          # ショートカットキー設定
+│   ├── external_tools.json      # 外部 ffmpeg パス設定
+│   └── language.json            # 表示言語選択状態
 └── plugins/
     ├── ai/
     │   ├── acp/
@@ -41,7 +47,12 @@
 ```
 
 > [!TIP]
-> Linux / macOS 環境では `.exe` 拡張子なしの各バイナリが対応します。プラグイン配置フォルダを明示的に上書きしたい場合は、環境変数 `SEA_EXPORT_PLUGIN_DIR` および `SEA_AI_PLUGIN_DIR` を使用できます。
+> - Linux / macOS 環境では `.exe` 拡張子なしの各バイナリが対応します。プラグイン配置フォルダを明示的に上書きしたい場合は環境変数 `SEA_EXPORT_PLUGIN_DIR` / `SEA_AI_PLUGIN_DIR` を、設定フォルダ (`settings/`) の保存先を上書きしたい場合は環境変数 **`SEA_SETTINGS_DIR`** を使用できます。
+> - ソースコードから `cargo run` で起動する場合、既定の実行ファイル位置が `target/debug/` になるため、設定ファイル群は `target/debug/settings/` に作成されます（リポジトリ直下で設定を固定したい場合は `SEA_SETTINGS_DIR=./settings` を指定してください。`/settings/` は `.gitignore` 対象です）。
+
+> [!WARNING]
+> **API キーの取り扱いについて**:
+> AI 設定モーダル（`⚙` ボタンまたはメニューバー `設定 -> AI 設定...`）から API キーを OS 資格情報ストア（Keyring）へ保存するほか、`settings/ai_settings.json` へ直接記述・保存することも可能です。**`settings/ai_settings.json` に API キーを記載している場合は、配布フォルダや `settings/` フォルダごと第三者へ共有・アップロードしないようご注意ください。**（プロジェクトファイル `.smc.json` には API キーは一切保存されません。）
 
 ### 起動方法
 

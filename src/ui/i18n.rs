@@ -8,7 +8,7 @@ use std::sync::{LazyLock, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::user_config_file_path;
+use crate::core::{user_config_file_path, user_config_read_path};
 
 const BUILTIN_JA_JSON: &str = include_str!("../../lang/ja.json");
 const BUILTIN_EN_JSON: &str = include_str!("../../lang/en.json");
@@ -381,7 +381,7 @@ fn language_preference_path() -> Option<PathBuf> {
 }
 
 fn load_saved_language_preference() -> Option<String> {
-    let path = language_preference_path()?;
+    let path = user_config_read_path("language.json")?;
     let raw = fs::read_to_string(path).ok()?;
     let pref: SavedLanguagePreference = serde_json::from_str(&raw).ok()?;
     let code = normalize_lang_code(&pref.active_code);
