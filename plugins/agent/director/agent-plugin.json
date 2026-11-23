@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.agent.director",
   "name": "ムービー構成エージェント (Director)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entrypoint": "sea-agent-director",
   "args": [],
   "protocol": "sea_agent_v1",

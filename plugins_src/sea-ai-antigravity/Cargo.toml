@@ -1,6 +1,6 @@
 [package]
 name = "sea-ai-antigravity"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Antigravity CLI (`agy acp --sandbox --stdio`) ACP adapter plugin for sea-movie-creator"
