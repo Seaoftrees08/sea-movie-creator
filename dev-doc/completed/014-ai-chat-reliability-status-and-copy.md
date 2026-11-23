@@ -1,20 +1,20 @@
 # [014] AI チャット継続性修正・作業中／完了状態の可視化・選択＆コピー対応設計書
 
-- **ステータス**: Draft
+- **ステータス**: Implemented
 - **作成日**: 2026-11-23
 - **更新日**: 2026-11-23
 - **関連ドキュメント**:
-  - 自律エージェントプラグイン基盤＆構成コンパイラ設計書（完了済み）: [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md)
-  - AI チャット UI 改修・設定・トークン残量表示設計書（完了済み）: [`completed/013-ai-ui-settings-and-usage.md`](completed/013-ai-ui-settings-and-usage.md)
-  - 外部プラグイン向け SDK・プロトコル互換性ポリシー: [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md)
-  - AI 連携・MCP・AI CLI プラグイン開発ガイド: [`../docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md)
+  - 自律エージェントプラグイン基盤＆構成コンパイラ設計書（完了済み）: [`completed/012-agentic-plugin-architecture.md`](012-agentic-plugin-architecture.md)
+  - AI チャット UI 改修・設定・トークン残量表示設計書（完了済み）: [`completed/013-ai-ui-settings-and-usage.md`](013-ai-ui-settings-and-usage.md)
+  - 外部プラグイン向け SDK・プロトコル互換性ポリシー: [`011-plugin-protocol-compatibility-policy.md`](../011-plugin-protocol-compatibility-policy.md)
+  - AI 連携・MCP・AI CLI プラグイン開発ガイド: [`../docs/plugins/ai-and-mcp.md`](../../docs/plugins/ai-and-mcp.md)
 
 ---
 
 ## 1. 概要・目的
 
 - **この機能で解決したい課題・達成したいこと**:
-  現在の AI チャットパネル（[`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs)）および CLI / 自律エージェント連携経路（[`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs)・[`src/ai/provider.rs`](../src/ai/provider.rs)・[`plugins_src/sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs)・[`plugins_src/sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs)・[`plugins_src/sea-agent-director/src/director.rs`](../plugins_src/sea-agent-director/src/director.rs)）に存在する、以下 3 点の実運用上の重大な課題を解消します。
+  現在の AI チャットパネル（[`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs)）および CLI / 自律エージェント連携経路（[`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs)・[`src/ai/provider.rs`](../../src/ai/provider.rs)・[`plugins_src/sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs)・[`plugins_src/sea-ai-acp/src/main.rs`](../../plugins_src/sea-ai-acp/src/main.rs)・[`plugins_src/sea-agent-director/src/director.rs`](../../plugins_src/sea-agent-director/src/director.rs)）に存在する、以下 3 点の実運用上の重大な課題を解消します。
   1. **チャットを続けるとうまく完了・反映されない問題の根本解消**:
      `Antigravity (agy CLI)` 等で継続指示（例: 4 項目の修正依頼）を送信したにもかかわらず、「現在のタイムライン（総尺: 10,800フレーム / 180秒）に対するドラフト検証が完了しました。追加の変更はありません。」＋ ```` ```json {"type":"batch","commands":[]} ``` ```` が出力され、編集が適用されず終了する不具合を解消します。
   2. **AI が作業中（応答中）か完了したかの明確な可視化と完了報告**:
@@ -51,22 +51,22 @@ sequenceDiagram
 ```
 
 1. **CLI / ACP プラグインにおける `history` の全破棄（主因）**:
-   - ホスト側 [`AiPluginProvider::run_sea_ai_v1`](../src/ai/plugin_host.rs#L548-L563) は `AiPluginCallParams.history` に会話履歴をシリアライズして標準入力へ送信していますが、[`sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs#L68-L77) および [`sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs#L38-L46) の `CallParams` に `history` フィールドが存在せず、JSON デシリアライズ時に黙って破棄されています。また、[`AiPluginProvider::run_direct_acp_stdio`](../src/ai/plugin_host.rs#L676-L682) でも `request.history` がプロンプトへ展開されていません。
-   - HTTP プロバイダ（OpenAI / Gemini / Anthropic）は `send_agent_turn` をネイティブ実装しているため会話配列を保持できますが、CLI プラグインは [`fallback_agent_turn_via_streaming`](../src/ai/provider.rs#L1289-L1327) を経由するため、**ツール実行後の 2 ステップ目では元のユーザー指示が `history` 側に移って消失し、モデルは `[ToolResult ...]` のみを見て即終了** してしまいます。通常チャットでも 2 ターン目以降の文脈が失われます。
+   - ホスト側 [`AiPluginProvider::run_sea_ai_v1`](../../src/ai/plugin_host.rs#L548-L563) は `AiPluginCallParams.history` に会話履歴をシリアライズして標準入力へ送信していますが、[`sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs#L68-L77) および [`sea-ai-acp/src/main.rs`](../../plugins_src/sea-ai-acp/src/main.rs#L38-L46) の `CallParams` に `history` フィールドが存在せず、JSON デシリアライズ時に黙って破棄されています。また、[`AiPluginProvider::run_direct_acp_stdio`](../../src/ai/plugin_host.rs#L676-L682) でも `request.history` がプロンプトへ展開されていません。
+   - HTTP プロバイダ（OpenAI / Gemini / Anthropic）は `send_agent_turn` をネイティブ実装しているため会話配列を保持できますが、CLI プラグインは [`fallback_agent_turn_via_streaming`](../../src/ai/provider.rs#L1289-L1327) を経由するため、**ツール実行後の 2 ステップ目では元のユーザー指示が `history` 側に移って消失し、モデルは `[ToolResult ...]` のみを見て即終了** してしまいます。通常チャットでも 2 ターン目以降の文脈が失われます。
    - さらに `sea-ai-acp` の `extract_acp_update_text`（L144-L155）には `sea-ai-antigravity` にある `sessionUpdate == "agent_message_chunk"` フィルタが無く、`agent_thought_chunk` や `tool_call` が本文へ混入する恐れがあります。
 2. **`sea-ai-antigravity` の `# Sandbox Constraints` による出力形式衝突**:
-   - [`build_session_prompt_request`](../plugins_src/sea-ai-antigravity/src/main.rs#L230-L242) が毎回無条件に `# Sandbox Constraints` へ `Always output a valid EditCommand JSON object matching the schema below (use {"type":"batch","commands":[]} ...)` を追記しています。
+   - [`build_session_prompt_request`](../../plugins_src/sea-ai-antigravity/src/main.rs#L230-L242) が毎回無条件に `# Sandbox Constraints` へ `Always output a valid EditCommand JSON object matching the schema below (use {"type":"batch","commands":[]} ...)` を追記しています。
    - 自律エージェント経由の呼び出し時は本体側から JSON Action Mode（`{"tool_calls":[...]}`）が指示されているにもかかわらず、プラグイン側の末尾追記が毎回 `{"type":"batch","commands":[]}` 出力を強制上書きするため、ツール呼び出しを止めて空 `batch` JSON を返す誘因になっています。さらに空の `command_schema_json` (`{}`)・`context_summary` (`{}`) も毎回埋め込まれています。
 3. **ツールフォールバック経路の脆弱性**:
-   - [`fallback_agent_turn_via_streaming`](../src/ai/provider.rs#L1289-L1327) は `stream: false` 固定で呼び出しており、応答中テキストが流れないほか、末尾に複数の `ToolResult` が連続する場合でも最後の 1 件しか `user_prompt` 側へ取り出さず残りが `history` と混在・分断されます。
+   - [`fallback_agent_turn_via_streaming`](../../src/ai/provider.rs#L1289-L1327) は `stream: false` 固定で呼び出しており、応答中テキストが流れないほか、末尾に複数の `ToolResult` が連続する場合でも最後の 1 件しか `user_prompt` 側へ取り出さず残りが `history` と混在・分断されます。
 4. **`sea-agent-director` のフォローアップ記憶・コンテキスト分離・未編集誤完了**:
-   - [`DirectorMemory`](../plugins_src/sea-agent-director/src/director.rs#L26-L48) に過去のフォローアップ指示と実施履歴が保存されず、連続チャット時に前の調整文脈が引き継がれません。
-   - [`run_dynamic_tool_loop`](../plugins_src/sea-agent-director/src/director.rs#L1099-L1120) の `initial_context` は `timeline_summary`・`last_blueprint`・`analyzed_images`（最大 64 枚）と `user_instruction` を単一 `serde_json::json!` にまとめており、キーがアルファベット順（`"user_instruction"` が最後尾）で出力されるため、履歴圧縮や切り詰め時に元のユーザー指示が最初に削られるリスクがあります。
+   - [`DirectorMemory`](../../plugins_src/sea-agent-director/src/director.rs#L26-L48) に過去のフォローアップ指示と実施履歴が保存されず、連続チャット時に前の調整文脈が引き継がれません。
+   - [`run_dynamic_tool_loop`](../../plugins_src/sea-agent-director/src/director.rs#L1099-L1120) の `initial_context` は `timeline_summary`・`last_blueprint`・`analyzed_images`（最大 64 枚）と `user_instruction` を単一 `serde_json::json!` にまとめており、キーがアルファベット順（`"user_instruction"` が最後尾）で出力されるため、履歴圧縮や切り詰め時に元のユーザー指示が最初に削られるリスクがあります。
    - また、モデルが変更系ツールを一度も呼ばずテキストのみ（あるいはテキスト内生 `EditCommand` JSON）を返した場合、検証せずにそのまま `Proposal`（`is_no_op = true`）として終了してしまいます。さらにフォローアップ時のプロンプトに `get_capabilities` で `EditCommand` スキーマを確認する誘導が不足しています。
 5. **UI 側の表示・状態管理上の課題（課題②・③）**:
-   - [`render_chat_body`](../src/ui/ai_chat_panel.rs#L2415-L2485) では完了時に `status_banner` を表示する領域が無く、[`finalize_ai_response`](../src/ui/ai_chat_panel.rs#L2119-L2138) でも `plan.reply_note` が破棄されて `summary_lines` のみ表示されます。
-   - [`agent_host.rs`](../src/ai/agent_host.rs#L1384-L1395) が `AiStreamEvent::DeltaText` を UI へ転送しておらず、一方でフォールバックや構造化生成時に生の制御 JSON（`tool_calls` 等）をそのまま垂れ流すと UX が悪化します。
-   - [`render_chat_turn`](../src/ui/ai_chat_panel.rs#L2554-L2580) がプレーン `div()` のため文字選択・コピーができず、`render_chat_body` (L2436) が `.rev().take(16).rev()` で過去 16 件以前を切り捨てています。
+   - [`render_chat_body`](../../src/ui/ai_chat_panel.rs#L2415-L2485) では完了時に `status_banner` を表示する領域が無く、[`finalize_ai_response`](../../src/ui/ai_chat_panel.rs#L2119-L2138) でも `plan.reply_note` が破棄されて `summary_lines` のみ表示されます。
+   - [`agent_host.rs`](../../src/ai/agent_host.rs#L1384-L1395) が `AiStreamEvent::DeltaText` を UI へ転送しておらず、一方でフォールバックや構造化生成時に生の制御 JSON（`tool_calls` 等）をそのまま垂れ流すと UX が悪化します。
+   - [`render_chat_turn`](../../src/ui/ai_chat_panel.rs#L2554-L2580) がプレーン `div()` のため文字選択・コピーができず、`render_chat_body` (L2436) が `.rev().take(16).rev()` で過去 16 件以前を切り捨てています。
 
 ---
 
@@ -80,20 +80,20 @@ sequenceDiagram
 ### 対象（In Scope）
 
 - **プラグイン側（`plugins_src/`）**:
-  - [`plugins_src/sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs): `history` 受信・多段圧縮付きプロンプト展開（`128 KiB` 上限・`# Original User Instruction` マーカーピン留め・`ToolResult` 優先圧縮）、`# Sandbox Constraints` の出力形式強制削除、空セクション省略。
-  - [`plugins_src/sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs): `history` 受信・多段圧縮付きプロンプト展開、空セクション省略、`extract_acp_update_text` への `agent_message_chunk` フィルタ追加。
-  - [`plugins_src/sea-agent-director/src/director.rs`](../plugins_src/sea-agent-director/src/director.rs): `DirectorMemory.recent_followups`（件数＆文字数上限付き）導入、Step 0 の `messages[0]`（コンテキスト）＋`messages[1]`（`# Original User Instruction`）分離構成、`build_followup_system_prompt` への `get_capabilities` スキーマ参照指示追加、`validate_draft_plan` 結果（`pending_command_count > 0` / `!is_no_op`）およびループ境界条件付き 1 回自己修復リトライ＆空 `batch` JSON 整形＆0 件時明示サマリ生成。
+  - [`plugins_src/sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs): `history` 受信・多段圧縮付きプロンプト展開（`128 KiB` 上限・`# Original User Instruction` マーカーピン留め・`ToolResult` 優先圧縮）、`# Sandbox Constraints` の出力形式強制削除、空セクション省略。
+  - [`plugins_src/sea-ai-acp/src/main.rs`](../../plugins_src/sea-ai-acp/src/main.rs): `history` 受信・多段圧縮付きプロンプト展開、空セクション省略、`extract_acp_update_text` への `agent_message_chunk` フィルタ追加。
+  - [`plugins_src/sea-agent-director/src/director.rs`](../../plugins_src/sea-agent-director/src/director.rs): `DirectorMemory.recent_followups`（件数＆文字数上限付き）導入、Step 0 の `messages[0]`（コンテキスト）＋`messages[1]`（`# Original User Instruction`）分離構成、`build_followup_system_prompt` への `get_capabilities` スキーマ参照指示追加、`validate_draft_plan` 結果（`pending_command_count > 0` / `!is_no_op`）およびループ境界条件付き 1 回自己修復リトライ＆空 `batch` JSON 整形＆0 件時明示サマリ生成。
 - **本体機能モジュール側（`src/`・`lang/`）**:
-  - [`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs): `run_direct_acp_stdio` への `history` 展開・空セクション省略統一。
-  - [`src/ai/provider.rs`](../src/ai/provider.rs): `fallback_agent_turn_via_streaming` での末尾連続 `ToolResult` 全集約と継続誘導強化、`stream: true` 化、`parse_fallback_agent_response` は最終テキスト非破壊のまま返却（ワイヤー型非変更）。
-  - [`src/ai/agent_host.rs`](../src/ai/agent_host.rs): `AgentHostEvent::StreamDelta { text }` 追加、`response_json_schema.is_some()` 時の生テキスト転送抑止（文字数付き `Status` 通知）および通常ターン時の転送。
-  - [`src/ai/context_builder.rs`](../src/ai/context_builder.rs): `default_editor_system_prompt()` へ簡潔な日本語完了報告指示を追加。
-  - [`src/ai/session_store.rs`](../src/ai/session_store.rs): `StoredChatTurn` へ任意状態バッジ `status_badge`（`#[serde(default)]` 後方互換）を追加。
-  - [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs): `AiExecutionState`（`ProposalReady` 含む）、`can_cancel()` による送信・停止ガード統一、安定ターン ID、`rendered_markdown: SharedString` キャッシュ、セッション切替／新規作成時の状態初期化、常設ステータスバー、`Spinner` 応答中カード、制御 JSON マスク（文中 ```` ```json ```` 対応）、`TextView::markdown(...).selectable(true)`（`240px` 折り返し＆余白調整）、ワンクリック `Clipboard` ボタン、Autopilot 単一ターン統合、完了報告確実化、16 件表示制限撤廃（200 件超折りたたみ）。
-  - [`src/ui/window.rs`](../src/ui/window.rs): `submit_ai_chat_input` の `can_cancel()` ガード統一、`ai_chat.is_busy()` 中の 1 秒周期再描画（`sliders_dirty` を立てない別分岐）、`ai_chat_history_focus` による `allow_editor_shortcut` / `Space` パン / `handle_escape_key` / 適用・破棄・Undo ボタン押下後の `workspace_focus` 復帰。
-  - [`lang/ja.json`](../lang/ja.json) / [`lang/en.json`](../lang/en.json): 状態表示・経過秒数・マスク文言・コピー関連・待機送信エラーの二言語キー追加（`tr_fmt` 対応）。
+  - [`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs): `run_direct_acp_stdio` への `history` 展開・空セクション省略統一。
+  - [`src/ai/provider.rs`](../../src/ai/provider.rs): `fallback_agent_turn_via_streaming` での末尾連続 `ToolResult` 全集約と継続誘導強化、`stream: true` 化、`parse_fallback_agent_response` は最終テキスト非破壊のまま返却（ワイヤー型非変更）。
+  - [`src/ai/agent_host.rs`](../../src/ai/agent_host.rs): `AgentHostEvent::StreamDelta { text }` 追加、`response_json_schema.is_some()` 時の生テキスト転送抑止（文字数付き `Status` 通知）および通常ターン時の転送。
+  - [`src/ai/context_builder.rs`](../../src/ai/context_builder.rs): `default_editor_system_prompt()` へ簡潔な日本語完了報告指示を追加。
+  - [`src/ai/session_store.rs`](../../src/ai/session_store.rs): `StoredChatTurn` へ任意状態バッジ `status_badge`（`#[serde(default)]` 後方互換）を追加。
+  - [`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs): `AiExecutionState`（`ProposalReady` 含む）、`can_cancel()` による送信・停止ガード統一、安定ターン ID、`rendered_markdown: SharedString` キャッシュ、セッション切替／新規作成時の状態初期化、常設ステータスバー、`Spinner` 応答中カード、制御 JSON マスク（文中 ```` ```json ```` 対応）、`TextView::markdown(...).selectable(true)`（`240px` 折り返し＆余白調整）、ワンクリック `Clipboard` ボタン、Autopilot 単一ターン統合、完了報告確実化、16 件表示制限撤廃（200 件超折りたたみ）。
+  - [`src/ui/window.rs`](../../src/ui/window.rs): `submit_ai_chat_input` の `can_cancel()` ガード統一、`ai_chat.is_busy()` 中の 1 秒周期再描画（`sliders_dirty` を立てない別分岐）、`ai_chat_history_focus` による `allow_editor_shortcut` / `Space` パン / `handle_escape_key` / 適用・破棄・Undo ボタン押下後の `workspace_focus` 復帰。
+  - [`lang/ja.json`](../../lang/ja.json) / [`lang/en.json`](../../lang/en.json): 状態表示・経過秒数・マスク文言・コピー関連・待機送信エラーの二言語キー追加（`tr_fmt` 対応）。
 - **プロトコル文書同期（`011` ポリシー準拠）**:
-  - [`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md): `sea_ai_v1` の `history` 展開挙動・プロンプト制約指針の同期。
+  - [`docs/plugins/ai-and-mcp.md`](../../docs/plugins/ai-and-mcp.md): `sea_ai_v1` の `history` 展開挙動・プロンプト制約指針の同期。
 
 ### 対象外（Out of Scope）
 
@@ -148,7 +148,7 @@ sequenceDiagram
   - `gpui_kit::component::text::TextView::markdown(id, source).selectable(true)`
   - `gpui_kit::component::clipboard::Clipboard::new(id).value(text).tooltip(tip)`
   - `gpui_kit::component::spinner::Spinner::new()`
-- `gpui-base-0.9.1` の `TextView` は要素構築時にキーコンテキスト `"TextView"` を登録して `ctrl-c` (`input::Copy`) / `ctrl-a` (`input::SelectAll`) を処理するが、選択が空の状態で `Ctrl+C` が押された場合は `cx.propagate()` する。また、ウィンドウ側の `is_any_text_input_focused`（[`src/ui/window.rs`](../src/ui/window.rs#L712-L739)）には `TextView` 自体が含まれていないため、チャット履歴コンテナ用の `FocusHandle` ガード（`allow_editor_shortcut` / `Space` パン / `handle_escape_key` / 提案ボタン押下後の `workspace_focus` 復帰）と組み合わせて誤発火・フォーカス残留を防止する。
+- `gpui-base-0.9.1` の `TextView` は要素構築時にキーコンテキスト `"TextView"` を登録して `ctrl-c` (`input::Copy`) / `ctrl-a` (`input::SelectAll`) を処理するが、選択が空の状態で `Ctrl+C` が押された場合は `cx.propagate()` する。また、ウィンドウ側の `is_any_text_input_focused`（[`src/ui/window.rs`](../../src/ui/window.rs#L712-L739)）には `TextView` 自体が含まれていないため、チャット履歴コンテナ用の `FocusHandle` ガード（`allow_editor_shortcut` / `Space` パン / `handle_escape_key` / 提案ボタン押下後の `workspace_focus` 復帰）と組み合わせて誤発火・フォーカス残留を防止する。
 
 ---
 
@@ -158,18 +158,18 @@ sequenceDiagram
 
 | 区分 | ファイルパス | 変更責務 |
 | --- | --- | --- |
-| **プラグイン** | [`plugins_src/sea-ai-antigravity/src/main.rs`](../plugins_src/sea-ai-antigravity/src/main.rs) | `CallParams.history` 受理、128 KiB 多段圧縮展開（`# Original User Instruction` ピン留め・`ToolResult` 優先圧縮）、`# Sandbox Constraints` 出力形式強制削除、空セクション省略 |
-| **プラグイン** | [`plugins_src/sea-ai-acp/src/main.rs`](../plugins_src/sea-ai-acp/src/main.rs) | `CallParams.history` 受理、128 KiB 多段圧縮展開、空セクション省略、`extract_acp_update_text` の `agent_message_chunk` フィルタ追加 |
-| **プラグイン** | [`plugins_src/sea-agent-director/src/director.rs`](../plugins_src/sea-agent-director/src/director.rs) | `DirectorMemory.recent_followups`（10 件・各文字数上限）永続化、Step 0 の `messages[0]`（`# Session Context`）＋`messages[1]`（`# Original User Instruction`）分離、`get_capabilities` スキーマ参照誘導、`validate_draft_plan` 基準＆ループ境界付き 1 回自己修復＆空 `batch` 除去＆0 件明示 |
-| **機能モジュール** | [`src/ai/plugin_host.rs`](../src/ai/plugin_host.rs) | `run_direct_acp_stdio` での `request.history` 128 KiB 多段展開と空セクション省略（`sea_ai_v1` と仕様統一） |
-| **機能モジュール** | [`src/ai/provider.rs`](../src/ai/provider.rs) | `fallback_agent_turn_via_streaming` での末尾連続 `ToolResult` 全集約・継続誘導強化、`stream: true` 化、`parse_fallback_agent_response` は本文非破壊返却 |
-| **機能モジュール** | [`src/ai/agent_host.rs`](../src/ai/agent_host.rs) | `AgentHostEvent::StreamDelta` 追加、内部構造化生成（`response_json_schema.is_some()`）時の生テキスト抑止と文字数ステータス通知 |
-| **機能モジュール** | [`src/ai/context_builder.rs`](../src/ai/context_builder.rs) | `default_editor_system_prompt()` へ簡潔な日本語完了報告指示を追加 |
-| **機能モジュール** | [`src/ai/session_store.rs`](../src/ai/session_store.rs) | `StoredChatTurn` へ `status_badge`（任意、`#[serde(default)]`）を追加 |
-| **機能モジュール** | [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs) | `AiExecutionState`（`ProposalReady` 含む）、`can_cancel()` 送信・停止ガード統一、セッション切替時リセット、安定ターン ID、`rendered_markdown: SharedString` キャッシュ、常設ステータスバー、`Spinner` 応答中カード、制御 JSON マスク（文中対応）、`TextView` 選択（`240px` 折り返し）、`Clipboard` ボタン、Autopilot 単一ターン統合、200 件超折りたたみ |
-| **機能モジュール** | [`src/ui/window.rs`](../src/ui/window.rs) | `submit_ai_chat_input` での `can_cancel()` 統一、`ai_chat.is_busy()` 中の 1 秒周期再描画（`sliders_dirty` を立てない別分岐）、`ai_chat_history_focus` による `allow_editor_shortcut` / `Space` パン / `handle_escape_key` / ボタン後 `workspace_focus` 復帰 |
-| **機能モジュール** | [`lang/ja.json`](../lang/ja.json)・[`lang/en.json`](../lang/en.json) | 状態表示・経過秒数・マスク文言・コピー関連・待機送信エラーの二言語キー追加 |
-| **ドキュメント** | [`docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md) | `sea_ai_v1` プロトコルの `history` 展開・プロンプト制約指針の同期 |
+| **プラグイン** | [`plugins_src/sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs) | `CallParams.history` 受理、128 KiB 多段圧縮展開（`# Original User Instruction` ピン留め・`ToolResult` 優先圧縮）、`# Sandbox Constraints` 出力形式強制削除、空セクション省略 |
+| **プラグイン** | [`plugins_src/sea-ai-acp/src/main.rs`](../../plugins_src/sea-ai-acp/src/main.rs) | `CallParams.history` 受理、128 KiB 多段圧縮展開、空セクション省略、`extract_acp_update_text` の `agent_message_chunk` フィルタ追加 |
+| **プラグイン** | [`plugins_src/sea-agent-director/src/director.rs`](../../plugins_src/sea-agent-director/src/director.rs) | `DirectorMemory.recent_followups`（10 件・各文字数上限）永続化、Step 0 の `messages[0]`（`# Session Context`）＋`messages[1]`（`# Original User Instruction`）分離、`get_capabilities` スキーマ参照誘導、`validate_draft_plan` 基準＆ループ境界付き 1 回自己修復＆空 `batch` 除去＆0 件明示 |
+| **機能モジュール** | [`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs) | `run_direct_acp_stdio` での `request.history` 128 KiB 多段展開と空セクション省略（`sea_ai_v1` と仕様統一） |
+| **機能モジュール** | [`src/ai/provider.rs`](../../src/ai/provider.rs) | `fallback_agent_turn_via_streaming` での末尾連続 `ToolResult` 全集約・継続誘導強化、`stream: true` 化、`parse_fallback_agent_response` は本文非破壊返却 |
+| **機能モジュール** | [`src/ai/agent_host.rs`](../../src/ai/agent_host.rs) | `AgentHostEvent::StreamDelta` 追加、内部構造化生成（`response_json_schema.is_some()`）時の生テキスト抑止と文字数ステータス通知 |
+| **機能モジュール** | [`src/ai/context_builder.rs`](../../src/ai/context_builder.rs) | `default_editor_system_prompt()` へ簡潔な日本語完了報告指示を追加 |
+| **機能モジュール** | [`src/ai/session_store.rs`](../../src/ai/session_store.rs) | `StoredChatTurn` へ `status_badge`（任意、`#[serde(default)]`）を追加 |
+| **機能モジュール** | [`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs) | `AiExecutionState`（`ProposalReady` 含む）、`can_cancel()` 送信・停止ガード統一、セッション切替時リセット、安定ターン ID、`rendered_markdown: SharedString` キャッシュ、常設ステータスバー、`Spinner` 応答中カード、制御 JSON マスク（文中対応）、`TextView` 選択（`240px` 折り返し）、`Clipboard` ボタン、Autopilot 単一ターン統合、200 件超折りたたみ |
+| **機能モジュール** | [`src/ui/window.rs`](../../src/ui/window.rs) | `submit_ai_chat_input` での `can_cancel()` 統一、`ai_chat.is_busy()` 中の 1 秒周期再描画（`sliders_dirty` を立てない別分岐）、`ai_chat_history_focus` による `allow_editor_shortcut` / `Space` パン / `handle_escape_key` / ボタン後 `workspace_focus` 復帰 |
+| **機能モジュール** | [`lang/ja.json`](../../lang/ja.json)・[`lang/en.json`](../../lang/en.json) | 状態表示・経過秒数・マスク文言・コピー関連・待機送信エラーの二言語キー追加 |
+| **ドキュメント** | [`docs/plugins/ai-and-mcp.md`](../../docs/plugins/ai-and-mcp.md) | `sea_ai_v1` プロトコルの `history` 展開・プロンプト制約指針の同期 |
 
 ---
 
@@ -209,7 +209,7 @@ sequenceDiagram
 
 #### 4.2.2 `fallback_agent_turn_via_streaming` の連続 `ToolResult` 集約と非破壊返却
 
-[`src/ai/provider.rs`](../src/ai/provider.rs#L1289-L1327) を以下の通り改善します。
+[`src/ai/provider.rs`](../../src/ai/provider.rs#L1289-L1327) を以下の通り改善します。
 
 - **末尾連続 `ToolResult` の一括集約**:
   - `request.messages` の末尾から連続するすべての `AiTurnMessage::ToolResult` を取り出して元の順序を保ったまま結合し、`user_prompt` へ集約します。取り出した `ToolResult` 群より前のメッセージのみを `history` へ格納し、重複投入や分断を防ぎます。
@@ -229,7 +229,7 @@ sequenceDiagram
 #### 4.2.3 `sea-agent-director` の記憶継承・Step 0 指示分離・1 回自己修復リトライ
 
 - **永続記憶拡張（件数・文字数上限付き）**:
-  [`DirectorMemory`](../plugins_src/sea-agent-director/src/director.rs#L26-L48) に以下を追加します。
+  [`DirectorMemory`](../../plugins_src/sea-agent-director/src/director.rs#L26-L48) に以下を追加します。
   ```rust
   const MAX_RECENT_FOLLOWUPS: usize = 10;
   const MAX_FOLLOWUP_PROMPT_CHARS: usize = 500;
@@ -298,7 +298,7 @@ sequenceDiagram
 
 #### 4.3.1 エージェントからのストリーミング転送と制御 JSON マスク
 
-- [`src/ai/agent_host.rs`](../src/ai/agent_host.rs) の `AgentHostEvent` に以下を追加します。
+- [`src/ai/agent_host.rs`](../../src/ai/agent_host.rs) の `AgentHostEvent` に以下を追加します。
   ```rust
   /// LLM が逐次生成している部分テキストチャンク。
   StreamDelta {
@@ -379,9 +379,9 @@ stateDiagram-v2
 - **待機状態からの停止と Enter 送信デッドロック防止（ガード統一）**:
   - `AiChatState::can_cancel(&self) -> bool` を定義し、`self.is_busy() || self.pending_question.is_some() || self.pending_tool_approval.is_some()` とします。
   - `render_prompt_composer` の停止ボタン表示だけでなく、送信入口である以下 **3 箇所すべての送信ガードを `can_cancel()` に統一** し、`WaitingUserInput` / `WaitingApproval` 中にコンポーザで `Enter` 押下しても新規 `FollowUp` が送られて常駐エージェントがデッドロックしないようにします（待機中は `tr("ai.err_waiting_action")` をエラー表示）:
-    1. `SeaEditorWindow::submit_ai_chat_input`（[`src/ui/window.rs`](../src/ui/window.rs#L517-L520)）
-    2. `AppController::start_ai_prompt_async`（[`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs#L1220-L1223)）
-    3. `AppController::start_agent_prompt_with_provider`（[`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs#L1288-L1290)）
+    1. `SeaEditorWindow::submit_ai_chat_input`（[`src/ui/window.rs`](../../src/ui/window.rs#L517-L520)）
+    2. `AppController::start_ai_prompt_async`（[`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs#L1220-L1223)）
+    3. `AppController::start_agent_prompt_with_provider`（[`src/ui/ai_chat_panel.rs`](../../src/ui/ai_chat_panel.rs#L1288-L1290)）
   - `cancel_ai_prompt` のエージェント停止分岐でも `streaming_preview` を必ず取得・クリアし、マスク対象でない可読テキストが含まれる場合のみ `[停止済み]` ターンとして記録（先頭・文中の制御 JSON のみの断片なら破棄）し、`execution_state = AiExecutionState::Cancelled` へ遷移します。
 - **セッション新規作成／復元時の状態リセット**:
   - `AiChatState::new_session()`・`AiChatState::clear_conversation()` および `AppController::apply_restored_session_record()` のすべてで、以下を確実に初期化します:
@@ -395,7 +395,7 @@ stateDiagram-v2
 - **常設ステータスバー（コンポーザ直上）**:
   - 会話が 1 件以上ある場合や完了後・待機中・エラー後も消えないステータスバーをコンポーザ直上に配置し、`execution_state` に応じた色付きアイコン＋状態ラベルを常時表示します。
 - **経過秒数の 1 秒周期更新（副作用防止）**:
-  - [`src/ui/window.rs`](../src/ui/window.rs#L489-L507) の `spawn_playback_loop` にて、既存の `if ... { view.sliders_dirty = true; cx.notify(); }` ブロックへ条件を混ぜず、**`else if view.controller.ai_chat.should_tick_elapsed_timer()` の別分岐**を設けて `sliders_dirty` を立てずに `cx.notify()` のみを呼び出し、1 秒ごとに経過秒数表示のみを安全に更新します。
+  - [`src/ui/window.rs`](../../src/ui/window.rs#L489-L507) の `spawn_playback_loop` にて、既存の `if ... { view.sliders_dirty = true; cx.notify(); }` ブロックへ条件を混ぜず、**`else if view.controller.ai_chat.should_tick_elapsed_timer()` の別分岐**を設けて `sliders_dirty` を立てずに `cx.notify()` のみを呼び出し、1 秒ごとに経過秒数表示のみを安全に更新します。
 
 #### 4.3.3 確実な完了報告と Autopilot 単一ターン統合
 
@@ -471,16 +471,16 @@ stateDiagram-v2
 
 #### 4.4.4 `TextView` フォーカス中のショートカット競合・誤発火・フォーカス残留防止
 
-- `gpui-base-0.9.1` の `TextView` は独自の `FocusHandle` と `"TextView"` キーコンテキストを持ち、`ctrl-c` (`input::Copy`) / `ctrl-a` (`input::SelectAll`) をバインドしています。一方、[`src/ui/window.rs`](../src/ui/window.rs#L1502-L1506) の `is_any_text_input_focused` には `TextView` が含まれないため、そのままでは以下の問題が起き得ます:
+- `gpui-base-0.9.1` の `TextView` は独自の `FocusHandle` と `"TextView"` キーコンテキストを持ち、`ctrl-c` (`input::Copy`) / `ctrl-a` (`input::SelectAll`) をバインドしています。一方、[`src/ui/window.rs`](../../src/ui/window.rs#L1502-L1506) の `is_any_text_input_focused` には `TextView` が含まれないため、そのままでは以下の問題が起き得ます:
   1. チャット本文を選択中に `Delete` / `Backspace` / `Space` / `Ctrl+X` を押すと、タイムラインのクリップ操作や `PreviewPointerInputMode::SpacePanHeld` パンが誤発火する。
   2. 選択範囲が空の状態で `TextView` 上にて `Ctrl+C` を押すと `gpui-base` 側が `cx.propagate()` し、親 `"EditorMain"` の `CopyClip`（タイムラインクリップのコピー）へ抜けてしまう。
   3. 履歴コンテナ内の「承認して適用」等のボタン押下後にフォーカスが履歴領域へ残留し、直後にタイムラインショートカット（`Space` 再生など）が効かなくなる。
 - **対策仕様（4 箇所での統合保護）**:
   - `SeaEditorWindow` にチャット履歴コンテナ用の `ai_chat_history_focus: FocusHandle` と判定メソッド `is_ai_chat_history_focused(&self, window: &Window, cx: &App) -> bool`（`self.ai_chat_history_focus.contains_focused(window, cx)`）を追加し、`render_chat_body` のスクロール領域へ `.track_focus(&ai_chat_history_focus)` を付与する。
   - 以下の 4 箇所をすべて対応する:
-    1. **`allow_editor_shortcut`**（[`src/ui/window.rs`](../src/ui/window.rs#L742-L750)）: `!self.is_ai_chat_history_focused(window, cx)` を追加し、`CopyClip` / `CutClip` / `DeleteClip` / `SelectAllClips` / `TogglePlayPause` 等の誤発火と空選択 `Ctrl+C` 貫通を抑止する。
-    2. **`on_key_down` の `Space` パン条件**（[`src/ui/window.rs`](../src/ui/window.rs#L1386-L1390)）: `&& !this.is_ai_chat_history_focused(window, cx)` を追加し、チャット本文閲覧・選択中に `Space` で `PreviewPointerInputMode::SpacePanHeld` へ入らないようにする。
-    3. **`handle_escape_key`**（[`src/ui/window.rs`](../src/ui/window.rs#L819-L820)）: `else if self.is_any_text_input_focused(window, cx) || self.is_ai_chat_history_focused(window, cx)` にて `window.focus(&self.workspace_focus, cx)` を実行し、`Escape` 1 回でチャット履歴フォーカスを解除できるようにする。
+    1. **`allow_editor_shortcut`**（[`src/ui/window.rs`](../../src/ui/window.rs#L742-L750)）: `!self.is_ai_chat_history_focused(window, cx)` を追加し、`CopyClip` / `CutClip` / `DeleteClip` / `SelectAllClips` / `TogglePlayPause` 等の誤発火と空選択 `Ctrl+C` 貫通を抑止する。
+    2. **`on_key_down` の `Space` パン条件**（[`src/ui/window.rs`](../../src/ui/window.rs#L1386-L1390)）: `&& !this.is_ai_chat_history_focused(window, cx)` を追加し、チャット本文閲覧・選択中に `Space` で `PreviewPointerInputMode::SpacePanHeld` へ入らないようにする。
+    3. **`handle_escape_key`**（[`src/ui/window.rs`](../../src/ui/window.rs#L819-L820)）: `else if self.is_any_text_input_focused(window, cx) || self.is_ai_chat_history_focused(window, cx)` にて `window.focus(&self.workspace_focus, cx)` を実行し、`Escape` 1 回でチャット履歴フォーカスを解除できるようにする。
     4. **履歴領域内アクションボタン押下後のフォーカス復帰**: 「承認して適用 (`ai-apply-plan`)」「破棄 (`ai-discard-plan`)」「1 クリック Undo (`ai-one-click-undo`)」のクリックハンドラ末尾で `window.focus(&this.workspace_focus, cx)` を呼び出し、タイムライン編集へすぐ戻れるようにする。
 
 ---
@@ -506,7 +506,7 @@ stateDiagram-v2
    - `AiChatState::can_cancel(&self) -> bool` および `AiChatState::should_tick_elapsed_timer(&self) -> bool` を追加。
    - `pub fn format_streaming_preview_for_ui(raw: &str) -> String` を公開（先頭 `{` だけでなく文中 ```` ```json ```` もマスク置換、整形には `tr_fmt` 使用）。
    - `pub fn escape_plain_text_for_markdown(raw: &str) -> String` を公開。
-   - `pub fn format_elapsed_duration(secs: u64) -> String` を公開（[`src/ui/i18n.rs`](../src/ui/i18n.rs) の `tr_fmt` を用いたロケール対応フォーマット）。
+   - `pub fn format_elapsed_duration(secs: u64) -> String` を公開（[`src/ui/i18n.rs`](../../src/ui/i18n.rs) の `tr_fmt` を用いたロケール対応フォーマット）。
 
 ### 5.2 多言語キー追加（`lang/ja.json` / `lang/en.json`）
 
