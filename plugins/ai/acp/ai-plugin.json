@@ -12,19 +12,26 @@
       "id": "claude",
       "label": "Claude Code (ACP)",
       "cli": "claude",
-      "args": ["--acp"]
+      "args": [
+        "--acp"
+      ]
     },
     {
       "id": "codex",
       "label": "OpenAI Codex CLI (ACP)",
       "cli": "codex",
-      "args": ["--acp"]
+      "args": [
+        "--acp"
+      ]
     },
     {
       "id": "copilot",
       "label": "GitHub Copilot CLI (ACP Stdio)",
       "cli": "copilot",
-      "args": ["--acp", "--stdio"]
+      "args": [
+        "--acp",
+        "--stdio"
+      ]
     }
   ]
 }
