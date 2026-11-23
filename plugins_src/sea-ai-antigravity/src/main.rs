@@ -63,12 +63,24 @@ fn default_method() -> String {
     "generate_command".to_owned()
 }
 
+const MAX_HISTORY_PROMPT_BYTES: usize = 128 * 1024;
+const PINNED_INSTRUCTION_MAX_BYTES: usize = 64 * 1024;
+const ORIGINAL_INSTRUCTION_MARKER: &str = "# Original User Instruction";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HistoryMessage {
+    role: String,
+    content: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct CallParams {
     system_prompt: String,
     command_schema_json: Value,
     context_summary: Value,
+    history: Vec<HistoryMessage>,
     user_prompt: String,
     model: Option<String>,
     thinking_level: Option<String>,
@@ -227,19 +239,200 @@ fn build_set_config_option_request(
     })
 }
 
+fn is_empty_json_value(val: &Value) -> bool {
+    val.is_null() || val.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn truncate_utf8_suffix(s: &str, max_bytes: usize) -> &str {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+fn excerpt_head_tail(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let sep = format!("\n...({marker})...\n");
+    if max_bytes <= sep.len() + 32 {
+        return truncate_utf8_prefix(s, max_bytes).to_owned();
+    }
+    let avail = max_bytes - sep.len();
+    let head_budget = (avail * 3) / 5;
+    let tail_budget = avail - head_budget;
+    let head = truncate_utf8_prefix(s, head_budget);
+    let tail = truncate_utf8_suffix(s, tail_budget);
+    format!("{head}{sep}{tail}")
+}
+
+fn normalize_history_role(role: &str) -> &str {
+    let trimmed = role.trim();
+    if trimmed.is_empty() { "user" } else { trimmed }
+}
+
+fn format_history_entry(msg: &HistoryMessage, max_pinned_bytes: Option<usize>) -> String {
+    let role = normalize_history_role(&msg.role);
+    let content = match max_pinned_bytes {
+        Some(cap) if msg.content.len() > cap => {
+            format!("{}...(truncated)", truncate_utf8_prefix(&msg.content, cap))
+        }
+        _ => msg.content.clone(),
+    };
+    format!("[{role}]\n{content}")
+}
+
+fn compress_history_entries(
+    history: &[HistoryMessage],
+    entries: &mut [String],
+    pinned_idx: Option<usize>,
+    session_cap: usize,
+    tool_cap: usize,
+) {
+    let last_tool_idx = history
+        .iter()
+        .rposition(|m| m.content.trim_start().starts_with("[ToolResult "));
+    for (idx, msg) in history.iter().enumerate() {
+        if pinned_idx == Some(idx) {
+            continue;
+        }
+        let trimmed = msg.content.trim_start();
+        let role = normalize_history_role(&msg.role);
+        if trimmed.starts_with("# Session Context") {
+            let compressed = excerpt_head_tail(
+                &msg.content,
+                session_cap,
+                "Session Context 圧縮済み: 必要なら get_timeline_summary を呼び出してください",
+            );
+            entries[idx] = format!("[{role}]\n{compressed}");
+        } else if trimmed.starts_with("[ToolResult ") && last_tool_idx != Some(idx) {
+            let compressed = excerpt_head_tail(&msg.content, tool_cap, "ToolResult 省略");
+            entries[idx] = format!("[{role}]\n{compressed}");
+        }
+    }
+}
+
+fn joined_history_bytes(entries: &[String]) -> usize {
+    const HEADER: &str = "# Conversation History\n";
+    let body: usize = entries.iter().map(String::len).sum();
+    let seps = entries.len().saturating_sub(1) * 2;
+    HEADER.len() + body + seps
+}
+
+fn assemble_omitted_history(
+    entries: &[String],
+    pinned_idx: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    const HEADER: &str = "# Conversation History\n";
+    const OMITTED: &str = "...(earlier messages omitted)...";
+    let mut keep = vec![false; entries.len()];
+    let mut used = HEADER.len() + OMITTED.len() + 4;
+    if let Some(pin) = pinned_idx
+        && let Some(entry) = entries.get(pin)
+    {
+        keep[pin] = true;
+        used += entry.len() + 2;
+    }
+    for idx in (0..entries.len()).rev() {
+        if keep[idx] {
+            continue;
+        }
+        let needed = entries[idx].len() + 2;
+        if used + needed <= max_bytes {
+            keep[idx] = true;
+            used += needed;
+        } else {
+            break;
+        }
+    }
+    if !keep.iter().any(|&k| k)
+        && let Some(last) = entries.last()
+    {
+        let budget = max_bytes.saturating_sub(HEADER.len() + OMITTED.len() + 4);
+        let fallback = truncate_utf8_prefix(last, budget);
+        return format!("{HEADER}{OMITTED}\n\n{fallback}");
+    }
+    let mut blocks = Vec::new();
+    let mut in_omitted = false;
+    for (idx, entry) in entries.iter().enumerate() {
+        if keep[idx] {
+            in_omitted = false;
+            blocks.push(entry.as_str());
+        } else if !in_omitted {
+            in_omitted = true;
+            blocks.push(OMITTED);
+        }
+    }
+    format!("{HEADER}{}", blocks.join("\n\n"))
+}
+
+// 128 KiB 上限を超過した場合でも元ユーザー指示 (# Original User Instruction) をピン留めし、
+// Session Context・古い ToolResult の圧縮を優先してから中間ステップを省略する。
+fn format_conversation_history_section(history: &[HistoryMessage], max_bytes: usize) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let pinned_idx = history.iter().rposition(|m| {
+        m.content
+            .trim_start()
+            .starts_with(ORIGINAL_INSTRUCTION_MARKER)
+    });
+    let mut entries: Vec<String> = history
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let cap = (pinned_idx == Some(idx)).then_some(PINNED_INSTRUCTION_MAX_BYTES);
+            format_history_entry(msg, cap)
+        })
+        .collect();
+
+    if joined_history_bytes(&entries) > max_bytes {
+        compress_history_entries(history, &mut entries, pinned_idx, 24 * 1024, 16 * 1024);
+    }
+    if joined_history_bytes(&entries) > max_bytes {
+        compress_history_entries(history, &mut entries, pinned_idx, 8 * 1024, 4 * 1024);
+    }
+    if joined_history_bytes(&entries) <= max_bytes {
+        return format!("# Conversation History\n{}", entries.join("\n\n"));
+    }
+    assemble_omitted_history(&entries, pinned_idx, max_bytes)
+}
+
+fn build_agy_prompt_text(params: &CallParams) -> String {
+    let mut sections = vec![
+        params.system_prompt.clone(),
+        "# Sandbox Constraints\nDo NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.".to_owned(),
+    ];
+    if !is_empty_json_value(&params.command_schema_json) {
+        sections.push(format!(
+            "# EditCommand JSON Schema\n{}",
+            params.command_schema_json
+        ));
+    }
+    if !is_empty_json_value(&params.context_summary) {
+        sections.push(format!("# Timeline Context\n{}", params.context_summary));
+    }
+    let history_section =
+        format_conversation_history_section(&params.history, MAX_HISTORY_PROMPT_BYTES);
+    if !history_section.is_empty() {
+        sections.push(history_section);
+    }
+    sections.push(format!("# Instruction\n{}", params.user_prompt));
+    sections.join("\n\n")
+}
+
 fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) -> Value {
-    let prompt_text = format!(
-        "{}\n\n# Sandbox Constraints\n\
-         Do NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.\n\
-         Always output a valid EditCommand JSON object matching the schema below (use {{\"type\":\"batch\",\"commands\":[]}} with a brief text answer before a ```json fence or in \"message\" if no edits are needed).\n\n\
-         # EditCommand JSON Schema\n{}\n\n\
-         # Timeline Context\n{}\n\n\
-         # Instruction\n{}",
-        params.system_prompt,
-        params.command_schema_json,
-        params.context_summary,
-        params.user_prompt
-    );
+    let prompt_text = build_agy_prompt_text(params);
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -942,5 +1135,96 @@ mod tests {
         let parsed_usage = extract_acp_usage(&usage_resp).ok_or("missing usage")?;
         assert_eq!(parsed_usage["total_tokens"], json!(55));
         Ok(())
+    }
+
+    #[test]
+    fn build_agy_prompt_expands_history_and_omits_empty_sections_and_batch_constraint() {
+        let params = CallParams {
+            system_prompt: "SYS".to_owned(),
+            command_schema_json: json!({}),
+            context_summary: Value::Null,
+            history: vec![
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: "# Session Context\n{\"clips\":1}".to_owned(),
+                },
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: "# Original User Instruction\n4項目の修正をして".to_owned(),
+                },
+                HistoryMessage {
+                    role: "assistant".to_owned(),
+                    content: "{\"tool_calls\":[{\"name\":\"get_timeline_summary\"}]}".to_owned(),
+                },
+            ],
+            user_prompt: "[ToolResult get_timeline_summary status=OK]\n{}".to_owned(),
+            ..CallParams::default()
+        };
+        let prompt = build_agy_prompt_text(&params);
+        assert!(!prompt.contains("Always output a valid EditCommand"));
+        assert!(!prompt.contains("# EditCommand JSON Schema"));
+        assert!(!prompt.contains("# Timeline Context"));
+        assert!(prompt.contains("# Conversation History"));
+        assert!(prompt.contains("[user]\n# Original User Instruction\n4項目の修正をして"));
+        assert!(prompt.contains("[assistant]\n{\"tool_calls\""));
+        assert!(prompt.contains("# Instruction\n[ToolResult get_timeline_summary"));
+    }
+
+    #[test]
+    fn history_compression_pins_original_instruction_and_preserves_utf8() {
+        let big_context = format!("# Session Context\n{}", "あ".repeat(25_000));
+        let old_tool = format!("[ToolResult inspect status=OK]\n{}", "い".repeat(15_000));
+        let original = format!("{ORIGINAL_INSTRUCTION_MARKER}\n必ず字幕の縁取り色を変更して");
+        let mid_turn = "う".repeat(10_000);
+        let latest_tool = "[ToolResult get_capabilities status=OK]\n{\"ok\":true}".to_owned();
+
+        let history = vec![
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: big_context,
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: original.clone(),
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: old_tool,
+            },
+            HistoryMessage {
+                role: "assistant".to_owned(),
+                content: mid_turn,
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: latest_tool.clone(),
+            },
+        ];
+
+        let section = format_conversation_history_section(&history, MAX_HISTORY_PROMPT_BYTES);
+        assert!(section.len() <= MAX_HISTORY_PROMPT_BYTES);
+        assert!(section.contains(&original));
+        assert!(section.contains(&latest_tool));
+
+        // 通常チャット（マーカーなし）では古いターンから省略され直近ターンが残ること
+        let normal_history = vec![
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: format!("古い指示 {}", "え".repeat(30_000)),
+            },
+            HistoryMessage {
+                role: "assistant".to_owned(),
+                content: format!("古い応答 {}", "お".repeat(30_000)),
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: "直近の依頼".to_owned(),
+            },
+        ];
+        let normal_section = format_conversation_history_section(&normal_history, 40 * 1024);
+        assert!(normal_section.len() <= 40 * 1024);
+        assert!(normal_section.contains("直近の依頼"));
+        assert!(normal_section.contains("...(earlier messages omitted)..."));
+        assert!(!normal_section.contains("古い指示"));
     }
 }

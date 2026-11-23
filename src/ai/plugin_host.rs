@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiStreamEvent, AiThinkingLevel,
-    AiTokenUsage,
+    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiRole, AiStreamEvent,
+    AiThinkingLevel, AiTokenUsage,
 };
 use crate::ai::settings::ProbedModelEntry;
 use crate::core::PluginAiHints;
@@ -673,13 +673,7 @@ impl AiPluginProvider {
             .unwrap_or("default-session")
             .to_owned();
 
-        let prompt_body = format!(
-            "{}\n\n# EditCommand JSON Schema\n{}\n\n# Current Timeline Context\n{}\n\n# Instruction\n{}",
-            request.system_prompt,
-            request.command_schema_json,
-            request.context_summary,
-            request.user_prompt
-        );
+        let prompt_body = build_direct_acp_prompt_body(request);
         send_acp_jsonrpc_line(
             &mut stdin,
             &json!({
@@ -887,6 +881,199 @@ pub fn load_and_validate_manifest(path: &Path) -> Result<AiPluginManifest, AiPlu
     Ok(manifest)
 }
 
+const MAX_HISTORY_PROMPT_BYTES: usize = 128 * 1024;
+const PINNED_INSTRUCTION_MAX_BYTES: usize = 64 * 1024;
+const ORIGINAL_INSTRUCTION_MARKER: &str = "# Original User Instruction";
+
+fn is_empty_json_value(val: &Value) -> bool {
+    val.is_null() || val.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn truncate_utf8_suffix(s: &str, max_bytes: usize) -> &str {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+fn excerpt_head_tail(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let sep = format!("\n...({marker})...\n");
+    if max_bytes <= sep.len() + 32 {
+        return truncate_utf8_prefix(s, max_bytes).to_owned();
+    }
+    let avail = max_bytes - sep.len();
+    let head_budget = (avail * 3) / 5;
+    let tail_budget = avail - head_budget;
+    let head = truncate_utf8_prefix(s, head_budget);
+    let tail = truncate_utf8_suffix(s, tail_budget);
+    format!("{head}{sep}{tail}")
+}
+
+const fn role_label(role: AiRole) -> &'static str {
+    match role {
+        AiRole::System => "system",
+        AiRole::User => "user",
+        AiRole::Assistant => "assistant",
+    }
+}
+
+fn compress_acp_history_entries(
+    history: &[AiChatMessage],
+    entries: &mut [String],
+    pinned_idx: Option<usize>,
+    session_cap: usize,
+    tool_cap: usize,
+) {
+    let last_tool_idx = history
+        .iter()
+        .rposition(|m| m.content.trim_start().starts_with("[ToolResult "));
+    for (idx, msg) in history.iter().enumerate() {
+        if pinned_idx == Some(idx) {
+            continue;
+        }
+        let trimmed = msg.content.trim_start();
+        let role = role_label(msg.role);
+        if trimmed.starts_with("# Session Context") {
+            let compressed = excerpt_head_tail(
+                &msg.content,
+                session_cap,
+                "Session Context 圧縮済み: 必要なら get_timeline_summary を呼び出してください",
+            );
+            entries[idx] = format!("[{role}]\n{compressed}");
+        } else if trimmed.starts_with("[ToolResult ") && last_tool_idx != Some(idx) {
+            let compressed = excerpt_head_tail(&msg.content, tool_cap, "ToolResult 省略");
+            entries[idx] = format!("[{role}]\n{compressed}");
+        }
+    }
+}
+
+fn joined_acp_history_bytes(entries: &[String]) -> usize {
+    const HEADER: &str = "# Conversation History\n";
+    let body: usize = entries.iter().map(String::len).sum();
+    let seps = entries.len().saturating_sub(1) * 2;
+    HEADER.len() + body + seps
+}
+
+fn assemble_omitted_acp_history(
+    entries: &[String],
+    pinned_idx: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    const HEADER: &str = "# Conversation History\n";
+    const OMITTED: &str = "...(earlier messages omitted)...";
+    let mut keep = vec![false; entries.len()];
+    let mut used = HEADER.len() + OMITTED.len() + 4;
+    if let Some(pin) = pinned_idx
+        && let Some(entry) = entries.get(pin)
+    {
+        keep[pin] = true;
+        used += entry.len() + 2;
+    }
+    for idx in (0..entries.len()).rev() {
+        if keep[idx] {
+            continue;
+        }
+        let needed = entries[idx].len() + 2;
+        if used + needed <= max_bytes {
+            keep[idx] = true;
+            used += needed;
+        } else {
+            break;
+        }
+    }
+    if !keep.iter().any(|&k| k)
+        && let Some(last) = entries.last()
+    {
+        let budget = max_bytes.saturating_sub(HEADER.len() + OMITTED.len() + 4);
+        let fallback = truncate_utf8_prefix(last, budget);
+        return format!("{HEADER}{OMITTED}\n\n{fallback}");
+    }
+    let mut blocks = Vec::new();
+    let mut in_omitted = false;
+    for (idx, entry) in entries.iter().enumerate() {
+        if keep[idx] {
+            in_omitted = false;
+            blocks.push(entry.as_str());
+        } else if !in_omitted {
+            in_omitted = true;
+            blocks.push(OMITTED);
+        }
+    }
+    format!("{HEADER}{}", blocks.join("\n\n"))
+}
+
+fn format_acp_conversation_history(history: &[AiChatMessage], max_bytes: usize) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let pinned_idx = history.iter().rposition(|m| {
+        m.content
+            .trim_start()
+            .starts_with(ORIGINAL_INSTRUCTION_MARKER)
+    });
+    let mut entries: Vec<String> = history
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let role = role_label(msg.role);
+            if pinned_idx == Some(idx) && msg.content.len() > PINNED_INSTRUCTION_MAX_BYTES {
+                format!(
+                    "[{role}]\n{}...(truncated)",
+                    truncate_utf8_prefix(&msg.content, PINNED_INSTRUCTION_MAX_BYTES)
+                )
+            } else {
+                format!("[{role}]\n{}", msg.content)
+            }
+        })
+        .collect();
+
+    if joined_acp_history_bytes(&entries) > max_bytes {
+        compress_acp_history_entries(history, &mut entries, pinned_idx, 24 * 1024, 16 * 1024);
+    }
+    if joined_acp_history_bytes(&entries) > max_bytes {
+        compress_acp_history_entries(history, &mut entries, pinned_idx, 8 * 1024, 4 * 1024);
+    }
+    if joined_acp_history_bytes(&entries) <= max_bytes {
+        return format!("# Conversation History\n{}", entries.join("\n\n"));
+    }
+    assemble_omitted_acp_history(&entries, pinned_idx, max_bytes)
+}
+
+fn build_direct_acp_prompt_body(request: &AiRequest) -> String {
+    let mut sections = vec![request.system_prompt.clone()];
+    if !is_empty_json_value(&request.command_schema_json) {
+        sections.push(format!(
+            "# EditCommand JSON Schema\n{}",
+            request.command_schema_json
+        ));
+    }
+    if !is_empty_json_value(&request.context_summary) {
+        sections.push(format!(
+            "# Current Timeline Context\n{}",
+            request.context_summary
+        ));
+    }
+    let history_section =
+        format_acp_conversation_history(&request.history, MAX_HISTORY_PROMPT_BYTES);
+    if !history_section.is_empty() {
+        sections.push(history_section);
+    }
+    sections.push(format!("# Instruction\n{}", request.user_prompt));
+    sections.join("\n\n")
+}
+
 fn validate_manifest(m: &AiPluginManifest) -> Result<(), AiPluginHostError> {
     if m.schema_version != 1 {
         return Err(AiPluginHostError::InvalidManifest(format!(
@@ -1038,5 +1225,36 @@ mod tests {
         assert_eq!(u.total_tokens, 165);
         assert!(!u.is_estimated);
         Ok(())
+    }
+
+    #[test]
+    fn direct_acp_prompt_expands_history_pins_instruction_and_omits_empty_sections() {
+        let req = AiRequest {
+            system_prompt: "SYS".to_owned(),
+            command_schema_json: json!({}),
+            context_summary: Value::Null,
+            history: vec![
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("# Session Context\n{}", "あ".repeat(40_000)),
+                },
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("{ORIGINAL_INSTRUCTION_MARKER}\n字幕色を白に変更"),
+                },
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("[ToolResult old status=OK]\n{}", "い".repeat(30_000)),
+                },
+            ],
+            user_prompt: "[ToolResult latest status=OK]\n{\"ok\":true}".to_owned(),
+            stream: true,
+        };
+        let prompt = build_direct_acp_prompt_body(&req);
+        assert!(!prompt.contains("# EditCommand JSON Schema"));
+        assert!(!prompt.contains("# Current Timeline Context"));
+        assert!(prompt.contains("# Conversation History"));
+        assert!(prompt.contains("字幕色を白に変更"));
+        assert!(prompt.contains("# Instruction\n[ToolResult latest"));
     }
 }

@@ -1294,20 +1294,7 @@ fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
     let mut sys = request.system_prompt.clone();
     sys.push_str(&format_tools_fallback_instructions(&request.tools));
 
-    let mut history = Vec::new();
-    let mut last_user_prompt = String::new();
-    for (idx, msg) in request.messages.iter().enumerate() {
-        let is_last = idx + 1 == request.messages.len();
-        let (role, content) = render_turn_message_as_text(msg);
-        if is_last && role == AiRole::User {
-            last_user_prompt = content;
-        } else {
-            history.push(AiChatMessage { role, content });
-        }
-    }
-    if last_user_prompt.is_empty() {
-        "Continue based on the tool results above.".clone_into(&mut last_user_prompt);
-    }
+    let (history, last_user_prompt) = split_fallback_messages_and_prompt(&request.messages);
 
     let legacy_req = AiRequest {
         system_prompt: sys,
@@ -1318,12 +1305,58 @@ fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
         context_summary: serde_json::json!({}),
         history,
         user_prompt: last_user_prompt,
-        stream: false,
+        stream: true,
     };
     let resp = provider.send_streaming(&legacy_req, on_event)?;
     let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
     parsed.usage = resp.usage;
     Ok(parsed)
+}
+
+fn split_fallback_messages_and_prompt(messages: &[AiTurnMessage]) -> (Vec<AiChatMessage>, String) {
+    // 末尾に ToolResult が複数連続する場合は全件を user_prompt 側へ集約し、history と分断されないようにする。
+    let trailing_tool_start = messages
+        .iter()
+        .rposition(|m| !matches!(m, AiTurnMessage::ToolResult { .. }))
+        .map_or(0, |idx| idx + 1);
+
+    if trailing_tool_start < messages.len() {
+        let history = messages[..trailing_tool_start]
+            .iter()
+            .map(|msg| {
+                let (role, content) = render_turn_message_as_text(msg);
+                AiChatMessage { role, content }
+            })
+            .collect();
+        let tool_results = messages[trailing_tool_start..]
+            .iter()
+            .map(|msg| render_turn_message_as_text(msg).1)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let prompt = format!(
+            "Based on the original user instruction in history and the latest tool execution results below, continue fulfilling the request.\n\
+             If timeline edits are still required, invoke the appropriate editing tool via JSON Action Mode (`{{\"tool_calls\":[...]}}`).\n\
+             Only provide a final Japanese summary after all required edits are applied.\n\n\
+             {tool_results}"
+        );
+        return (history, prompt);
+    }
+
+    let mut history = Vec::new();
+    let mut last_user_prompt = String::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        let is_last = idx + 1 == messages.len();
+        let (role, content) = render_turn_message_as_text(msg);
+        if is_last && role == AiRole::User {
+            last_user_prompt = content;
+        } else {
+            history.push(AiChatMessage { role, content });
+        }
+    }
+    if last_user_prompt.is_empty() {
+        "Continue based on the conversation history above.".clone_into(&mut last_user_prompt);
+    }
+    (history, last_user_prompt)
 }
 
 fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
@@ -1477,5 +1510,137 @@ mod tests {
         let parsed_prose = parse_fallback_agent_response(prose, "ollama:qwen3");
         assert_eq!(parsed_prose.tool_calls.len(), 1);
         assert_eq!(parsed_prose.tool_calls[0].name, "validate_draft_plan");
+    }
+
+    #[test]
+    fn parse_fallback_agent_response_preserves_raw_text_when_no_tool_calls() {
+        let raw = "確認しました。\n```json\n{\"type\":\"batch\",\"commands\":[]}\n```";
+        let parsed = parse_fallback_agent_response(raw, "antigravity:gemini-4-argon");
+        assert_eq!(parsed.tool_calls.len(), 0);
+        assert_eq!(parsed.text.as_deref(), Some(raw));
+    }
+
+    struct RecordingFallbackProvider {
+        captured: std::sync::Arc<std::sync::Mutex<Option<AiRequest>>>,
+    }
+
+    impl AiProvider for RecordingFallbackProvider {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Recording"
+        }
+
+        fn send_streaming(
+            &self,
+            request: &AiRequest,
+            on_event: &mut dyn FnMut(AiStreamEvent),
+        ) -> Result<AiResponse, AiError> {
+            *self
+                .captured
+                .lock()
+                .map_err(|_| AiError::PluginError("lock poisoned".to_owned()))? =
+                Some(request.clone());
+            on_event(AiStreamEvent::DeltaText("完了しました。".to_owned()));
+            Ok(AiResponse {
+                raw_text: "完了しました。".to_owned(),
+                model: "recording:m1".to_owned(),
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn fallback_agent_turn_aggregates_all_trailing_tool_results_and_enables_streaming()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(None));
+        let provider = RecordingFallbackProvider {
+            captured: Arc::clone(&captured),
+        };
+        let req = AiAgentTurnRequest {
+            system_prompt: "SYS".to_owned(),
+            messages: vec![
+                AiTurnMessage::User {
+                    parts: vec![AiContentPart::Text {
+                        text: "# Original User Instruction\n字幕と画像を修正して".to_owned(),
+                    }],
+                },
+                AiTurnMessage::Assistant {
+                    text: Some("確認します".to_owned()),
+                    tool_calls: vec![
+                        AiToolCall {
+                            id: "c1".to_owned(),
+                            name: "get_timeline_summary".to_owned(),
+                            arguments: serde_json::json!({}),
+                        },
+                        AiToolCall {
+                            id: "c2".to_owned(),
+                            name: "get_capabilities".to_owned(),
+                            arguments: serde_json::json!({ "include_schemas": true }),
+                        },
+                    ],
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "c1".to_owned(),
+                    name: "get_timeline_summary".to_owned(),
+                    content_json: "{\"frames\":10800}".to_owned(),
+                    is_error: false,
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "c2".to_owned(),
+                    name: "get_capabilities".to_owned(),
+                    content_json: "{\"schema\":\"ok\"}".to_owned(),
+                    is_error: false,
+                },
+            ],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        };
+
+        let mut events = Vec::new();
+        let resp = fallback_agent_turn_via_streaming(&provider, &req, &mut |ev| {
+            events.push(ev);
+        })?;
+        assert_eq!(resp.text.as_deref(), Some("完了しました。"));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AiStreamEvent::DeltaText(t) if t == "完了しました。"))
+        );
+
+        let recorded = captured
+            .lock()
+            .map_err(|_| "lock poisoned")?
+            .clone()
+            .ok_or("request not captured")?;
+        assert!(recorded.stream);
+        assert_eq!(recorded.history.len(), 2);
+        assert!(
+            recorded.history[0]
+                .content
+                .contains("# Original User Instruction")
+        );
+        assert!(
+            !recorded
+                .history
+                .iter()
+                .any(|h| h.content.contains("[ToolResult"))
+        );
+        assert!(
+            recorded
+                .user_prompt
+                .contains("[ToolResult get_timeline_summary id=c1 status=OK]")
+        );
+        assert!(
+            recorded
+                .user_prompt
+                .contains("[ToolResult get_capabilities id=c2 status=OK]")
+        );
+        Ok(())
     }
 }
