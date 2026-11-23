@@ -9,14 +9,16 @@ use std::time::Instant;
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement,
+    Anchor, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     px,
 };
@@ -79,11 +81,67 @@ pub struct AiChatTurn {
     pub status_badge: Option<AiTurnBadge>,
 }
 
+const CHAT_HISTORY_COLLAPSE_THRESHOLD: usize = 200;
+
+/// ユーザー入力等のプレーンテキストを Markdown 誤解釈なしで選択可能描画できるようエスケープする。
+///
+/// - `\r\n` / `\r` を `\n` へ正規化
+/// - `CommonMark` の ASCII 記号全般を `\` でエスケープ（`#1`、`1. `、`<tag>`、`~~`、`a=b` 等の誤解釈防止）
+/// - 単一改行（前後がともに非空行）のみ末尾 `"  \n"` で改行維持し、空行 `\n\n` には余分なスペースを混ぜない
+#[must_use]
+pub fn escape_plain_text_for_markdown(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut out = String::with_capacity(normalized.len() + 16);
+    for (idx, line) in lines.iter().enumerate() {
+        for ch in line.chars() {
+            if matches!(
+                ch,
+                '\\' | '`'
+                    | '*'
+                    | '_'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '#'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '!'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '~'
+                    | '='
+            ) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        if idx + 1 < lines.len() {
+            let cur_non_empty = !line.is_empty();
+            let next_non_empty = !lines[idx + 1].is_empty();
+            if cur_non_empty && next_non_empty {
+                out.push_str("  \n");
+            } else {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 impl AiChatTurn {
     /// 指定された ID・ロール・本文・状態バッジからチャットターンを構築する。
     #[must_use]
     pub fn new(id: u64, role: AiRole, text: String, status_badge: Option<AiTurnBadge>) -> Self {
-        let rendered_markdown = SharedString::from(text.clone());
+        let rendered_markdown = match role {
+            AiRole::User => SharedString::from(escape_plain_text_for_markdown(&text)),
+            AiRole::Assistant | AiRole::System => SharedString::from(text.clone()),
+        };
         Self {
             id,
             role,
@@ -2617,6 +2675,7 @@ pub fn render_ai_chat_panel(
     ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
     ai_chat_input: &Entity<TextareaState>,
     ai_ask_inputs: &[(String, Entity<InputState>)],
+    ai_chat_history_focus: &FocusHandle,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let chat = &controller.ai_chat;
@@ -2681,7 +2740,12 @@ pub fn render_ai_chat_panel(
             }
             AiChatDrawer::None => None,
         })
-        .child(render_chat_body(chat, ai_ask_inputs, cx))
+        .child(render_chat_body(
+            chat,
+            ai_ask_inputs,
+            ai_chat_history_focus,
+            cx,
+        ))
         .children(render_status_bar(chat, &theme))
         .child(render_prompt_composer(controller, ai_chat_input, cx))
 }
@@ -2799,6 +2863,7 @@ fn render_compact_header(
 fn render_chat_body(
     chat: &AiChatState,
     ai_ask_inputs: &[(String, Entity<InputState>)],
+    ai_chat_history_focus: &FocusHandle,
     cx: &mut Context<SeaEditorWindow>,
 ) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
@@ -2817,7 +2882,21 @@ fn render_chat_body(
     }
 
     let mut thread = v_flex().w_full().gap_2().px_2().py_2();
-    for turn in chat.turns.iter().rev().take(16).rev() {
+    let collapsed_count = collapsed_history_count(chat.turns.len(), chat.show_all_history);
+    if collapsed_count > 0 {
+        let count_str = collapsed_count.to_string();
+        thread = thread.child(
+            Button::new("ai-show-older-history")
+                .ghost()
+                .xsmall()
+                .label(tr_fmt("ai.show_older_history", &[("count", &count_str)]))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller.ai_chat.show_all_history = true;
+                    cx.notify();
+                })),
+        );
+    }
+    for turn in &chat.turns[collapsed_count..] {
         thread = thread.child(render_chat_turn(turn, &theme));
     }
     if chat.is_busy() {
@@ -2838,34 +2917,67 @@ fn render_chat_body(
                 .ghost()
                 .xsmall()
                 .label(tr("ai.undo_last"))
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
                     if let Err(err) = this.controller.undo_last_ai_plan() {
                         this.controller.ai_chat.last_error = Some(err);
                     }
                     this.sync_widgets_from_controller(cx);
+                    window.focus(&this.workspace_focus, cx);
                     cx.notify();
                 })),
         );
     }
     if let Some(err) = &chat.last_error {
-        thread = thread.child(
-            div()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.danger)
-                .text_color(theme.danger)
-                .child(err.clone()),
-        );
+        thread = thread.child(render_error_card(err, &theme));
     }
 
     div()
+        .id("ai-chat-history-scroll")
+        .track_focus(ai_chat_history_focus)
         .flex_1()
         .w_full()
         .min_h(px(0.))
         .overflow_y_scrollbar()
         .child(thread)
         .into_any_element()
+}
+
+const fn collapsed_history_count(total_turns: usize, show_all_history: bool) -> usize {
+    if total_turns > CHAT_HISTORY_COLLAPSE_THRESHOLD && !show_all_history {
+        total_turns - CHAT_HISTORY_COLLAPSE_THRESHOLD
+    } else {
+        0
+    }
+}
+
+fn render_error_card(err: &str, theme: &gpui_kit::component::Theme) -> impl IntoElement {
+    let md: SharedString = escape_plain_text_for_markdown(err).into();
+    v_flex()
+        .w_full()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.danger)
+        .text_color(theme.danger)
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(div().text_xs().font_semibold().child("エラー"))
+                .child(
+                    Clipboard::new("ai-error-copy")
+                        .value(err.to_owned())
+                        .tooltip(tr("ai.copy_message")),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.))
+                .child(TextView::markdown("ai-error-md", md).selectable(true)),
+        )
 }
 
 fn render_welcome_empty_state(
@@ -3069,22 +3181,40 @@ fn turn_badge_label(badge: AiTurnBadge) -> &'static str {
 fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
 
+    let copy_btn = Clipboard::new(("ai-turn-copy", turn.id))
+        .value(turn.text.clone())
+        .tooltip(tr("ai.copy_message"));
+
     match turn.role {
-        AiRole::User => div()
+        AiRole::User => v_flex()
             .w_full()
+            .gap_0p5()
             .p_2()
             .rounded_md()
             .bg(theme.secondary)
             .text_color(theme.foreground)
-            .child(turn.text.clone())
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_color(theme.muted_foreground).child("You"))
+                    .child(copy_btn),
+            )
+            .child(
+                div().w_full().min_w(px(0.)).child(
+                    TextView::markdown(("ai-turn-user", turn.id), turn.rendered_markdown.clone())
+                        .selectable(true),
+                ),
+            )
             .into_any_element(),
         AiRole::Assistant => {
-            let mut header = h_flex()
+            let mut left_meta = h_flex()
                 .items_center()
                 .gap_1p5()
                 .child(div().text_color(theme.muted_foreground).child("AI"));
             if let Some(badge) = turn.status_badge {
-                header = header.child(
+                left_meta = left_meta.child(
                     div()
                         .px_1()
                         .rounded(px(4.))
@@ -3097,15 +3227,41 @@ fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gp
                 .w_full()
                 .gap_0p5()
                 .px_1()
-                .child(header)
-                .child(div().text_color(theme.foreground).child(turn.text.clone()))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(left_meta)
+                        .child(copy_btn),
+                )
+                .child(
+                    div().w_full().min_w(px(0.)).child(
+                        TextView::markdown(("ai-turn-md", turn.id), turn.rendered_markdown.clone())
+                            .selectable(true),
+                    ),
+                )
                 .into_any_element()
         }
-        AiRole::System => div()
+        AiRole::System => v_flex()
             .w_full()
+            .gap_0p5()
             .px_1()
             .text_color(theme.muted_foreground)
-            .child(turn.text.clone())
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_color(theme.muted_foreground).child("System"))
+                    .child(copy_btn),
+            )
+            .child(
+                div().w_full().min_w(px(0.)).child(
+                    TextView::markdown(("ai-turn-sys", turn.id), turn.rendered_markdown.clone())
+                        .selectable(true),
+                ),
+            )
             .into_any_element(),
     }
 }
@@ -3115,6 +3271,14 @@ fn render_diff_card(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
+    let summary_lines: String = proposal
+        .plan
+        .summary_lines
+        .iter()
+        .take(6)
+        .map(|l| format!("- {}", escape_plain_text_for_markdown(l)))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut card = v_flex()
         .p_2()
         .gap_1()
@@ -3126,8 +3290,13 @@ fn render_diff_card(
                 .text_color(theme.foreground)
                 .child(format!("適用差分カード ({})", proposal.model)),
         );
-    for line in proposal.plan.summary_lines.iter().take(6) {
-        card = card.child(div().text_color(theme.muted_foreground).child(line.clone()));
+    if !summary_lines.is_empty() {
+        card = card.child(
+            div().w_full().min_w(px(0.)).child(
+                TextView::markdown("ai-diff-summary-md", SharedString::from(summary_lines))
+                    .selectable(true),
+            ),
+        );
     }
     card.child(
         h_flex()
@@ -3137,11 +3306,12 @@ fn render_diff_card(
                     .primary()
                     .small()
                     .label(tr("ai.approve"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         if let Err(err) = this.controller.approve_pending_ai_proposal() {
                             this.controller.ai_chat.last_error = Some(err);
                         }
                         this.sync_widgets_from_controller(cx);
+                        window.focus(&this.workspace_focus, cx);
                         cx.notify();
                     })),
             )
@@ -3150,8 +3320,9 @@ fn render_diff_card(
                     .ghost()
                     .small()
                     .label(tr("ai.discard"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.controller.discard_pending_ai_proposal();
+                        window.focus(&this.workspace_focus, cx);
                         cx.notify();
                     })),
             ),
@@ -4448,5 +4619,45 @@ mod tests {
         assert_eq!(super::format_elapsed_duration(65), "1m 5s");
 
         let _ = crate::ui::i18n::set_active_language(&prev);
+    }
+
+    #[test]
+    fn escape_plain_text_for_markdown_escapes_symbols_and_keeps_empty_lines_clean() {
+        let input = "#1の設定\r\n*斜体* `code` <tag> ~~削除~~ a=b | 1. 項目\r\n\r\n次の段落";
+        let escaped = super::escape_plain_text_for_markdown(input);
+        assert!(escaped.contains("\\#1の設定  \n"));
+        assert!(escaped.contains(
+            "\\*斜体\\* \\`code\\` \\<tag\\> \\~\\~削除\\~\\~ a\\=b \\| 1\\. 項目\n\n次の段落"
+        ));
+        assert!(!escaped.contains("  \n\n"));
+
+        let turn =
+            super::AiChatTurn::new(1, crate::ai::provider::AiRole::User, input.to_owned(), None);
+        assert_eq!(turn.text, input);
+        assert_eq!(turn.rendered_markdown.as_ref(), escaped);
+    }
+
+    #[test]
+    fn history_keeps_more_than_16_turns_and_collapses_only_past_200() {
+        let mut chat = AiChatState::default();
+        for i in 0..25 {
+            chat.push_turn(crate::ai::provider::AiRole::User, format!("msg {i}"), None);
+        }
+        assert_eq!(chat.turns.len(), 25);
+        assert_eq!(
+            super::collapsed_history_count(chat.turns.len(), chat.show_all_history),
+            0
+        );
+
+        for i in 25..215 {
+            chat.push_turn(
+                crate::ai::provider::AiRole::Assistant,
+                format!("reply {i}"),
+                None,
+            );
+        }
+        assert_eq!(chat.turns.len(), 215);
+        assert_eq!(super::collapsed_history_count(chat.turns.len(), false), 15);
+        assert_eq!(super::collapsed_history_count(chat.turns.len(), true), 0);
     }
 }

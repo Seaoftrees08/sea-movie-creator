@@ -6,7 +6,9 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
-use gpui_kit::{Context, Entity, IntoElement, ParentElement as _, Styled as _, div, px, rgba};
+use gpui_kit::{
+    Context, Entity, FocusHandle, IntoElement, ParentElement as _, Styled as _, div, px, rgba,
+};
 
 use crate::timeline::document::TimelineLengthMode;
 use crate::ui::ai_chat_panel::{AiProviderSelectItem, render_ai_chat_panel};
@@ -29,6 +31,8 @@ pub struct RightPanelWidgets<'a> {
     pub ai_chat_input: &'a Entity<TextareaState>,
     /// エージェント質問カード用の動的入力欄一覧。
     pub ai_ask_inputs: &'a [(String, Entity<InputState>)],
+    /// チャット履歴コンテナ用のフォーカスハンドル。
+    pub ai_chat_history_focus: &'a FocusHandle,
 }
 
 /// 4 タブ（クリップ設定 / AI / レイヤー / プロジェクト情報）を切り替える右側パネルを構築する。
@@ -102,6 +106,7 @@ pub fn render_right_panel(
                 widgets.ai_provider_select,
                 widgets.ai_chat_input,
                 widgets.ai_ask_inputs,
+                widgets.ai_chat_history_focus,
                 cx,
             ))
             .into_any_element(),
