@@ -62,6 +62,10 @@
     4. ビルドおよび全テスト実行: プラグインバイナリ欠損を防ぐため `cargo build --workspace --all-targets` のうえで `cargo test --workspace --all-targets --all-features`（`tests/quality_gates.rs` の規約・整合テストを含む）
     5. 依存関係・ライセンス監査（導入環境 / CI）: `cargo deny check`（`deny.toml` 準拠）
   - 実 GPU・OS HW エンコーダ・実外部 CLI 等に依存しヘッドレス CI で実行不可なテストには `#[ignore = "理由"]` を付与し、通常の `cargo test --workspace --all-targets --all-features` が環境依存なく全通過する状態を維持する（実機検証時は `cargo test -- --ignored` を併用）。
+- **リリースビルド・配布パッケージ生成ルール**:
+  - リリース作成・バージョン更新・配布物更新時は、既存の古い `target/release/` や `dist/` を流用せず、必ず最新コードから `scripts/package-release.bat`（Windows、PowerShell 実行ポリシー回避のため `.bat` を使用。ZIP 作成時は `--zip`）または `cargo build --release --workspace` で再ビルドし、`dist/` をクリーン再生成すること。
+  - バージョン更新時はルート `Cargo.toml`、`plugins_src/*/Cargo.toml`、`plugins/*/*/*.json`、`docs/` のバージョン表記を同期更新すること。
+  - 配布フォルダに `settings/`（API キー等の機密情報）やテスト用ダミーバイナリ（`sea-export-dummy` 等）が混入していないことを確認すること。
 - **テストの配置ルール**:
   - **部品ごとの小さなテスト（単体テスト）**: 各部品の `.rs` ファイル内の最後に `#[cfg(test)] mod tests { ... }` として記述すること。
   - **組み合わせテスト・全体テスト（結合テスト）**: `tests/<実装名>/` フォルダ内に記述し、自動テスト（`cargo test`）および `cargo fmt` で確実に認識されるよう入り口となる `tests/<実装名>.rs` と `tests/<実装名>/mod.rs` をあわせて配置すること。

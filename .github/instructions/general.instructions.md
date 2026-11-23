@@ -38,6 +38,7 @@ description: "sea-movie-creator における設計書(dev-doc)・人間向けド
 - 変更後に worktree 内で `scripts/pre-pr.ps1`（または `cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`、`cargo build --workspace --all-targets`、`cargo test --workspace --all-targets --all-features`）をすべて実行し、警告・エラーがゼロであることを確認したか
 - 仕様や使い方が変わる場合、`dev-doc/` と `docs/` の該当箇所を更新したか
 - 対象の `dev-doc/` 設計書の実装が完了した場合、ステータスを `Implemented` に更新して `dev-doc/completed/` へ移動し、`dev-doc/README.md` と相対リンクを更新したか
+- リリース・配布パッケージ生成を伴うタスクでは、`scripts/package-release.bat` 等で最新ビルドから `dist/` をクリーン再生成し、古い成果物や `settings/`（API キー等）・テスト専用バイナリが混入していないか確認したか
 - 完了時に勝手な `main` マージや worktree 削除をせず、ブランチ名・worktree パス・コミット概要・検証結果を報告したか
 
 # 並行作業とテストの運用ルール
