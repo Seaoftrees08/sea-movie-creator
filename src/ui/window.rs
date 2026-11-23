@@ -478,6 +478,7 @@ impl SeaEditorWindow {
     fn spawn_playback_loop(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut last_tick = Instant::now();
+            let mut last_ai_elapsed_sec: Option<u64> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(TICK_INTERVAL_MS))
@@ -501,8 +502,18 @@ impl SeaEditorWindow {
                         || ai_changed
                         || waveform_changed
                     {
+                        last_ai_elapsed_sec = view.controller.ai_chat.responding_elapsed_secs();
                         view.sliders_dirty = true;
                         cx.notify();
+                    } else if view.controller.ai_chat.should_tick_elapsed_timer() {
+                        // スライダー再同期 (sliders_dirty) を起こさず、経過秒数の 1 秒変化時のみ再描画する。
+                        let cur_sec = view.controller.ai_chat.responding_elapsed_secs();
+                        if cur_sec != last_ai_elapsed_sec {
+                            last_ai_elapsed_sec = cur_sec;
+                            cx.notify();
+                        }
+                    } else {
+                        last_ai_elapsed_sec = None;
                     }
                 });
                 if keep_going.is_err() {
@@ -515,7 +526,12 @@ impl SeaEditorWindow {
 
     /// AI チャット入力欄の現在文字列を送信し、受理された場合は入力欄を空にする。
     pub(crate) fn submit_ai_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.controller.ai_chat.is_busy() {
+        if self.controller.ai_chat.can_cancel() {
+            if !self.controller.ai_chat.is_busy() {
+                self.controller.ai_chat.last_error =
+                    Some(crate::ui::i18n::tr("ai.err_waiting_action"));
+                self.sync_widgets_from_controller(cx);
+            }
             return;
         }
         let msg = self.ai_chat_input.read(cx).value().to_string();

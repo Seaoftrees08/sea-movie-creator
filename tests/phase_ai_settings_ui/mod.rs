@@ -244,10 +244,12 @@ fn session_usage_persists_and_footer_adapts_per_provider() -> Result<(), Box<dyn
     controller
         .ai_chat
         .turns
-        .push(sea_movie_creator::ui::ai_chat_panel::AiChatTurn {
-            role: sea_movie_creator::ai::provider::AiRole::User,
-            text: "テスト".to_owned(),
-        });
+        .push(sea_movie_creator::ui::ai_chat_panel::AiChatTurn::new(
+            1,
+            sea_movie_creator::ai::provider::AiRole::User,
+            "テスト".to_owned(),
+            None,
+        ));
     controller.ai_chat.persist_session();
     let sid = controller.ai_chat.session_id.clone();
 

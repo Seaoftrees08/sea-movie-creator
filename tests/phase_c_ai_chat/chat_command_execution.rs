@@ -225,7 +225,12 @@ fn ai_chat_accepts_empty_batch_no_op_without_error() -> Result<(), Box<dyn std::
         .last()
         .ok_or("assistant reply turn should be recorded")?;
     assert_eq!(last_turn.role, AiRole::Assistant);
-    assert_eq!(last_turn.text, "pong!");
+    assert!(
+        last_turn.text.starts_with("pong!")
+            && last_turn
+                .text
+                .contains("応答が完了しました（タイムラインへの変更はありません）")
+    );
 
     controller.submit_ai_prompt_with_provider("ping again", &mock)?;
     assert!(controller.ai_chat.last_error.is_none());
@@ -237,6 +242,10 @@ fn ai_chat_accepts_empty_batch_no_op_without_error() -> Result<(), Box<dyn std::
         .last()
         .ok_or("assistant fallback reply turn should be recorded")?;
     assert_eq!(bare_turn.role, AiRole::Assistant);
-    assert_eq!(bare_turn.text, "応答を受信しました（タイムライン変更なし）");
+    assert!(
+        bare_turn
+            .text
+            .contains("応答が完了しました（タイムラインへの変更はありません）")
+    );
     Ok(())
 }
