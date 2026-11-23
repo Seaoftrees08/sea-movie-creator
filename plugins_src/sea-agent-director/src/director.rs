@@ -1196,10 +1196,10 @@ fn run_dynamic_tool_loop(
         tools_snapshot: transport.available_tools.clone(),
         updated_blueprint: None,
         messages: build_initial_dynamic_messages(session, prompt, attached_clips),
+        self_repair_attempted: false,
     };
     let mut final_text = String::new();
     let mut completed_by_model = false;
-    let mut self_repair_attempted = false;
 
     for step in 0..MAX_DYNAMIC_TOOL_STEPS {
         let (text, tool_calls) = match transport.llm_chat(
@@ -1220,37 +1220,8 @@ fn run_dynamic_tool_loop(
         };
 
         if tool_calls.is_empty() {
-            let has_remaining_steps = step + 1 < MAX_DYNAMIC_TOOL_STEPS;
-            if !self_repair_attempted && has_remaining_steps {
-                let mutated_draft = check_draft_has_pending_changes(transport)?;
-                if should_attempt_self_repair(
-                    prompt,
-                    &text,
-                    mutated_draft,
-                    self_repair_attempted,
-                    has_remaining_steps,
-                ) {
-                    self_repair_attempted = true;
-                    state.messages.push(AgentLlmMessage {
-                        role: "assistant".to_owned(),
-                        text,
-                        image_paths: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    state.messages.push(AgentLlmMessage {
-                        role: "user".to_owned(),
-                        text: "まだタイムラインへの有効な変更が DraftSandbox へ反映されていません（テキスト内の JSON は適用されません）。\
-                               ユーザーの指示内容を反映するため、必要な編集を `apply_draft_edit_command`（または `compile_movie_blueprint`）ツールで実行してください\
-                               （`SetParameter` 等の形式確認が必要なら `get_capabilities` を `include_schemas: true` で参照してください）。\
-                               本当に変更が不要な場合のみ、その理由を日本語で説明してください."
-                            .to_owned(),
-                        image_paths: Vec::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    continue;
-                }
+            if try_queue_self_repair(transport, prompt, &text, step, &mut state)? {
+                continue;
             }
             final_text = text;
             completed_by_model = true;
@@ -1287,19 +1258,69 @@ fn run_dynamic_tool_loop(
     }
 
     // DraftSandbox に変更が蓄積されているか検証し Proposal として送出
+    let expect_timeline_edit = state.self_repair_attempted || has_edit_intent(prompt);
     finalize_dynamic_proposal(
         session,
         transport,
         prompt,
         &final_text,
         state.updated_blueprint,
+        expect_timeline_edit,
     )
+}
+
+/// ツール未呼出で完了しようとした編集依頼に対して 1 回だけ自己修復プロンプトを積む。
+fn try_queue_self_repair(
+    transport: &mut AgentTransport<'_>,
+    prompt: &str,
+    text: &str,
+    step: u32,
+    state: &mut DynamicToolLoopState,
+) -> Result<bool, RpcError> {
+    let has_remaining_steps = step + 1 < MAX_DYNAMIC_TOOL_STEPS;
+    let repair_candidate = !state.self_repair_attempted
+        && has_remaining_steps
+        && (looks_like_inline_edit_json(text) || has_edit_intent(prompt));
+    if !repair_candidate {
+        return Ok(false);
+    }
+    let mutated_draft = check_draft_has_pending_changes(transport)?;
+    if !should_attempt_self_repair(
+        prompt,
+        text,
+        mutated_draft,
+        state.self_repair_attempted,
+        has_remaining_steps,
+    ) {
+        return Ok(false);
+    }
+    state.self_repair_attempted = true;
+    state.messages.push(AgentLlmMessage {
+        role: "assistant".to_owned(),
+        text: text.to_owned(),
+        image_paths: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+    state.messages.push(AgentLlmMessage {
+        role: "user".to_owned(),
+        text: "まだタイムラインへの有効な変更が DraftSandbox へ反映されていません（テキスト内の JSON は適用されません）。\
+               ユーザーの指示内容を反映するため、必要な編集を `apply_draft_edit_command`（または `compile_movie_blueprint`）ツールで実行してください\
+               （`SetParameter` 等の形式確認が必要なら `get_capabilities` を `include_schemas: true` で参照してください）。\
+               本当に変更が不要な場合のみ、その理由を日本語で説明してください。"
+            .to_owned(),
+        image_paths: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+    Ok(true)
 }
 
 struct DynamicToolLoopState {
     tools_snapshot: Vec<sea_agent_protocol::AgentToolSpec>,
     updated_blueprint: Option<Value>,
     messages: Vec<AgentLlmMessage>,
+    self_repair_attempted: bool,
 }
 
 fn execute_single_dynamic_tool_call(
@@ -1363,6 +1384,7 @@ fn finalize_dynamic_proposal(
     prompt: &str,
     final_text: &str,
     updated_blueprint: Option<Value>,
+    expect_timeline_edit: bool,
 ) -> Result<(), RpcError> {
     let val_res = transport.call_tool("validate_draft_plan", json!({ "include_command": true }))?;
     let is_no_op = val_res
@@ -1391,14 +1413,20 @@ fn finalize_dynamic_proposal(
             })
             .unwrap_or_default();
         if is_no_op {
-            "⚠ タイムラインへの変更は行われませんでした（0 件）。".to_owned()
+            if expect_timeline_edit {
+                "⚠ タイムラインへの変更は行われませんでした（0 件）。".to_owned()
+            } else {
+                "タイムラインへの変更はありませんでした。".to_owned()
+            }
         } else {
             format!("調整プランを作成しました:\n{lines}")
         }
     } else {
         cleaned_text
     };
-    if is_no_op && !summary_markdown.contains("タイムラインへの変更は行われませんでした")
+    if is_no_op
+        && expect_timeline_edit
+        && !summary_markdown.contains("タイムラインへの変更は行われませんでした")
     {
         summary_markdown.push_str("\n\n⚠ タイムラインへの変更は行われませんでした（0 件）。");
     }
@@ -1419,6 +1447,77 @@ fn finalize_dynamic_proposal(
     Ok(())
 }
 
+fn looks_like_inline_edit_json(response_text: &str) -> bool {
+    (response_text.contains("\"type\"") && response_text.contains("\"batch\""))
+        || response_text.contains("\"commands\"")
+}
+
+fn contains_ascii_word(haystack_lower: &str, word: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    let mut start = 0_usize;
+    while let Some(offset) = haystack_lower[start..].find(word) {
+        let idx = start + offset;
+        let end = idx + word.len();
+        let left_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        let right_ok =
+            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if left_ok && right_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+/// ユーザー指示にタイムライン変更を求める具体的な編集意図が含まれるか判定する。
+///
+/// 「教えてください」「確認してください」等の丁寧な読み取り質問では誤発火しないよう、
+/// 汎用的な語尾（「して」「ください」等）を除外し、具体的な編集動詞と ASCII 単語境界を用いる。
+#[must_use]
+pub fn has_edit_intent(prompt: &str) -> bool {
+    const JA_EDIT_KEYWORDS: &[&str] = &[
+        "修正",
+        "変更",
+        "追加",
+        "削除",
+        "消去",
+        "消して",
+        "回転",
+        "適用",
+        "統一",
+        "直して",
+        "変えて",
+        "入れて",
+        "調整",
+        "移動",
+        "分割",
+        "カット",
+        "トリム",
+        "作って",
+        "作成",
+        "差し替え",
+        "入れ替え",
+        "大きくして",
+        "小さくして",
+        "長くして",
+        "短くして",
+        "音量",
+        "フェード",
+    ];
+    const EN_EDIT_WORDS: &[&str] = &[
+        "edit", "fix", "change", "add", "remove", "delete", "rotate", "apply", "update", "trim",
+        "split", "cut", "move", "adjust", "replace",
+    ];
+    if JA_EDIT_KEYWORDS.iter().any(|kw| prompt.contains(kw)) {
+        return true;
+    }
+    let lower = prompt.to_ascii_lowercase();
+    EN_EDIT_WORDS
+        .iter()
+        .any(|word| contains_ascii_word(&lower, word))
+}
+
 /// タイムライン変更指示に対して未編集のまま終了しようとした場合に自己修復リトライを行うべきか判定する。
 #[must_use]
 pub fn should_attempt_self_repair(
@@ -1428,48 +1527,10 @@ pub fn should_attempt_self_repair(
     already_retried: bool,
     has_remaining_steps: bool,
 ) -> bool {
-    const EDIT_INTENT_KEYWORDS: &[&str] = &[
-        "修正",
-        "変更",
-        "追加",
-        "削除",
-        "回転",
-        "適用",
-        "統一",
-        "消",
-        "直",
-        "して",
-        "ください",
-        "変え",
-        "入れ",
-        "調整",
-        "移動",
-        "分割",
-        "カット",
-        "トリム",
-        "edit",
-        "fix",
-        "change",
-        "add",
-        "remove",
-        "delete",
-        "rotate",
-        "apply",
-        "update",
-    ];
     if already_retried || !has_remaining_steps || mutated_draft {
         return false;
     }
-    let looks_like_inline_edit_json = (response_text.contains("\"type\"")
-        && response_text.contains("\"batch\""))
-        || response_text.contains("\"commands\"");
-    if looks_like_inline_edit_json {
-        return true;
-    }
-    let lower_prompt = prompt.to_ascii_lowercase();
-    EDIT_INTENT_KEYWORDS
-        .iter()
-        .any(|kw| prompt.contains(kw) || lower_prompt.contains(kw))
+    looks_like_inline_edit_json(response_text) || has_edit_intent(prompt)
 }
 
 /// モデルがテキスト内に誤って出力した空の `{"type":"batch","commands":[]}` コードブロックを除去する。
@@ -1829,6 +1890,49 @@ mod tests {
         assert!(!should_attempt_self_repair(
             "このタイムラインは何秒ですか？",
             "180秒です。",
+            false,
+            false,
+            true,
+        ));
+        // 丁寧な読み取り質問や英単語の部分文字列一致で誤リトライしないこと
+        assert!(!should_attempt_self_repair(
+            "現在のタイムライン構成を教えてください",
+            "現在の構成は以下の通りです。",
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_attempt_self_repair(
+            "字幕一覧を確認してください",
+            "字幕は 3 件あります。",
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_attempt_self_repair(
+            "内容を説明してください",
+            "旅行のダイジェスト構成です。",
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_attempt_self_repair(
+            "Check the address and confirm if fixed",
+            "All checked.",
+            false,
+            false,
+            true,
+        ));
+        assert!(should_attempt_self_repair(
+            "画像を90度回転して",
+            "確認しました。",
+            false,
+            false,
+            true,
+        ));
+        assert!(should_attempt_self_repair(
+            "please rotate the clip",
+            "Checked.",
             false,
             false,
             true,

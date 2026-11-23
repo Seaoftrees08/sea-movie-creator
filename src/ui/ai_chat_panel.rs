@@ -212,15 +212,21 @@ pub fn format_elapsed_duration(secs: u64) -> String {
 }
 
 fn find_json_fence_start(raw: &str) -> Option<usize> {
+    let mut earliest = raw.find("{\"tool_calls\"");
     for (idx, _) in raw.match_indices("```") {
         let after = &raw[idx + 3..];
         let line_end = after.find('\n').unwrap_or(after.len());
         let tag = after[..line_end].trim();
-        if tag.eq_ignore_ascii_case("json") {
-            return Some(idx);
+        let body_starts_json = tag.is_empty()
+            && after[line_end..]
+                .strip_prefix('\n')
+                .is_some_and(|rest| rest.trim_start().starts_with('{'));
+        if tag.eq_ignore_ascii_case("json") || body_starts_json {
+            earliest = Some(earliest.map_or(idx, |prev| prev.min(idx)));
+            break;
         }
     }
-    None
+    earliest
 }
 
 fn tail_char_snippet(text: &str, max_chars: usize) -> String {
@@ -1210,6 +1216,13 @@ impl AiChatState {
         self.is_busy() || self.pending_question.is_some() || self.pending_tool_approval.is_some()
     }
 
+    fn clear_pending_agent_interactions(&mut self) {
+        self.pending_question = None;
+        self.ask_field_values.clear();
+        self.pending_tool_approval = None;
+        self.streaming_preview.clear();
+    }
+
     /// 1 秒周期の経過秒数タイマーで UI を再描画すべき状態かどうか。
     #[must_use]
     pub const fn should_tick_elapsed_timer(&self) -> bool {
@@ -2049,9 +2062,7 @@ impl AppController {
             runner.cancel();
             self.ai_chat.agent_busy = false;
             self.ai_chat.agent_step_status = None;
-            self.ai_chat.pending_question = None;
-            self.ai_chat.ask_field_values.clear();
-            self.ai_chat.pending_tool_approval = None;
+            self.ai_chat.clear_pending_agent_interactions();
             self.record_cancelled_preview();
             if was_busy {
                 self.ai_chat.execution_state = AiExecutionState::Cancelled;
@@ -2059,8 +2070,32 @@ impl AppController {
                 "エージェント実行を停止しました".clone_into(&mut self.status_message);
                 return true;
             }
+        } else if self.ai_chat.can_cancel() {
+            // 異常終了等で active_agent が既に失われた後に待機状態だけ残留した場合の安全解除
+            self.ai_chat.agent_busy = false;
+            self.ai_chat.agent_step_status = None;
+            self.ai_chat.clear_pending_agent_interactions();
+            self.record_cancelled_preview();
+            self.ai_chat.execution_state = AiExecutionState::Cancelled;
+            "待機中のエージェント操作を解除しました".clone_into(&mut self.ai_chat.status_banner);
+            "待機中のエージェント操作を解除しました".clone_into(&mut self.status_message);
+            return true;
         }
         false
+    }
+
+    fn finish_running_job_error(&mut self, err_msg: &str) {
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.last_error = Some(err_msg.to_owned());
+        self.ai_chat.execution_state = AiExecutionState::Failed {
+            summary: err_msg.to_owned(),
+        };
+        self.ai_chat.push_turn(
+            AiRole::Assistant,
+            format!("エラー: {err_msg}"),
+            Some(AiTurnBadge::Error),
+        );
+        self.ai_chat.persist_session();
     }
 
     /// 非同期 AI チャット・バックグラウンドプローブおよび常駐エージェント受信キューをポーリングし、UI 更新が必要なら `true` を返す。
@@ -2112,31 +2147,14 @@ impl AppController {
                 return true;
             }
             if let Some(err_msg) = failed {
-                self.ai_chat.last_error = Some(err_msg.clone());
                 self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
-                self.ai_chat.execution_state = AiExecutionState::Failed {
-                    summary: err_msg.clone(),
-                };
-                self.ai_chat.push_turn(
-                    AiRole::Assistant,
-                    format!("エラー: {err_msg}"),
-                    Some(AiTurnBadge::Error),
-                );
-                self.ai_chat.persist_session();
+                self.finish_running_job_error(&err_msg);
                 return true;
             }
             if disconnected {
-                let err_msg = "AI プロバイダが応答を返さず終了しました".to_owned();
-                self.ai_chat.last_error = Some(err_msg.clone());
-                self.ai_chat.status_banner.clone_from(&err_msg);
-                self.ai_chat.execution_state = AiExecutionState::Failed {
-                    summary: err_msg.clone(),
-                };
-                self.ai_chat.push_turn(
-                    AiRole::Assistant,
-                    format!("エラー: {err_msg}"),
-                    Some(AiTurnBadge::Error),
-                );
+                let err_msg = "AI プロバイダが応答を返さず終了しました";
+                err_msg.clone_into(&mut self.ai_chat.status_banner);
+                self.finish_running_job_error(err_msg);
                 return true;
             }
             self.ai_chat.running_job = Some(handle);
@@ -2163,6 +2181,13 @@ impl AppController {
             }
             if !exited && runner.is_alive() {
                 self.ai_chat.active_agent = Some(runner);
+            } else if !exited {
+                // Exited イベント無しでプロセスが終了した場合も待機中カード等を解放してロックアウトを防ぐ
+                let (_, persist_evt) = self.handle_agent_exited_event("unexpected_exit");
+                changed = true;
+                if persist_evt {
+                    self.ai_chat.persist_session();
+                }
             }
         }
 
@@ -2264,12 +2289,14 @@ impl AppController {
         total_steps: Option<u32>,
     ) -> (bool, bool) {
         self.ai_chat.status_banner.clone_from(&message);
-        self.ai_chat.agent_step_status = Some((step, total_steps));
+        if step.is_some() || total_steps.is_some() {
+            self.ai_chat.agent_step_status = Some((step, total_steps));
+        }
         if step.is_some() {
             self.ai_chat.streaming_preview.clear();
         }
         self.ai_chat
-            .set_responding_phase(message, Some((step, total_steps)));
+            .set_responding_phase(message, self.ai_chat.agent_step_status);
         (false, false)
     }
 
@@ -2297,6 +2324,7 @@ impl AppController {
     fn handle_agent_exited_event(&mut self, reason: &str) -> (bool, bool) {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
+        self.ai_chat.clear_pending_agent_interactions();
         if reason != "cancelled" {
             self.ai_chat.status_banner = format!("エージェントプロセス終了: {reason}");
             if matches!(
@@ -2321,7 +2349,7 @@ impl AppController {
     ) -> (bool, bool) {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
-        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.clear_pending_agent_interactions();
         let formatted = format!("[{code}] {message}");
         self.ai_chat.last_error = Some(formatted.clone());
         self.ai_chat.execution_state = AiExecutionState::Failed {
@@ -4659,5 +4687,116 @@ mod tests {
         assert_eq!(chat.turns.len(), 215);
         assert_eq!(super::collapsed_history_count(chat.turns.len(), false), 15);
         assert_eq!(super::collapsed_history_count(chat.turns.len(), true), 0);
+    }
+
+    #[test]
+    fn waiting_state_clears_on_agent_exit_fatal_error_and_orphan_cancel() {
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::session_store::PendingAgentQuestionSnapshot;
+
+        // 1) WaitingUserInput 中のプロセス終了 (Exited) で待機状態が解放され再送信できること
+        let mut controller = AppController::new();
+        controller.handle_agent_host_event(AgentHostEvent::AskUser {
+            request_id: "req1".to_owned(),
+            title: "スタイル確認".to_owned(),
+            message: "選択してください".to_owned(),
+            fields: Vec::new(),
+            choices: Vec::new(),
+            allow_skip: true,
+        });
+        assert!(controller.ai_chat.can_cancel());
+        let (did_exit, _) = controller.handle_agent_host_event(AgentHostEvent::Exited {
+            reason: "crashed".to_owned(),
+        });
+        assert!(did_exit);
+        assert!(controller.ai_chat.pending_question.is_none());
+        assert!(!controller.ai_chat.can_cancel());
+        assert!(matches!(
+            controller.ai_chat.execution_state,
+            super::AiExecutionState::Failed { .. }
+        ));
+
+        // 2) WaitingApproval 中の非回復 AgentError で待機状態が解放されること
+        controller.handle_agent_host_event(AgentHostEvent::ToolApprovalRequired {
+            request_id: "req2".to_owned(),
+            tool_name: "ext_tool".to_owned(),
+            arguments: serde_json::json!({}),
+            description: "desc".to_owned(),
+        });
+        assert!(controller.ai_chat.can_cancel());
+        let (fatal_exit, _) = controller.handle_agent_host_event(AgentHostEvent::AgentError {
+            code: "fatal".to_owned(),
+            message: "terminated".to_owned(),
+            recoverable: false,
+        });
+        assert!(fatal_exit);
+        assert!(controller.ai_chat.pending_tool_approval.is_none());
+        assert!(!controller.ai_chat.can_cancel());
+
+        // 3) active_agent が None のまま待機カードが残留しても cancel_ai_prompt で強制解除できること
+        controller.ai_chat.pending_tool_approval = Some(super::PendingAgentToolApproval {
+            request_id: "req3".to_owned(),
+            tool_name: "orphan".to_owned(),
+            arguments: serde_json::json!({}),
+            description: "desc".to_owned(),
+        });
+        controller.ai_chat.pending_question = Some(PendingAgentQuestionSnapshot {
+            request_id: "req4".to_owned(),
+            title: "orphan".to_owned(),
+            message: "msg".to_owned(),
+            fields: Vec::new(),
+            choices: Vec::new(),
+            allow_skip: false,
+        });
+        assert!(controller.ai_chat.can_cancel());
+        assert!(controller.cancel_ai_prompt());
+        assert!(!controller.ai_chat.can_cancel());
+        assert_eq!(
+            controller.ai_chat.execution_state,
+            super::AiExecutionState::Cancelled
+        );
+    }
+
+    #[test]
+    fn status_without_step_preserves_progress_and_untagged_or_inline_json_is_masked() {
+        use crate::ai::agent_host::AgentHostEvent;
+
+        let mut controller = AppController::new();
+        controller.handle_agent_host_event(AgentHostEvent::Status {
+            message: "分析中".to_owned(),
+            step: Some(2),
+            total_steps: Some(4),
+        });
+        controller.handle_agent_host_event(AgentHostEvent::Status {
+            message: "構成データを生成中... (200文字)".to_owned(),
+            step: None,
+            total_steps: None,
+        });
+        assert_eq!(
+            controller.ai_chat.agent_step_status,
+            Some((Some(2), Some(4)))
+        );
+        assert!(matches!(
+            controller.ai_chat.execution_state,
+            super::AiExecutionState::Responding {
+                step: Some((Some(2), Some(4))),
+                ..
+            }
+        ));
+
+        let untagged = super::format_streaming_preview_for_ui(
+            "前置きです。\n```\n{\"tool_calls\":[{\"name\":\"x\"}]}\n```",
+        );
+        assert!(untagged.contains("前置きです。"));
+        assert!(!untagged.contains("tool_calls"));
+
+        let inline_raw = "確認中 {\"tool_calls\":[{\"name\":\"get_timeline_summary\"}]}";
+        let masked_inline = super::format_streaming_preview_for_ui(inline_raw);
+        assert!(masked_inline.contains("確認中"));
+        assert!(!masked_inline.contains("tool_calls"));
+        assert_eq!(
+            super::extract_readable_cancelled_preview(inline_raw).as_deref(),
+            Some("確認中")
+        );
     }
 }
