@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.export.h265",
   "name": "H.265 / HEVC MP4・MOV (OS HW エンコーダ / 外部 ffmpeg)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "export",
   "entrypoint": "sea-export-h265",
   "args": [],

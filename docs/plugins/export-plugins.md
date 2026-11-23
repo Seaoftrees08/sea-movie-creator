@@ -141,7 +141,7 @@ sequenceDiagram
 | `requires_external_binary` | `bool` | - | 外部実行ファイルを必要とするかの宣言（既定 `false`） |
 
 > [!WARNING]
-> **現行 UI（Alpha v0.1.0）における `requires_external_binary` の挙動に関する注意**:
+> **現行 UI（Alpha v0.1.1）における `requires_external_binary` の挙動に関する注意**:
 > [`src/ui/export_dialog.rs`](../../src/ui/export_dialog.rs#L121-L130) の `ExportDialogState::is_plugin_visible` は現在、外部 `ffmpeg` パスが未設定の状態で `license.requires_external_binary == true` のプラグインを**ダイアログ一覧から非表示**にする実装になっています。`ffmpeg` 以外の独自外部バイナリに依存するプラグインであっても、未設定時に一覧から消えてほしくない場合は `false` とし、実行時チェックや `notice` / `option_fields` で案内する設計を推奨します。
 
 ### `capabilities`（`PluginCapabilities`）

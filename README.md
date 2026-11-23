@@ -3,7 +3,7 @@
 AI チャットから動画編集操作を行える、Rust 製の軽量デスクトップ動画編集ソフト（AI-native lightweight movie editor built with Rust）の開発リポジトリです。
 
 > [!NOTE]
-> 現在 **Alpha v0.1.0**（Phase 0 〜 Phase C 全実装）に到達しています。利用手順は [人間向けドキュメント](docs/README.md)（[はじめに](docs/getting-started.md)・[ユーザーガイド](docs/user-guide.md)）、内部設計は [`dev-doc/`](dev-doc/README.md) を参照してください。
+> 現在 **Alpha v0.1.1**（Phase 0 〜 Phase C 全実装）に到達しています。利用手順は [人間向けドキュメント](docs/README.md)（[はじめに](docs/getting-started.md)・[ユーザーガイド](docs/user-guide.md)）、内部設計は [`dev-doc/`](dev-doc/README.md) を参照してください。
 
 ## 主な特徴
 

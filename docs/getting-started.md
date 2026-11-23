@@ -1,10 +1,10 @@
 # はじめに（導入・ビルド・起動方法）
 
-このドキュメントは `sea-movie-creator`（**Alpha v0.1.0**）の入手・起動・ソースコードからのビルド手順をまとめたガイドです。
+このドキュメントは `sea-movie-creator`（**Alpha v0.1.1**）の入手・起動・ソースコードからのビルド手順をまとめたガイドです。
 
 ## 1. アルファ版パッケージ（配布フォルダ）を使う場合
 
-ビルド済みアルファ版フォルダ（例: `dist/sea-movie-creator-v0.1.0-alpha-windows-x86_64/` または `target/release/` 基準の配置）には、本体実行ファイルと各種別プロセスプラグインが含まれています。
+ビルド済みアルファ版フォルダ（例: `dist/sea-movie-creator-v0.1.1-alpha-windows-x86_64/` または `target/release/` 基準の配置）には、本体実行ファイルと各種別プロセスプラグインが含まれています。
 
 ### 必要なフォルダ配置
 
@@ -25,6 +25,10 @@
 │   ├── external_tools.json      # 外部 ffmpeg パス設定
 │   └── language.json            # 表示言語選択状態
 └── plugins/
+    ├── agent/
+    │   └── director/
+    │       ├── agent-plugin.json
+    │       └── sea-agent-director.exe  # 自律エージェントプラグイン: Director
     ├── ai/
     │   ├── acp/
     │   │   ├── ai-plugin.json
@@ -100,6 +104,16 @@ cargo build --release --workspace
 
 # macOS / Linux
 ./target/release/sea-movie-creator
+```
+
+Windows で上記配布フォルダ形式のパッケージを `dist\` 配下へ書き出す場合は、専用のバッチスクリプトを使用します（PowerShell の実行ポリシーに依存せず実行できます）。
+
+```cmd
+:: 本体・プラグインをリリースビルドし、dist\sea-movie-creator-v0.1.1-alpha-windows-x86_64\ へパッケージング
+scripts\package-release.bat
+
+:: ZIP アーカイブもあわせて生成する場合
+scripts\package-release.bat --zip
 ```
 
 ### 開発時の品質チェック・全テスト（PR 前チェック）

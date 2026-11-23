@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.export.av1",
   "name": "標準 AV1 (純粋 Rust / OS HW)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "export",
   "entrypoint": "sea-export-av1",
   "args": [],

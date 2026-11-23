@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.ai.acp",
   "name": "External Coding Agent (ACP Stdio: Claude / Codex / Copilot)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entrypoint": "sea-ai-acp",
   "args": [],
   "protocol": "sea_ai_v1",

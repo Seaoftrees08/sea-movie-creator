@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.export.h264",
   "name": "H.264 / MP4 (OS Media Foundation / 外部 ffmpeg)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "export",
   "entrypoint": "sea-export-h264",
   "args": [],

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "sea.ai.antigravity",
   "name": "Google Antigravity (agy CLI)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entrypoint": "sea-ai-antigravity",
   "args": [],
   "protocol": "sea_ai_v1",

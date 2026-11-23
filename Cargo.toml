@@ -58,7 +58,7 @@ module_name_repetitions = "allow"
 
 [package]
 name = "sea-movie-creator"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "AI-native lightweight movie editor built with Rust"

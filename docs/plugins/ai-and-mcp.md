@@ -68,7 +68,7 @@ sea-movie-creator mcp --project path/to/project.smc.json
 本体チャットパネルの裏側で外部 AI CLI を呼び出す別プロセスプラグイン機構です（[`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs)）。
 
 > [!WARNING]
-> **現行バージョン（Alpha v0.1.0）の UI 露出制限**:
+> **現行バージョン（Alpha v0.1.1）の UI 露出制限**:
 > `AiPluginRegistry` 自体は `plugins/ai/` 配下の任意ディレクトリを動的スキャンできますが、GUI のプロバイダ選択コンボボックス（[`src/ai/provider.rs`](../../src/ai/provider.rs#L579-L629) `AiProviderKind::ui_selectable_providers` および `model_catalog`）には現在 **`sea.ai.antigravity`** と **`sea.ai.acp`** の 2 つだけがハードコードされています。
 > そのため、サードパーティが新しい `id` の AI プラグインを置いても現時点の GUI コンボボックスには自動出現しません（将来的に UI 側を動的リスト化するまで、独自 AI プラグインのテスト・利用は `AiPluginRegistry` API 経由または上記既存プロファイル連携を前提としてください）。
 
