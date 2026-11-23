@@ -7,13 +7,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(test)]
+use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
+use sea_ai_protocol::{
+    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    format_conversation_history_section, is_empty_json_value,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiStreamEvent, AiThinkingLevel,
-    AiTokenUsage,
+    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiRole, AiStreamEvent,
+    AiThinkingLevel, AiTokenUsage,
 };
 use crate::ai::settings::ProbedModelEntry;
 use crate::core::PluginAiHints;
@@ -673,13 +679,7 @@ impl AiPluginProvider {
             .unwrap_or("default-session")
             .to_owned();
 
-        let prompt_body = format!(
-            "{}\n\n# EditCommand JSON Schema\n{}\n\n# Current Timeline Context\n{}\n\n# Instruction\n{}",
-            request.system_prompt,
-            request.command_schema_json,
-            request.context_summary,
-            request.user_prompt
-        );
+        let prompt_body = build_direct_acp_prompt_body(request);
         send_acp_jsonrpc_line(
             &mut stdin,
             &json!({
@@ -867,12 +867,7 @@ fn read_acp_until_id_collecting<R: BufRead>(
 }
 
 fn extract_acp_update_delta(params: &Value) -> Option<String> {
-    let update = params.get("update").unwrap_or(params);
-    update["content"]["text"]
-        .as_str()
-        .or_else(|| update["text"].as_str())
-        .or_else(|| update["delta"].as_str())
-        .map(ToOwned::to_owned)
+    extract_acp_update_message_delta(params)
 }
 
 /// マニフェストファイルを読み込み、必須制約・パストラバーサル禁止を検証する。
@@ -885,6 +880,45 @@ pub fn load_and_validate_manifest(path: &Path) -> Result<AiPluginManifest, AiPlu
     let manifest: AiPluginManifest = serde_json::from_str(&raw)?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+const fn role_label(role: AiRole) -> &'static str {
+    match role {
+        AiRole::System => "system",
+        AiRole::User => "user",
+        AiRole::Assistant => "assistant",
+    }
+}
+
+fn build_direct_acp_prompt_body(request: &AiRequest) -> String {
+    let mut sections = vec![request.system_prompt.clone()];
+    if !is_empty_json_value(&request.command_schema_json) {
+        sections.push(format!(
+            "# EditCommand JSON Schema\n{}",
+            request.command_schema_json
+        ));
+    }
+    if !is_empty_json_value(&request.context_summary) {
+        sections.push(format!(
+            "# Current Timeline Context\n{}",
+            request.context_summary
+        ));
+    }
+    let history_msgs: Vec<HistoryMessage> = request
+        .history
+        .iter()
+        .map(|msg| HistoryMessage {
+            role: role_label(msg.role).to_owned(),
+            content: msg.content.clone(),
+        })
+        .collect();
+    let history_section =
+        format_conversation_history_section(&history_msgs, MAX_HISTORY_PROMPT_BYTES);
+    if !history_section.is_empty() {
+        sections.push(history_section);
+    }
+    sections.push(format!("# Instruction\n{}", request.user_prompt));
+    sections.join("\n\n")
 }
 
 fn validate_manifest(m: &AiPluginManifest) -> Result<(), AiPluginHostError> {
@@ -1038,5 +1072,66 @@ mod tests {
         assert_eq!(u.total_tokens, 165);
         assert!(!u.is_estimated);
         Ok(())
+    }
+
+    #[test]
+    fn direct_acp_prompt_expands_history_pins_instruction_and_omits_empty_sections() {
+        let req = AiRequest {
+            system_prompt: "SYS".to_owned(),
+            command_schema_json: json!({}),
+            context_summary: Value::Null,
+            history: vec![
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("# Session Context\n{}", "あ".repeat(40_000)),
+                },
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("{ORIGINAL_INSTRUCTION_MARKER}\n字幕色を白に変更"),
+                },
+                AiChatMessage {
+                    role: AiRole::User,
+                    content: format!("[ToolResult old status=OK]\n{}", "い".repeat(30_000)),
+                },
+            ],
+            user_prompt: "[ToolResult latest status=OK]\n{\"ok\":true}".to_owned(),
+            stream: true,
+        };
+        let prompt = build_direct_acp_prompt_body(&req);
+        assert!(!prompt.contains("# EditCommand JSON Schema"));
+        assert!(!prompt.contains("# Current Timeline Context"));
+        assert!(prompt.contains("# Conversation History"));
+        assert!(prompt.contains("字幕色を白に変更"));
+        assert!(prompt.contains("# Instruction\n[ToolResult latest"));
+    }
+
+    #[test]
+    fn extract_acp_update_delta_filters_thoughts_and_tool_calls() {
+        let thought = json!({
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "internal thought" }
+            }
+        });
+        assert_eq!(extract_acp_update_delta(&thought), None);
+
+        let tool_call = json!({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "content": { "type": "text", "text": "running tool" }
+            }
+        });
+        assert_eq!(extract_acp_update_delta(&tool_call), None);
+
+        let msg = json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "字幕を更新しました" }
+            }
+        });
+        assert_eq!(
+            extract_acp_update_delta(&msg).as_deref(),
+            Some("字幕を更新しました")
+        );
     }
 }

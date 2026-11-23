@@ -805,7 +805,9 @@ pub fn default_editor_system_prompt() -> String {
         "6. Only reference asset/layer/clip IDs that exist in the Current Timeline Context or were defined earlier in the same batch. ",
         "When referenced_targets is non-empty (from @<filename> mentions or user-attached timeline clips), prioritize editing those exact targets using their current visual/audio values.\n",
         "7. For questions, greetings, or checks requiring no timeline edits (such as \"ping\"), ",
-        "give a brief answer either before a ```json code block or inside a \"message\" field, paired with {\"type\":\"batch\",\"commands\":[]}."
+        "give a brief answer either before a ```json code block or inside a \"message\" field, paired with {\"type\":\"batch\",\"commands\":[]}.\n",
+        "8. Whenever you return an EditCommand or batch, also provide a concise Japanese completion summary ",
+        "(what was changed) before the ```json code block or inside the \"message\" field."
     )
     .to_owned()
 }

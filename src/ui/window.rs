@@ -142,6 +142,8 @@ pub struct SeaEditorWindow {
     pub(crate) font_select_needs_refresh: bool,
     /// 非テキスト編集領域（プレビュー・タイムライン等）用の既定フォーカスハンドル。
     pub(crate) workspace_focus: FocusHandle,
+    /// AI チャット履歴（テキスト選択中）のショートカット誤発火防止用フォーカスハンドル。
+    pub(crate) ai_chat_history_focus: FocusHandle,
     /// プレビュー領域ポインタ・パン修飾入力モード。
     pub(crate) preview_pointer_mode: PreviewPointerInputMode,
     /// 直近のポインタウィンドウ座標 (px)。
@@ -201,6 +203,9 @@ impl SeaEditorWindow {
         ];
         let inspector_widgets = InspectorWidgetBank::new(window, cx, &mut subscriptions);
         let workspace_focus = cx.focus_handle();
+        let ai_chat_history_focus = cx.focus_handle();
+        subscriptions.push(cx.on_focus_in(&ai_chat_history_focus, window, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.on_blur(&ai_chat_history_focus, window, |_, _, cx| cx.notify()));
 
         // 全入力欄のフォーカス／ブラー時に再描画し、`.key_context` を即座に切替える
         let ai_fh = ai_chat_input.read(cx).focus_handle(cx);
@@ -239,6 +244,7 @@ impl SeaEditorWindow {
             extra_google_font_results: Vec::new(),
             font_select_needs_refresh: false,
             workspace_focus,
+            ai_chat_history_focus,
             preview_pointer_mode: PreviewPointerInputMode::Idle,
             last_mouse_window: (0.0, 0.0),
             dynamic_input_sub: None,
@@ -478,6 +484,7 @@ impl SeaEditorWindow {
     fn spawn_playback_loop(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut last_tick = Instant::now();
+            let mut last_ai_elapsed_sec: Option<u64> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(TICK_INTERVAL_MS))
@@ -501,8 +508,18 @@ impl SeaEditorWindow {
                         || ai_changed
                         || waveform_changed
                     {
+                        last_ai_elapsed_sec = view.controller.ai_chat.responding_elapsed_secs();
                         view.sliders_dirty = true;
                         cx.notify();
+                    } else if view.controller.ai_chat.should_tick_elapsed_timer() {
+                        // スライダー再同期 (sliders_dirty) を起こさず、経過秒数の 1 秒変化時のみ再描画する。
+                        let cur_sec = view.controller.ai_chat.responding_elapsed_secs();
+                        if cur_sec != last_ai_elapsed_sec {
+                            last_ai_elapsed_sec = cur_sec;
+                            cx.notify();
+                        }
+                    } else {
+                        last_ai_elapsed_sec = None;
                     }
                 });
                 if keep_going.is_err() {
@@ -515,7 +532,12 @@ impl SeaEditorWindow {
 
     /// AI チャット入力欄の現在文字列を送信し、受理された場合は入力欄を空にする。
     pub(crate) fn submit_ai_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.controller.ai_chat.is_busy() {
+        if self.controller.ai_chat.can_cancel() {
+            if !self.controller.ai_chat.is_busy() {
+                self.controller.ai_chat.last_error =
+                    Some(crate::ui::i18n::tr("ai.err_waiting_action"));
+                self.sync_widgets_from_controller(cx);
+            }
             return;
         }
         let msg = self.ai_chat_input.read(cx).value().to_string();
@@ -738,9 +760,16 @@ impl SeaEditorWindow {
             || self.inspector_widgets.is_any_input_focused(window, cx)
     }
 
+    /// AI チャット履歴領域（テキスト選択中など）にフォーカスが入っているかを返す。
+    #[must_use]
+    pub fn is_ai_chat_history_focused(&self, window: &Window, cx: &App) -> bool {
+        self.ai_chat_history_focus.contains_focused(window, cx)
+    }
+
     #[must_use]
     fn allow_editor_shortcut(&self, window: &Window, cx: &App) -> bool {
         !self.is_any_text_input_focused(window, cx)
+            && !self.is_ai_chat_history_focused(window, cx)
             && self.close_prompt != ClosePromptState::ConfirmModal
             && self.key_config_modal.is_none()
             && self.external_tools_modal.is_none()
@@ -816,7 +845,9 @@ impl SeaEditorWindow {
             self.layer_rename_target = None;
             self.layer_rename_input = None;
             self.dynamic_input_sub = None;
-        } else if self.is_any_text_input_focused(window, cx) {
+        } else if self.is_any_text_input_focused(window, cx)
+            || self.is_ai_chat_history_focused(window, cx)
+        {
             window.focus(&self.workspace_focus, cx);
         } else if self.controller.document.selection_range.is_some() {
             let _ = self.controller.set_selection_range(None);
@@ -924,6 +955,7 @@ impl SeaEditorWindow {
                                 .ai_ask_inputs
                                 .as_ref()
                                 .map_or(&[][..], |(_, list)| list.as_slice()),
+                            ai_chat_history_focus: &self.ai_chat_history_focus,
                         },
                         cx,
                     )),
@@ -1386,6 +1418,7 @@ impl SeaEditorWindow {
                 if ev.keystroke.key == "space"
                     && ev.keystroke.modifiers == Modifiers::none()
                     && !this.is_any_text_input_focused(window, cx)
+                    && !this.is_ai_chat_history_focused(window, cx)
                     && this.preview_pointer_mode == PreviewPointerInputMode::Idle
                 {
                     this.preview_pointer_mode = PreviewPointerInputMode::SpacePanHeld;

@@ -129,6 +129,10 @@ sea-movie-creator mcp --project path/to/project.smc.json
      }
    }
    ```
+   - `params.history`（省略時は空配列）を受け取るプラグインは、役割（`[system]` / `[user]` / `[assistant]`）付きの時系列コンテキストとしてプロンプトへ展開してください（上限目安: `128 KiB`）。
+     - 履歴内に `# Original User Instruction` で始まるメッセージが含まれる場合（自律エージェントの複数ステップ実行中）、そのメッセージを最優先でピン留め保持し、`# Session Context` や古い `[ToolResult ` 本文の圧縮を優先したうえで中間ステップを省略します（UTF-8 文字境界を破壊しないこと）。
+     - `command_schema_json` や `context_summary` が `null` または空オブジェクト `{}` の場合は、対応するプロンプトセクション自体を省略してください。
+     - プラグイン側のサンドボックス制約に特定の出力形式（`EditCommand` や `{"type":"batch","commands":[]}` 等）をハードコード強制してはいけません。出力形式（通常編集か JSON Action Mode か）は常にホストから渡された `system_prompt` に従います。
    ```json
    {
      "protocol": "sea_ai_v1",
@@ -152,6 +156,8 @@ sea-movie-creator mcp --project path/to/project.smc.json
 ### 2.3 プロトコル B: `acp_stdio`（直接 ACP JSON-RPC 2.0）
 
 `protocol: "acp_stdio"` を指定した場合、ホストは子プロセスに直接 ACP over stdio（JSON-RPC 2.0）で話しかけます（`initialize` → `session/new` → `session/prompt`、`session/update` 通知でテキスト収集）。
+- ホスト側の `acp_stdio` プロンプト組み立ておよびリファレンスプラグイン `sea-ai-acp` でも、`history` は `128 KiB` 上限で時系列展開（`# Original User Instruction` ピン留め・圧縮・省略）され、空の `command_schema_json` / `context_summary` セクションは省略されます。
+- `session/update` 通知を解釈する際は、`update.sessionUpdate` が存在する場合 `"agent_message_chunk"` のみを応答本文として採用し、`agent_thought_chunk` や `tool_call` が混入しないようフィルタすることを推奨します。
 また、外部エージェントからツール権限要求（`session/request_permission`）を受ける構成では、[`sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs#L268-L322) のように**プロジェクトファイル破壊やシェル実行を防ぐため明示的に拒否応答する**のが推奨パターンです。
 
 ### 2.4 テスト用フィクスチャ

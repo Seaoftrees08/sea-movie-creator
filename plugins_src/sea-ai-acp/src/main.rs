@@ -18,6 +18,12 @@ fn apply_background_process_flags(cmd: &mut Command) {
     let _ = cmd;
 }
 
+#[cfg(test)]
+use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
+use sea_ai_protocol::{
+    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    format_conversation_history_section, is_empty_json_value,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -39,6 +45,7 @@ struct CallParams {
     system_prompt: String,
     command_schema_json: Value,
     context_summary: Value,
+    history: Vec<HistoryMessage>,
     user_prompt: String,
     model: Option<String>,
     external_cli: Option<String>,
@@ -141,17 +148,31 @@ fn build_initialize_request(id: u64) -> Value {
     })
 }
 
+fn build_acp_prompt_text(params: &CallParams) -> String {
+    let mut sections = vec![params.system_prompt.clone()];
+    if !is_empty_json_value(&params.command_schema_json) {
+        sections.push(format!(
+            "# EditCommand JSON Schema\n{}",
+            params.command_schema_json
+        ));
+    }
+    if !is_empty_json_value(&params.context_summary) {
+        sections.push(format!("# Timeline Context\n{}", params.context_summary));
+    }
+    let history_section =
+        format_conversation_history_section(&params.history, MAX_HISTORY_PROMPT_BYTES);
+    if !history_section.is_empty() {
+        sections.push(history_section);
+    }
+    sections.push(format!("# Instruction\n{}", params.user_prompt));
+    sections.join("\n\n")
+}
+
 fn extract_acp_update_text(msg: &Value) -> Option<String> {
     if msg["method"].as_str() != Some("session/update") {
         return None;
     }
-    let params = &msg["params"];
-    let update = params.get("update").unwrap_or(params);
-    update["content"]["text"]
-        .as_str()
-        .or_else(|| update["text"].as_str())
-        .or_else(|| update["delta"].as_str())
-        .map(ToOwned::to_owned)
+    extract_acp_update_message_delta(&msg["params"])
 }
 
 fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), String> {
@@ -337,13 +358,7 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
         .unwrap_or("default-session")
         .to_owned();
 
-    let prompt_text = format!(
-        "{}\n\n# EditCommand JSON Schema\n{}\n\n# Timeline Context\n{}\n\n# Instruction\n{}",
-        params.system_prompt,
-        params.command_schema_json,
-        params.context_summary,
-        params.user_prompt
-    );
+    let prompt_text = build_acp_prompt_text(params);
     write_jsonrpc_line(
         &mut child_stdin,
         &json!({
@@ -468,5 +483,88 @@ mod tests {
             usage.as_ref().and_then(|u| u["total_tokens"].as_u64()),
             Some(25)
         );
+    }
+
+    #[test]
+    fn extract_acp_update_text_filters_non_message_chunks() {
+        let thought = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "internal thought" }
+                }
+            }
+        });
+        assert_eq!(extract_acp_update_text(&thought), None);
+
+        let tool_call = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "content": { "type": "text", "text": "tool running" }
+                }
+            }
+        });
+        assert_eq!(extract_acp_update_text(&tool_call), None);
+    }
+
+    #[test]
+    fn build_acp_prompt_expands_history_and_omits_empty_sections() {
+        let params = CallParams {
+            system_prompt: "SYS".to_owned(),
+            command_schema_json: json!({}),
+            context_summary: Value::Null,
+            history: vec![
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: format!("{ORIGINAL_INSTRUCTION_MARKER}\n最初の指示"),
+                },
+                HistoryMessage {
+                    role: "assistant".to_owned(),
+                    content: "中間応答".to_owned(),
+                },
+            ],
+            user_prompt: "最新のツール結果".to_owned(),
+            ..CallParams::default()
+        };
+        let prompt = build_acp_prompt_text(&params);
+        assert!(!prompt.contains("# EditCommand JSON Schema"));
+        assert!(!prompt.contains("# Timeline Context"));
+        assert!(prompt.contains("# Conversation History"));
+        assert!(prompt.contains("最初の指示"));
+        assert!(prompt.contains("# Instruction\n最新のツール結果"));
+
+        // 128 KiB 圧縮で元指示がピン留めされること
+        let huge_ctx = format!("# Session Context\n{}", "あ".repeat(40_000));
+        let huge_tool = format!("[ToolResult scan status=OK]\n{}", "い".repeat(30_000));
+        let section = format_conversation_history_section(
+            &[
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: huge_ctx,
+                },
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: format!("{ORIGINAL_INSTRUCTION_MARKER}\nピン留め指示"),
+                },
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: huge_tool,
+                },
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: "[ToolResult latest status=OK]\n{\"ok\":true}".to_owned(),
+                },
+            ],
+            MAX_HISTORY_PROMPT_BYTES,
+        );
+        assert!(section.len() <= MAX_HISTORY_PROMPT_BYTES);
+        assert!(section.contains("ピン留め指示"));
     }
 }

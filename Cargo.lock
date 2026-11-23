@@ -6240,12 +6240,22 @@ dependencies = [
 name = "sea-ai-acp"
 version = "0.1.1"
 dependencies = [
+ "sea-ai-protocol",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "sea-ai-antigravity"
+version = "0.1.1"
+dependencies = [
+ "sea-ai-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sea-ai-protocol"
 version = "0.1.1"
 dependencies = [
  "serde",
@@ -6334,6 +6344,7 @@ dependencies = [
  "rubato",
  "schemars",
  "sea-agent-protocol",
+ "sea-ai-protocol",
  "sea-export-protocol",
  "serde",
  "serde_json",

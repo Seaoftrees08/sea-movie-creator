@@ -22,6 +22,12 @@ fn apply_background_process_flags(cmd: &mut Command) {
 }
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
+use sea_ai_protocol::{
+    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    format_conversation_history_section, is_empty_json_value,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -69,6 +75,7 @@ struct CallParams {
     system_prompt: String,
     command_schema_json: Value,
     context_summary: Value,
+    history: Vec<HistoryMessage>,
     user_prompt: String,
     model: Option<String>,
     thinking_level: Option<String>,
@@ -227,19 +234,31 @@ fn build_set_config_option_request(
     })
 }
 
+fn build_agy_prompt_text(params: &CallParams) -> String {
+    let mut sections = vec![
+        params.system_prompt.clone(),
+        "# Sandbox Constraints\nDo NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.".to_owned(),
+    ];
+    if !is_empty_json_value(&params.command_schema_json) {
+        sections.push(format!(
+            "# EditCommand JSON Schema\n{}",
+            params.command_schema_json
+        ));
+    }
+    if !is_empty_json_value(&params.context_summary) {
+        sections.push(format!("# Timeline Context\n{}", params.context_summary));
+    }
+    let history_section =
+        format_conversation_history_section(&params.history, MAX_HISTORY_PROMPT_BYTES);
+    if !history_section.is_empty() {
+        sections.push(history_section);
+    }
+    sections.push(format!("# Instruction\n{}", params.user_prompt));
+    sections.join("\n\n")
+}
+
 fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) -> Value {
-    let prompt_text = format!(
-        "{}\n\n# Sandbox Constraints\n\
-         Do NOT execute shell commands, modify files, browse URLs, or invoke workspace tools.\n\
-         Always output a valid EditCommand JSON object matching the schema below (use {{\"type\":\"batch\",\"commands\":[]}} with a brief text answer before a ```json fence or in \"message\" if no edits are needed).\n\n\
-         # EditCommand JSON Schema\n{}\n\n\
-         # Timeline Context\n{}\n\n\
-         # Instruction\n{}",
-        params.system_prompt,
-        params.command_schema_json,
-        params.context_summary,
-        params.user_prompt
-    );
+    let prompt_text = build_agy_prompt_text(params);
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -255,18 +274,7 @@ fn extract_acp_message_delta(msg: &Value) -> Option<String> {
     if msg["method"].as_str() != Some("session/update") {
         return None;
     }
-    let params = &msg["params"];
-    let update = params.get("update").unwrap_or(params);
-    if let Some(kind) = update["sessionUpdate"].as_str()
-        && kind != "agent_message_chunk"
-    {
-        return None;
-    }
-    update["content"]["text"]
-        .as_str()
-        .or_else(|| update["text"].as_str())
-        .or_else(|| update["delta"].as_str())
-        .map(ToOwned::to_owned)
+    extract_acp_update_message_delta(&msg["params"])
 }
 
 fn build_permission_deny_response(id: &Value, params: &Value) -> Value {
@@ -942,5 +950,96 @@ mod tests {
         let parsed_usage = extract_acp_usage(&usage_resp).ok_or("missing usage")?;
         assert_eq!(parsed_usage["total_tokens"], json!(55));
         Ok(())
+    }
+
+    #[test]
+    fn build_agy_prompt_expands_history_and_omits_empty_sections_and_batch_constraint() {
+        let params = CallParams {
+            system_prompt: "SYS".to_owned(),
+            command_schema_json: json!({}),
+            context_summary: Value::Null,
+            history: vec![
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: "# Session Context\n{\"clips\":1}".to_owned(),
+                },
+                HistoryMessage {
+                    role: "user".to_owned(),
+                    content: "# Original User Instruction\n4項目の修正をして".to_owned(),
+                },
+                HistoryMessage {
+                    role: "assistant".to_owned(),
+                    content: "{\"tool_calls\":[{\"name\":\"get_timeline_summary\"}]}".to_owned(),
+                },
+            ],
+            user_prompt: "[ToolResult get_timeline_summary status=OK]\n{}".to_owned(),
+            ..CallParams::default()
+        };
+        let prompt = build_agy_prompt_text(&params);
+        assert!(!prompt.contains("Always output a valid EditCommand"));
+        assert!(!prompt.contains("# EditCommand JSON Schema"));
+        assert!(!prompt.contains("# Timeline Context"));
+        assert!(prompt.contains("# Conversation History"));
+        assert!(prompt.contains("[user]\n# Original User Instruction\n4項目の修正をして"));
+        assert!(prompt.contains("[assistant]\n{\"tool_calls\""));
+        assert!(prompt.contains("# Instruction\n[ToolResult get_timeline_summary"));
+    }
+
+    #[test]
+    fn history_compression_pins_original_instruction_and_preserves_utf8() {
+        let big_context = format!("# Session Context\n{}", "あ".repeat(25_000));
+        let old_tool = format!("[ToolResult inspect status=OK]\n{}", "い".repeat(15_000));
+        let original = format!("{ORIGINAL_INSTRUCTION_MARKER}\n必ず字幕の縁取り色を変更して");
+        let mid_turn = "う".repeat(10_000);
+        let latest_tool = "[ToolResult get_capabilities status=OK]\n{\"ok\":true}".to_owned();
+
+        let history = vec![
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: big_context,
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: original.clone(),
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: old_tool,
+            },
+            HistoryMessage {
+                role: "assistant".to_owned(),
+                content: mid_turn,
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: latest_tool.clone(),
+            },
+        ];
+
+        let section = format_conversation_history_section(&history, MAX_HISTORY_PROMPT_BYTES);
+        assert!(section.len() <= MAX_HISTORY_PROMPT_BYTES);
+        assert!(section.contains(&original));
+        assert!(section.contains(&latest_tool));
+
+        // 通常チャット（マーカーなし）では古いターンから省略され直近ターンが残ること
+        let normal_history = vec![
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: format!("古い指示 {}", "え".repeat(30_000)),
+            },
+            HistoryMessage {
+                role: "assistant".to_owned(),
+                content: format!("古い応答 {}", "お".repeat(30_000)),
+            },
+            HistoryMessage {
+                role: "user".to_owned(),
+                content: "直近の依頼".to_owned(),
+            },
+        ];
+        let normal_section = format_conversation_history_section(&normal_history, 40 * 1024);
+        assert!(normal_section.len() <= 40 * 1024);
+        assert!(normal_section.contains("直近の依頼"));
+        assert!(normal_section.contains("...(earlier messages omitted)..."));
+        assert!(!normal_section.contains("古い指示"));
     }
 }

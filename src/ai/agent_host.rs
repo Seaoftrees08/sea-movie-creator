@@ -336,6 +336,11 @@ pub enum AgentHostEvent {
         /// 想定総ステップ数。
         total_steps: Option<u32>,
     },
+    /// LLM が逐次生成している部分テキストチャンク。
+    StreamDelta {
+        /// 追記テキスト。
+        text: String,
+    },
     /// ホストツール実行結果のアクティビティログ。
     ToolActivity {
         /// 実行されたツール名。
@@ -1373,6 +1378,41 @@ fn handle_llm_chat(
     send_agent_llm_turn_and_reply(state, request_id, &req, event_tx);
 }
 
+fn forward_agent_stream_event(
+    ev: crate::ai::provider::AiStreamEvent,
+    suppress_raw_delta: bool,
+    structured_chars: &mut usize,
+    last_reported_chars: &mut usize,
+    tx: &mpsc::Sender<AgentHostEvent>,
+) {
+    match ev {
+        crate::ai::provider::AiStreamEvent::Status(msg) => {
+            let _ = tx.send(AgentHostEvent::Status {
+                message: msg,
+                step: None,
+                total_steps: None,
+            });
+        }
+        crate::ai::provider::AiStreamEvent::DeltaText(delta) => {
+            if suppress_raw_delta {
+                *structured_chars = structured_chars.saturating_add(delta.chars().count());
+                if structured_chars.saturating_sub(*last_reported_chars) >= 200 {
+                    *last_reported_chars = *structured_chars;
+                    let _ = tx.send(AgentHostEvent::Status {
+                        message: format!("構成データを生成中... ({structured_chars}文字)"),
+                        step: None,
+                        total_steps: None,
+                    });
+                }
+            } else {
+                let _ = tx.send(AgentHostEvent::StreamDelta { text: delta });
+            }
+        }
+        crate::ai::provider::AiStreamEvent::Completed(_)
+        | crate::ai::provider::AiStreamEvent::Failed(_) => {}
+    }
+}
+
 fn send_agent_llm_turn_and_reply(
     state: &mut CoordinatorState,
     request_id: String,
@@ -1381,17 +1421,20 @@ fn send_agent_llm_turn_and_reply(
 ) {
     let cancelled_ref = Arc::clone(&state.cancelled);
     let tx_clone = event_tx.clone();
+    let suppress_raw_delta = req.response_json_schema.is_some();
+    let mut structured_chars = 0_usize;
+    let mut last_reported_chars = 0_usize;
     let mut on_stream_event = |ev: crate::ai::provider::AiStreamEvent| {
         if cancelled_ref.load(Ordering::Acquire) {
             return;
         }
-        if let crate::ai::provider::AiStreamEvent::Status(msg) = ev {
-            let _ = tx_clone.send(AgentHostEvent::Status {
-                message: msg,
-                step: None,
-                total_steps: None,
-            });
-        }
+        forward_agent_stream_event(
+            ev,
+            suppress_raw_delta,
+            &mut structured_chars,
+            &mut last_reported_chars,
+            &tx_clone,
+        );
     };
 
     match state.provider.send_agent_turn(req, &mut on_stream_event) {
@@ -1856,5 +1899,40 @@ mod tests {
         }];
         assert!(convert_wire_messages_to_turn_messages(&too_many_imgs, &scope, 512).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn stream_delta_forwards_plain_turns_and_suppresses_structured_schema_turns() {
+        let (tx, rx) = mpsc::channel();
+        let mut structured = 0_usize;
+        let mut reported = 0_usize;
+
+        // response_json_schema なし: StreamDelta をそのまま転送
+        forward_agent_stream_event(
+            crate::ai::provider::AiStreamEvent::DeltaText("作業中です".to_owned()),
+            false,
+            &mut structured,
+            &mut reported,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentHostEvent::StreamDelta { text }) if text == "作業中です"
+        ));
+
+        // response_json_schema あり: StreamDelta を抑止し 200 文字ごとに Status 通知
+        let chunk = "a".repeat(220);
+        forward_agent_stream_event(
+            crate::ai::provider::AiStreamEvent::DeltaText(chunk),
+            true,
+            &mut structured,
+            &mut reported,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentHostEvent::Status { message, .. }) if message.contains("220文字")
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

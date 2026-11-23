@@ -39,6 +39,22 @@ pub enum SessionStoreError {
     Json(#[from] serde_json::Error),
 }
 
+/// チャットターンに付与する完了・結果ステータスバッジ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiTurnBadge {
+    /// タイムラインへ適用済み。
+    Applied,
+    /// 編集案作成完了・承認待ち。
+    ProposalReady,
+    /// 完了（タイムラインへの変更なし）。
+    CompletedNoChange,
+    /// ユーザー操作により停止済み。
+    Cancelled,
+    /// エラーで終了。
+    Error,
+}
+
 /// 永続化されるチャットメッセージ 1 件分。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredChatTurn {
@@ -49,6 +65,9 @@ pub struct StoredChatTurn {
     /// UNIX エポック秒。
     #[serde(default)]
     pub timestamp_unix_secs: u64,
+    /// 完了・停止・エラー状態を示す任意バッジ（旧セッション JSON 互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_badge: Option<AiTurnBadge>,
 }
 
 /// セッション再開時にも再表示できる保留中 `ask_user` 質問カードのスナップショット。
@@ -585,6 +604,7 @@ mod tests {
                 role: AiRole::User,
                 text: "お願いします".to_owned(),
                 timestamp_unix_secs: 100,
+                status_badge: None,
             }],
             pending_question: None,
             agent_memory: json!({"analyzed_count": 12}),
@@ -672,6 +692,20 @@ mod tests {
         assert_eq!(usage.last_context_tokens, 1500);
         assert!(usage.has_known_cost);
         assert!((usage.cost_usd - 0.012).abs() < 1e-8);
+
+        // status_badge 欠落の旧ターン JSON も後方互換で読み込め、付与時は保持されること
+        let legacy_turn: StoredChatTurn =
+            serde_json::from_str(r#"{"role":"assistant","text":"完了","timestamp_unix_secs":10}"#)?;
+        assert_eq!(legacy_turn.status_badge, None);
+        let badged_turn = StoredChatTurn {
+            role: AiRole::Assistant,
+            text: "適用しました".to_owned(),
+            timestamp_unix_secs: 11,
+            status_badge: Some(AiTurnBadge::Applied),
+        };
+        let roundtrip: StoredChatTurn =
+            serde_json::from_str(&serde_json::to_string(&badged_turn)?)?;
+        assert_eq!(roundtrip.status_badge, Some(AiTurnBadge::Applied));
         Ok(())
     }
 }
