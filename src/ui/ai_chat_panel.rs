@@ -2062,8 +2062,8 @@ impl AppController {
             runner.cancel();
             self.ai_chat.agent_busy = false;
             self.ai_chat.agent_step_status = None;
-            self.ai_chat.clear_pending_agent_interactions();
             self.record_cancelled_preview();
+            self.ai_chat.clear_pending_agent_interactions();
             if was_busy {
                 self.ai_chat.execution_state = AiExecutionState::Cancelled;
                 "エージェント実行を停止しました".clone_into(&mut self.ai_chat.status_banner);
@@ -2074,8 +2074,8 @@ impl AppController {
             // 異常終了等で active_agent が既に失われた後に待機状態だけ残留した場合の安全解除
             self.ai_chat.agent_busy = false;
             self.ai_chat.agent_step_status = None;
-            self.ai_chat.clear_pending_agent_interactions();
             self.record_cancelled_preview();
+            self.ai_chat.clear_pending_agent_interactions();
             self.ai_chat.execution_state = AiExecutionState::Cancelled;
             "待機中のエージェント操作を解除しました".clone_into(&mut self.ai_chat.status_banner);
             "待機中のエージェント操作を解除しました".clone_into(&mut self.status_message);
@@ -4748,13 +4748,20 @@ mod tests {
             choices: Vec::new(),
             allow_skip: false,
         });
+        controller.ai_chat.streaming_preview = "途中の応答テキスト".to_owned();
         assert!(controller.ai_chat.can_cancel());
         assert!(controller.cancel_ai_prompt());
         assert!(!controller.ai_chat.can_cancel());
+        assert_eq!(controller.ai_chat.streaming_preview, "");
         assert_eq!(
             controller.ai_chat.execution_state,
             super::AiExecutionState::Cancelled
         );
+        let last_turn = controller.ai_chat.turns.last();
+        assert!(last_turn.is_some_and(|turn| {
+            turn.status_badge == Some(crate::ai::session_store::AiTurnBadge::Cancelled)
+                && turn.text.contains("途中の応答テキスト")
+        }));
     }
 
     #[test]
