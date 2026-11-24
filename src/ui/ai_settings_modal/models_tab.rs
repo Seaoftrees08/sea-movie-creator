@@ -2,10 +2,10 @@
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Context, IntoElement as _, ParentElement as _, Styled as _, div, px, rgba,
+    AnyElement, Context, Entity, IntoElement as _, ParentElement as _, Styled as _, div, px, rgba,
 };
 
 use crate::ai::provider::AiProviderKind;
@@ -30,6 +30,7 @@ pub(super) fn render_models_tab(
 
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_2p5()
         .child(render_provider_pills(kind, "ai-mdl-prov", cx))
         .child(body)
@@ -50,6 +51,7 @@ fn render_custom_models_panel(
 
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_2p5()
         .child(render_custom_model_add_form(modal, kind, cx))
         .child(list)
@@ -79,7 +81,7 @@ fn render_custom_model_row(
     } else {
         tr("ai.settings_use_model")
     };
-    let mut actions = h_flex().items_center().gap_1().child(
+    let mut actions = h_flex().flex_shrink_0().items_center().gap_1().child(
         Button::new(("ai-mdl-use", idx))
             .xsmall()
             .label(use_label)
@@ -143,6 +145,14 @@ fn render_custom_model_row(
         .into_any_element()
 }
 
+fn render_flex_input_cell(input: &Entity<InputState>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .child(Input::new(input).small())
+        .into_any_element()
+}
+
 fn render_custom_model_add_form(
     modal: &AiSettingsModalState,
     kind: &AiProviderKind,
@@ -164,6 +174,7 @@ fn render_custom_model_add_form(
 
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_1p5()
         .p_2p5()
         .rounded(px(6.0))
@@ -179,36 +190,20 @@ fn render_custom_model_add_form(
         )
         .child(
             h_flex()
+                .w_full()
+                .min_w(px(0.))
                 .gap_1p5()
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&modal.model_id_input).small()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&modal.model_name_input).small()),
-                ),
+                .child(render_flex_input_cell(&modal.model_id_input))
+                .child(render_flex_input_cell(&modal.model_name_input)),
         )
         .child(
             h_flex()
+                .w_full()
+                .min_w(px(0.))
                 .gap_1p5()
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&modal.model_context_input).small()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&modal.model_in_price_input).small()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&modal.model_out_price_input).small()),
-                ),
+                .child(render_flex_input_cell(&modal.model_context_input))
+                .child(render_flex_input_cell(&modal.model_in_price_input))
+                .child(render_flex_input_cell(&modal.model_out_price_input)),
         )
         .child(
             h_flex()
@@ -270,11 +265,13 @@ fn render_plugin_models_panel(
     } else {
         tr("ai.settings_rescan")
     };
-    let mut panel = v_flex().w_full().gap_2().child(
+    let mut panel = v_flex().w_full().min_w(px(0.)).gap_2().child(
         h_flex()
             .w_full()
+            .min_w(px(0.))
             .items_center()
             .justify_between()
+            .gap_2()
             .p_2()
             .rounded(px(6.0))
             .bg(rgba(0x0f17_2a99))
@@ -283,20 +280,23 @@ fn render_plugin_models_panel(
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
                     .text_xs()
                     .text_color(rgba(0xcbd5_e1ff))
                     .child(tr("ai.settings_cli_models_notice")),
             )
             .child(
-                Button::new("ai-mdl-rescan")
-                    .xsmall()
-                    .outline()
-                    .disabled(probing || plugin_id.is_empty())
-                    .label(rescan_label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.controller.ai_chat.probe_plugin_models_async(&probe_id);
-                        cx.notify();
-                    })),
+                div().flex_shrink_0().child(
+                    Button::new("ai-mdl-rescan")
+                        .xsmall()
+                        .outline()
+                        .disabled(probing || plugin_id.is_empty())
+                        .label(rescan_label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.controller.ai_chat.probe_plugin_models_async(&probe_id);
+                            cx.notify();
+                        })),
+                ),
             ),
     );
 
@@ -339,6 +339,7 @@ fn render_plugin_model_row(
     };
     h_flex()
         .w_full()
+        .min_w(px(0.))
         .items_center()
         .justify_between()
         .gap_2()
@@ -348,6 +349,8 @@ fn render_plugin_model_row(
         .bg(rgba(0x0f17_2a99))
         .child(
             v_flex()
+                .flex_1()
+                .min_w(px(0.))
                 .child(
                     div()
                         .text_xs()
@@ -362,24 +365,26 @@ fn render_plugin_model_row(
                 .child(div().text_xs().text_color(rgba(0x94a3_b8ff)).child(status)),
         )
         .child(
-            Button::new(("ai-cli-mdl-use", idx))
-                .xsmall()
-                .disabled(!model.available || is_active)
-                .label(use_label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let switched = this.controller.ai_chat.selected_provider != switch_kind;
-                    if switched {
-                        this.controller.ai_chat.select_provider(switch_kind.clone());
-                    }
-                    this.controller
-                        .ai_chat
-                        .select_model_default_medium(&model_id);
-                    if switched {
-                        this.controller.ai_chat.refresh_active_provider_side_data();
-                    }
-                    this.sync_widgets_from_controller(cx);
-                    cx.notify();
-                })),
+            div().flex_shrink_0().child(
+                Button::new(("ai-cli-mdl-use", idx))
+                    .xsmall()
+                    .disabled(!model.available || is_active)
+                    .label(use_label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let switched = this.controller.ai_chat.selected_provider != switch_kind;
+                        if switched {
+                            this.controller.ai_chat.select_provider(switch_kind.clone());
+                        }
+                        this.controller
+                            .ai_chat
+                            .select_model_default_medium(&model_id);
+                        if switched {
+                            this.controller.ai_chat.refresh_active_provider_side_data();
+                        }
+                        this.sync_widgets_from_controller(cx);
+                        cx.notify();
+                    })),
+            ),
         )
         .into_any_element()
 }
