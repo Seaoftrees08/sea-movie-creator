@@ -380,7 +380,8 @@ fn run_vision_analysis_batches(
         .collect();
 
     let total_pending = pending_indices.len();
-    let chunk_size = 6_usize;
+    // ホスト側の inspect_images_vision 上限（100 枚）単位で委譲し、コンタクトシート／バッチ分割はホスト側設定へ任せる
+    let chunk_size = 100_usize;
     for (chunk_idx, idx_chunk) in pending_indices.chunks(chunk_size).enumerate() {
         let done_count = (chunk_idx * chunk_size).min(total_pending);
         transport.status(
@@ -401,6 +402,11 @@ fn run_vision_analysis_batches(
             }),
         ) {
             Ok(res) => {
+                if let Some(warning) = res.get("warning").and_then(Value::as_str)
+                    && !warning.trim().is_empty()
+                {
+                    transport.status(warning, Some(2), Some(4));
+                }
                 apply_vision_results_to_memory(
                     &mut session.memory.analyzed_images,
                     idx_chunk,
@@ -1589,6 +1595,10 @@ fn build_followup_system_prompt(session: &DirectorSession) -> String {
          modify existing clips/subtitles via `apply_draft_edit_command`, or recompile the overall structure via `compile_movie_blueprint`.\n\
          CRITICAL: To modify the timeline, you MUST invoke `apply_draft_edit_command` or `compile_movie_blueprint` via tool calls. \
          Writing `EditCommand` or ```json blocks in plain text does NOT modify the timeline.\n\
+         When asked to verify/fix mismatches between photos and subtitles OR to fix sideways/rotated photos, \
+         you MUST call `audit_timeline_slides` FIRST to inspect the actual images and all overlapping subtitles (never guess from filenames alone).\n\
+         When `audit_timeline_slides` returns `recommended_rotation_deg` and `recommended_scale_x_param` / `recommended_scale_y_param`, \
+         apply `RotationDeg` together with `ScaleX` and `ScaleY` `SetParameter` updates in the same `EditCommand::Batch`.\n\
          When you need exact JSON parameter shapes for `SetParameter` (such as subtitle outline color/width or clip rotation), \
          call `get_capabilities` with `{{\"include_schemas\": true}}` to inspect the full `EditCommand` JSON Schema.\n\
          Keep exact target duration constraints when adjusting individual slides/endings.\n\
@@ -1971,5 +1981,18 @@ mod tests {
 
         let keep_other = "例:\n```json\n{\"type\":\"set_project_meta\",\"name\":\"Demo\"}\n```";
         assert_eq!(strip_empty_batch_json_blocks(keep_other), keep_other);
+    }
+
+    #[test]
+    fn followup_system_prompt_guides_audit_timeline_slides_and_batch_scale_update() {
+        let session = DirectorSession {
+            capabilities: Value::Null,
+            memory: DirectorMemory::default(),
+            timeline_summary: String::new(),
+        };
+        let prompt = build_followup_system_prompt(&session);
+        assert!(prompt.contains("audit_timeline_slides"));
+        assert!(prompt.contains("recommended_rotation_deg"));
+        assert!(prompt.contains("recommended_scale_x_param"));
     }
 }

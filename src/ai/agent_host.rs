@@ -646,7 +646,10 @@ impl AgentSessionRunner {
             stdin: Some(stdin),
             initial_msg: Some(initial_msg),
             tool_registry,
-            folder_scope: AllowedFolderScope::from_folders(&config.attached_folders),
+            folder_scope: rebuild_project_folder_scope(
+                &config.attached_folders,
+                &config.base_document,
+            ),
             attached_folders_raw: config.attached_folders,
             sandbox: DraftSandbox::new(config.base_document),
             agent_memory: config.agent_memory,
@@ -1115,6 +1118,35 @@ fn run_coordinator_loop(
     }
 }
 
+fn collect_project_asset_files(doc: &ProjectDocument) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for asset in &doc.assets {
+        if let Some(abs) = asset.path.absolute.as_deref()
+            && !abs.trim().is_empty()
+        {
+            let p = PathBuf::from(abs);
+            if p.is_file() {
+                files.push(p);
+                continue;
+            }
+        }
+        if let Some(rel) = asset.path.relative.as_deref()
+            && !rel.trim().is_empty()
+        {
+            let p = PathBuf::from(rel);
+            if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+    files
+}
+
+fn rebuild_project_folder_scope(folders: &[PathBuf], doc: &ProjectDocument) -> AllowedFolderScope {
+    let asset_files = collect_project_asset_files(doc);
+    AllowedFolderScope::from_folders_and_files(folders, asset_files)
+}
+
 fn handle_follow_up_msg(
     state: &mut CoordinatorState,
     prompt: String,
@@ -1130,8 +1162,10 @@ fn handle_follow_up_msg(
         let mut combined = state.attached_folders_raw.clone();
         combined.extend(attached_folders.iter().cloned());
         state.attached_folders_raw.clone_from(&combined);
-        state.folder_scope = AllowedFolderScope::from_folders(combined);
     }
+    // 追加編集時に添付フォルダが空でも、プロジェクト登録済みアセットを読み取れるよう毎回再構築する
+    state.folder_scope =
+        rebuild_project_folder_scope(&state.attached_folders_raw, state.sandbox.base_document());
     let folder_strings: Vec<String> = attached_folders
         .iter()
         .map(|p| p.display().to_string())
@@ -1934,5 +1968,41 @@ mod tests {
             Ok(AgentHostEvent::Status { message, .. }) if message.contains("220文字")
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rebuild_project_folder_scope_grants_registered_assets_without_attached_folders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::ids::AssetId;
+        use crate::timeline::document::{Asset, AssetKind, AssetPath, AssetStatus};
+
+        let base = std::env::temp_dir().join(format!(
+            "sea_agent_asset_scope_{}_{}",
+            std::process::id(),
+            crate::ai::session_store::AiSessionStore::generate_session_id()
+        ));
+        fs::create_dir_all(&base)?;
+        let _guard = TempDirGuard(base.clone());
+        let registered = base.join("registered.jpg");
+        let unregistered = base.join("sibling.jpg");
+        fs::write(&registered, b"jpg1")?;
+        fs::write(&unregistered, b"jpg2")?;
+
+        let mut doc = ProjectDocument::new("ScopeDoc");
+        doc.assets.push(Asset {
+            id: AssetId::new("a1")?,
+            name: "registered.jpg".to_owned(),
+            path: AssetPath::new(None, Some(registered.to_string_lossy().into_owned())),
+            kind: AssetKind::Image {
+                width: 100,
+                height: 100,
+            },
+            status: AssetStatus::Available,
+        });
+
+        let scope = rebuild_project_folder_scope(&[], &doc);
+        assert!(scope.validate_path(&registered).is_ok());
+        assert!(scope.validate_path(&unregistered).is_err());
+        Ok(())
     }
 }

@@ -617,6 +617,8 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
     let store = AiSessionStore::new(&store_dir);
     let mut controller = AppController::new();
     controller.ai_chat.session_store = Some(store.clone());
+    controller.ai_chat.runtime_settings.vision_packing_mode =
+        sea_movie_creator::ai::provider::VisionPackingMode::Individual;
     controller.ai_chat.runtime_settings.vision_batch_size = 4;
     controller.ai_chat.attach_folder_with_auto_agent(media_dir);
     let sid = controller.ai_chat.session_id.clone();
