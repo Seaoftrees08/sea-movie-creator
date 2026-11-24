@@ -4,11 +4,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use image::imageops::FilterType;
-use image::{ImageBuffer, ImageReader, Rgba};
+use image::metadata::Orientation;
+use image::{ImageBuffer, ImageDecoder as _, ImageReader, Rgba};
 
 use crate::core::ids::AssetId;
 
-use super::decoder::{MediaError, VideoFrameBuffer, decode_image_bytes, decode_image_file};
+use super::decoder::{
+    MediaError, VideoFrameBuffer, decode_image_bytes, decode_image_file,
+    orientation_swaps_dimensions,
+};
 use super::frame_cache::{FrameCache, FrameCacheKey};
 
 /// 静止画ファイルのメタ情報。
@@ -22,7 +26,7 @@ pub struct ImageInfo {
     pub format: String,
 }
 
-/// 画像ファイルを全画素デコードせずにヘッダから解像度と形式を取得する。
+/// 画像ファイルを全画素デコードせずにヘッダから EXIF 補正後の解像度と形式を取得する。
 ///
 /// # Errors
 ///
@@ -34,9 +38,16 @@ pub fn inspect_image_file(path: &Path) -> Result<ImageInfo, MediaError> {
     let format = reader
         .format()
         .map_or_else(|| "Unknown".to_owned(), |fmt| format!("{fmt:?}"));
-    let (width, height) = reader
-        .into_dimensions()
+    let mut decoder = reader
+        .into_decoder()
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    let (raw_width, raw_height) = decoder.dimensions();
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (width, height) = if orientation_swaps_dimensions(orientation) {
+        (raw_height, raw_width)
+    } else {
+        (raw_width, raw_height)
+    };
     Ok(ImageInfo {
         width,
         height,
@@ -226,6 +237,43 @@ mod tests {
         let f_webp = load_image_into_cache(&webp_path, &a_webp, None, &mut cache)?;
         assert_eq!((f_webp.width, f_webp.height), (80, 40));
         assert!(f_webp.data[3] > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_image_file_swaps_dimensions_for_exif_orientation_6()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestTempDir::new("exif_orient6")?;
+        let jpg_path = dir.path().join("rotated.jpg");
+        let base_jpeg = encode_test_image(24, 12, ImageFormat::Jpeg, 255)?;
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42_u16.to_le_bytes());
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&6_u16.to_le_bytes());
+        tiff.extend_from_slice(&0_u16.to_le_bytes());
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+
+        let mut app1 = Vec::new();
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        let seg_len = u16::try_from(app1.len() + 2).unwrap_or(0);
+
+        let mut oriented_jpeg = Vec::with_capacity(base_jpeg.len() + app1.len() + 4);
+        oriented_jpeg.extend_from_slice(&base_jpeg[..2]);
+        oriented_jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        oriented_jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        oriented_jpeg.extend_from_slice(&app1);
+        oriented_jpeg.extend_from_slice(&base_jpeg[2..]);
+        std::fs::write(&jpg_path, oriented_jpeg)?;
+
+        let info = inspect_image_file(&jpg_path)?;
+        assert_eq!((info.width, info.height), (12, 24));
         Ok(())
     }
 }

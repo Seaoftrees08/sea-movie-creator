@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use image::ImageReader;
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder as _, ImageReader, Limits};
 use thiserror::Error;
 
 use crate::core::color::RgbaColor;
@@ -434,35 +435,86 @@ pub trait AudioDecoderStream: Send {
     fn decode_all_interleaved(&mut self) -> Result<DecodedAudioPcm, MediaError>;
 }
 
-/// 静止画ファイルを読み込み、BGRA8 の `VideoFrameBuffer` に変換する。
+/// EXIF の向きが 90 度または 270 度回転（幅と高さの入れ替え）を伴うかどうかを返す。
+#[must_use]
+pub const fn orientation_swaps_dimensions(orientation: Orientation) -> bool {
+    matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+/// ファイルを EXIF Orientation に従って正立状態へデコードし `DynamicImage` として返す。
+///
+/// # Errors
+///
+/// ファイル読込、フォーマット判定、デコード制限超過、またはデコードに失敗した場合。
+pub fn decode_oriented_dynamic_image_file(
+    path: &Path,
+    limits: Option<Limits>,
+) -> Result<DynamicImage, MediaError> {
+    let mut reader = ImageReader::open(path)?
+        .with_guessed_format()
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    if let Some(lim) = limits {
+        reader.limits(lim);
+    }
+    decode_oriented_from_reader(reader)
+}
+
+/// メモリ上の画像バイト列を EXIF Orientation に従って正立状態へデコードし `DynamicImage` として返す。
+///
+/// # Errors
+///
+/// フォーマット判定またはデコードに失敗した場合。
+pub fn decode_oriented_dynamic_image_bytes(
+    bytes: &[u8],
+    limits: Option<Limits>,
+) -> Result<DynamicImage, MediaError> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = ImageReader::new(cursor)
+        .with_guessed_format()
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    if let Some(lim) = limits {
+        reader.limits(lim);
+    }
+    decode_oriented_from_reader(reader)
+}
+
+fn decode_oriented_from_reader<R: std::io::BufRead + std::io::Seek>(
+    reader: ImageReader<R>,
+) -> Result<DynamicImage, MediaError> {
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    // Orientation 取得は形式未対応の場合も NoTransforms として安全に続行する
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder)
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+/// 静止画ファイルを読み込み、EXIF 向きを正立補正した BGRA8 の `VideoFrameBuffer` に変換する。
 ///
 /// # Errors
 ///
 /// ファイル読み込みまたは画像デコードに失敗した場合。
 pub fn decode_image_file(path: &Path) -> Result<VideoFrameBuffer, MediaError> {
-    let reader = ImageReader::open(path)?;
-    let reader = reader
-        .with_guessed_format()
-        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
-    let image = reader
-        .decode()
-        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    let image = decode_oriented_dynamic_image_file(path, None)?;
     dynamic_image_to_bgra8(&image)
 }
 
-/// メモリ上の画像バイト列から静止画をデコードし、BGRA8 `VideoFrameBuffer` を返す。
+/// メモリ上の画像バイト列から静止画をデコードし、EXIF 向きを正立補正した BGRA8 `VideoFrameBuffer` を返す。
 ///
 /// # Errors
 ///
 /// フォーマット判定またはデコードに失敗した場合。
 pub fn decode_image_bytes(bytes: &[u8]) -> Result<VideoFrameBuffer, MediaError> {
-    let cursor = std::io::Cursor::new(bytes);
-    let reader = ImageReader::new(cursor)
-        .with_guessed_format()
-        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
-    let image = reader
-        .decode()
-        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    let image = decode_oriented_dynamic_image_bytes(bytes, None)?;
     dynamic_image_to_bgra8(&image)
 }
 
@@ -568,5 +620,55 @@ mod tests {
         let jump = step(&mut tracker, 3.5, &mut cursor, &mut seek_count);
         assert!(jump.is_some());
         assert_eq!(seek_count, 2);
+    }
+
+    fn build_exif_oriented_jpeg(width: u32, height: u32, orientation_tag: u16) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            // 上半分を赤、下半分を青にして正立時の回転向きを識別できるようにする
+            if y < height / 2 {
+                *px = image::Rgb([240, 20, 20]);
+            } else if x < width / 2 {
+                *px = image::Rgb([20, 20, 240]);
+            } else {
+                *px = image::Rgb([20, 220, 20]);
+            }
+        }
+        let mut base = std::io::Cursor::new(Vec::new());
+        let _ = image::DynamicImage::ImageRgb8(img).write_to(&mut base, image::ImageFormat::Jpeg);
+        let raw = base.into_inner();
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42_u16.to_le_bytes());
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&orientation_tag.to_le_bytes());
+        tiff.extend_from_slice(&0_u16.to_le_bytes());
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+
+        let mut app1 = Vec::new();
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        let seg_len = u16::try_from(app1.len() + 2).unwrap_or(0);
+
+        let mut out = Vec::with_capacity(raw.len() + app1.len() + 4);
+        out.extend_from_slice(&raw[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&raw[2..]);
+        out
+    }
+
+    #[test]
+    fn decode_image_bytes_applies_exif_orientation() -> Result<(), Box<dyn std::error::Error>> {
+        // 元の画素は横長 16x8、Orientation=6 (時計回り 90 度) で正立時は縦長 8x16 になる
+        let jpeg = build_exif_oriented_jpeg(16, 8, 6);
+        let frame = decode_image_bytes(&jpeg)?;
+        assert_eq!((frame.width, frame.height), (8, 16));
+        Ok(())
     }
 }

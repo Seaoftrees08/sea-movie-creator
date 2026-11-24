@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{ColorType, ImageEncoder as _, ImageReader, Limits, RgbImage};
+use image::{ColorType, DynamicImage, ImageEncoder as _, Limits, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ai::provider::encode_base64;
-use crate::media::decoder::{BackendPreference, open_audio_decoder, probe_media};
+use crate::media::decoder::{
+    BackendPreference, decode_oriented_dynamic_image_file, open_audio_decoder, probe_media,
+};
 use crate::media::image_loader::inspect_image_file;
 
 const MAX_SCAN_DEPTH: usize = 4;
@@ -40,10 +42,11 @@ pub enum MediaInspectorError {
     ImageFailed(String),
 }
 
-/// ユーザーがチャットへ添付／明示したフォルダ群のみへ読み取りを制限するアクセス境界。
+/// ユーザーがチャットへ添付／明示したフォルダ群、およびプロジェクト登録済みファイルのみへ読み取りを制限するアクセス境界。
 #[derive(Debug, Clone, Default)]
 pub struct AllowedFolderScope {
     roots: Vec<PathBuf>,
+    allowed_files: Vec<PathBuf>,
 }
 
 impl AllowedFolderScope {
@@ -54,6 +57,20 @@ impl AllowedFolderScope {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        Self::from_folders_and_files(folders, std::iter::empty::<PathBuf>())
+    }
+
+    /// 許可するルートディレクトリ群および個別許可ファイル群を正規化して構築する。
+    ///
+    /// `files` に登録された項目は同一ディレクトリ内の兄弟ファイルへ波及せず、完全一致のファイルのみ読み取りを許可する。
+    #[must_use]
+    pub fn from_folders_and_files<IF, PF, IFile, PFile>(folders: IF, files: IFile) -> Self
+    where
+        IF: IntoIterator<Item = PF>,
+        PF: AsRef<Path>,
+        IFile: IntoIterator<Item = PFile>,
+        PFile: AsRef<Path>,
+    {
         let mut roots = Vec::new();
         for folder in folders {
             if let Ok(canon) = fs::canonicalize(folder.as_ref())
@@ -63,7 +80,19 @@ impl AllowedFolderScope {
                 roots.push(canon);
             }
         }
-        Self { roots }
+        let mut allowed_files = Vec::new();
+        for file in files {
+            if let Ok(canon) = fs::canonicalize(file.as_ref())
+                && canon.is_file()
+                && !allowed_files.contains(&canon)
+            {
+                allowed_files.push(canon);
+            }
+        }
+        Self {
+            roots,
+            allowed_files,
+        }
     }
 
     /// 登録されている正規化済みルート一覧を返す。
@@ -72,15 +101,23 @@ impl AllowedFolderScope {
         &self.roots
     }
 
-    /// 対象パスが許可ルート配下に実在するか検証し、正規化済みパスを返す。
+    /// 登録されている正規化済み個別許可ファイル一覧を返す。
+    #[must_use]
+    pub fn allowed_files(&self) -> &[PathBuf] {
+        &self.allowed_files
+    }
+
+    /// 対象パスが許可ルート配下または個別許可ファイルに実在するか検証し、正規化済みパスを返す。
     ///
     /// # Errors
     ///
-    /// 対象が存在しない場合、または許可されたいずれのルート配下にも含まれない場合。
+    /// 対象が存在しない場合、または許可されたいずれのルート・ファイルにも含まれない場合。
     pub fn validate_path(&self, target: &Path) -> Result<PathBuf, MediaInspectorError> {
         let canon = fs::canonicalize(target)
             .map_err(|_| MediaInspectorError::NotFound(target.display().to_string()))?;
-        if self.roots.iter().any(|root| canon.starts_with(root)) {
+        if self.roots.iter().any(|root| canon.starts_with(root))
+            || self.allowed_files.iter().any(|file| file == &canon)
+        {
             return Ok(canon);
         }
         Err(MediaInspectorError::AccessDenied(
@@ -307,6 +344,79 @@ pub fn inspect_media_folder(
     })
 }
 
+/// Vision 用サムネイル生成時の縮小・回転・圧縮オプション。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailEncodeOptions {
+    /// 長辺の上限ピクセル数（`64..=2048` へクランプ）。
+    pub max_edge_px: u32,
+    /// JPEG エンコード品質（`40..=90` へクランプ、既定 `68`）。
+    pub jpeg_quality: u8,
+    /// EXIF 正立後に適用する追加直交回転（時計回り度：`0`, `90`, `180`, `270` 等）。
+    pub extra_rotation_deg: i32,
+}
+
+impl Default for ThumbnailEncodeOptions {
+    fn default() -> Self {
+        Self {
+            max_edge_px: 512,
+            jpeg_quality: 68,
+            extra_rotation_deg: 0,
+        }
+    }
+}
+
+/// コンタクトシート生成時のグリッド・品質設定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactSheetOptions {
+    /// 横列数 (`1..=4`)。
+    pub cols: u32,
+    /// 縦行数 (`1..=4`)。
+    pub rows: u32,
+    /// 各タイルの長辺上限ピクセル数 (`128..=1024`)。
+    pub tile_max_edge_px: u32,
+    /// JPEG エンコード品質 (`40..=90`)。
+    pub jpeg_quality: u8,
+}
+
+impl Default for ContactSheetOptions {
+    fn default() -> Self {
+        Self {
+            cols: 3,
+            rows: 2,
+            tile_max_edge_px: 320,
+            jpeg_quality: 68,
+        }
+    }
+}
+
+/// コンタクトシート内の 1 タイルに配置する画像入力指定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactSheetInput {
+    /// 画像ファイルパス（[`AllowedFolderScope`] 内であること）。
+    pub path: PathBuf,
+    /// 画像左上に描画する 1-based 番号バッジ（例: `1` -> `#1`）。
+    pub badge_index: usize,
+    /// EXIF 正立後に適用する事前直交回転角（時計回り度）。
+    pub extra_rotation_deg: i32,
+}
+
+/// 生成された番号バッジ付きコンタクトシートのエンコード結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedContactSheet {
+    /// シート全体の幅 (px)。
+    pub width: u32,
+    /// シート全体の高さ (px)。
+    pub height: u32,
+    /// MIME 種別（`"image/jpeg"`）。
+    pub mime_type: String,
+    /// Base64 エンコード済み JPEG データ。
+    pub base64_data: String,
+    /// 含まれるタイル枚数。
+    pub tile_count: usize,
+    /// 各タイルに対応する正規化済み実ファイルパス一覧。
+    pub paths: Vec<String>,
+}
+
 /// 指定画像ファイルを長辺 `max_edge_px` 以下へ縮小し、Vision 送信用 JPEG Base64 として生成する。
 ///
 /// # Errors
@@ -317,69 +427,293 @@ pub fn encode_thumbnail_jpeg_base64(
     image_path: &Path,
     max_edge_px: u32,
 ) -> Result<EncodedThumbnail, MediaInspectorError> {
+    encode_thumbnail_jpeg_base64_with_options(
+        scope,
+        image_path,
+        ThumbnailEncodeOptions {
+            max_edge_px,
+            ..ThumbnailEncodeOptions::default()
+        },
+    )
+}
+
+/// オプション（JPEG 品質・EXIF 正立後追加回転）を指定して Vision 用サムネイル JPEG Base64 を生成する。
+///
+/// # Errors
+///
+/// パスが許可境界外、画像読込失敗、または JPEG エンコード失敗時に [`MediaInspectorError`] を返す。
+pub fn encode_thumbnail_jpeg_base64_with_options(
+    scope: &AllowedFolderScope,
+    image_path: &Path,
+    options: ThumbnailEncodeOptions,
+) -> Result<EncodedThumbnail, MediaInspectorError> {
     let canon = scope.validate_path(image_path)?;
-    let clamped_edge = max_edge_px.clamp(64, 2048);
+    let clamped_edge = options.max_edge_px.clamp(64, 2048);
+    let quality = options.jpeg_quality.clamp(40, 90);
 
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_THUMB_DECODE_DIM);
-    limits.max_image_height = Some(MAX_THUMB_DECODE_DIM);
-    limits.max_alloc = Some(MAX_THUMB_DECODE_ALLOC_BYTES);
-
-    let mut reader = ImageReader::open(&canon)
-        .map_err(|err| MediaInspectorError::ImageFailed(err.to_string()))?
-        .with_guessed_format()
-        .map_err(|err| MediaInspectorError::ImageFailed(err.to_string()))?;
-    reader.limits(limits);
-
-    let decoded = reader
-        .decode()
-        .map_err(|err| MediaInspectorError::ImageFailed(format!("image decode failed: {err}")))?;
-    let resized = if decoded.width().max(decoded.height()) > clamped_edge {
-        decoded.thumbnail(clamped_edge, clamped_edge)
+    let rotated = decode_oriented_and_rotated(&canon, options.extra_rotation_deg)?;
+    let resized = if rotated.width().max(rotated.height()) > clamped_edge {
+        rotated.thumbnail(clamped_edge, clamped_edge)
     } else {
-        decoded
+        rotated
     };
 
     let width = resized.width();
     let height = resized.height();
-    let rgb_img = if resized.color().has_alpha() {
-        let rgba = resized.into_rgba8();
-        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-        for px in rgba.as_chunks::<4>().0 {
-            let a = u16::from(px[3]);
-            if a == 255 {
-                rgb.extend_from_slice(&px[..3]);
-            } else {
-                // 透過 PNG 等は白背景へ合成して JPEG 時の黒潰れを防止する
-                let inv = 255 - a;
-                let r = u8::try_from((u16::from(px[0]) * a + 255 * inv) / 255).unwrap_or(255);
-                let g = u8::try_from((u16::from(px[1]) * a + 255 * inv) / 255).unwrap_or(255);
-                let b = u8::try_from((u16::from(px[2]) * a + 255 * inv) / 255).unwrap_or(255);
-                rgb.push(r);
-                rgb.push(g);
-                rgb.push(b);
-            }
-        }
-        RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
-            MediaInspectorError::ImageFailed("failed to construct RGB image buffer".to_owned())
-        })?
-    } else {
-        resized.into_rgb8()
-    };
-
-    let mut jpeg_buf = Cursor::new(Vec::new());
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 78);
-    encoder
-        .write_image(rgb_img.as_raw(), width, height, ColorType::Rgb8.into())
-        .map_err(|err| MediaInspectorError::ImageFailed(format!("JPEG encode failed: {err}")))?;
+    let rgb_img = dynamic_image_to_rgb8_white_bg(resized)?;
+    let base64_data = encode_rgb_image_to_jpeg_base64(&rgb_img, quality)?;
 
     Ok(EncodedThumbnail {
         path: canon.to_string_lossy().into_owned(),
         width,
         height,
         mime_type: "image/jpeg".to_owned(),
-        base64_data: encode_base64(&jpeg_buf.into_inner()),
+        base64_data,
     })
+}
+
+/// 複数画像を番号バッジ付きコンタクトシート 1 枚へ合成し、JPEG Base64 で返す。
+///
+/// # Errors
+///
+/// 入力が空またはグリッド上限超過、パスが許可境界外、画像デコード／JPEG エンコード失敗時に [`MediaInspectorError`] を返す。
+pub fn build_contact_sheet_jpeg_base64(
+    scope: &AllowedFolderScope,
+    inputs: &[ContactSheetInput],
+    options: ContactSheetOptions,
+) -> Result<EncodedContactSheet, MediaInspectorError> {
+    if inputs.is_empty() {
+        return Err(MediaInspectorError::ImageFailed(
+            "contact sheet requires at least 1 input image".to_owned(),
+        ));
+    }
+    let cols = options.cols.clamp(1, 4);
+    let rows = options.rows.clamp(1, 4);
+    let capacity = usize::try_from(cols.saturating_mul(rows)).unwrap_or(16);
+    if inputs.len() > capacity {
+        return Err(MediaInspectorError::ImageFailed(format!(
+            "contact sheet tile count {} exceeds {cols}x{rows} capacity ({capacity})",
+            inputs.len()
+        )));
+    }
+    let tile_px = options.tile_max_edge_px.clamp(128, 1024);
+    let quality = options.jpeg_quality.clamp(40, 90);
+    let active_rows = u32::try_from(inputs.len().div_ceil(cols as usize)).unwrap_or(1);
+    let sheet_w = cols.saturating_mul(tile_px);
+    let sheet_h = active_rows.saturating_mul(tile_px);
+
+    let mut sheet = RgbImage::from_pixel(sheet_w, sheet_h, Rgb([24, 28, 36]));
+    let mut paths = Vec::with_capacity(inputs.len());
+
+    for (slot_idx, item) in inputs.iter().enumerate() {
+        let canon = scope.validate_path(&item.path)?;
+        let oriented = decode_oriented_and_rotated(&canon, item.extra_rotation_deg)?;
+        let thumb = if oriented.width().max(oriented.height()) > tile_px {
+            oriented.thumbnail(tile_px, tile_px)
+        } else {
+            oriented
+        };
+        let rgb_tile = dynamic_image_to_rgb8_white_bg(thumb)?;
+
+        let slot_u32 = u32::try_from(slot_idx).unwrap_or(0);
+        let tile_origin_x = (slot_u32 % cols).saturating_mul(tile_px);
+        let tile_origin_y = (slot_u32 / cols).saturating_mul(tile_px);
+        blit_centered_tile(&mut sheet, &rgb_tile, tile_origin_x, tile_origin_y, tile_px);
+
+        let label = format!("#{}", item.badge_index);
+        draw_badge_label(&mut sheet, tile_origin_x + 4, tile_origin_y + 4, &label);
+        paths.push(canon.to_string_lossy().into_owned());
+    }
+
+    let base64_data = encode_rgb_image_to_jpeg_base64(&sheet, quality)?;
+    Ok(EncodedContactSheet {
+        width: sheet_w,
+        height: sheet_h,
+        mime_type: "image/jpeg".to_owned(),
+        base64_data,
+        tile_count: paths.len(),
+        paths,
+    })
+}
+
+fn decode_oriented_and_rotated(
+    canon: &Path,
+    extra_rotation_deg: i32,
+) -> Result<DynamicImage, MediaInspectorError> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_THUMB_DECODE_DIM);
+    limits.max_image_height = Some(MAX_THUMB_DECODE_DIM);
+    limits.max_alloc = Some(MAX_THUMB_DECODE_ALLOC_BYTES);
+
+    let decoded = decode_oriented_dynamic_image_file(canon, Some(limits))
+        .map_err(|err| MediaInspectorError::ImageFailed(format!("image decode failed: {err}")))?;
+    Ok(apply_extra_orthogonal_rotation(decoded, extra_rotation_deg))
+}
+
+fn apply_extra_orthogonal_rotation(image: DynamicImage, deg: i32) -> DynamicImage {
+    let normalized = deg.rem_euclid(360);
+    match normalized {
+        90 => image.rotate90(),
+        180 => image.rotate180(),
+        270 => image.rotate270(),
+        _ => image,
+    }
+}
+
+fn dynamic_image_to_rgb8_white_bg(image: DynamicImage) -> Result<RgbImage, MediaInspectorError> {
+    let width = image.width();
+    let height = image.height();
+    if !image.color().has_alpha() {
+        return Ok(image.into_rgb8());
+    }
+    let rgba = image.into_rgba8();
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for px in rgba.as_chunks::<4>().0 {
+        let a = u16::from(px[3]);
+        if a == 255 {
+            rgb.extend_from_slice(&px[..3]);
+        } else {
+            // 透過 PNG 等は白背景へ合成して JPEG 時の黒潰れを防止する
+            let inv = 255 - a;
+            let r = u8::try_from((u16::from(px[0]) * a + 255 * inv) / 255).unwrap_or(255);
+            let g = u8::try_from((u16::from(px[1]) * a + 255 * inv) / 255).unwrap_or(255);
+            let b = u8::try_from((u16::from(px[2]) * a + 255 * inv) / 255).unwrap_or(255);
+            rgb.push(r);
+            rgb.push(g);
+            rgb.push(b);
+        }
+    }
+    RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
+        MediaInspectorError::ImageFailed("failed to construct RGB image buffer".to_owned())
+    })
+}
+
+fn encode_rgb_image_to_jpeg_base64(
+    rgb_img: &RgbImage,
+    quality: u8,
+) -> Result<String, MediaInspectorError> {
+    let mut jpeg_buf = Cursor::new(Vec::new());
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+    encoder
+        .write_image(
+            rgb_img.as_raw(),
+            rgb_img.width(),
+            rgb_img.height(),
+            ColorType::Rgb8.into(),
+        )
+        .map_err(|err| MediaInspectorError::ImageFailed(format!("JPEG encode failed: {err}")))?;
+    Ok(encode_base64(&jpeg_buf.into_inner()))
+}
+
+fn blit_centered_tile(
+    sheet: &mut RgbImage,
+    tile: &RgbImage,
+    origin_x: u32,
+    origin_y: u32,
+    cell_px: u32,
+) {
+    let pad_x = cell_px.saturating_sub(tile.width()) / 2;
+    let pad_y = cell_px.saturating_sub(tile.height()) / 2;
+    for y in 0..tile.height() {
+        for x in 0..tile.width() {
+            let dst_x = origin_x + pad_x + x;
+            let dst_y = origin_y + pad_y + y;
+            if dst_x < sheet.width() && dst_y < sheet.height() {
+                sheet.put_pixel(dst_x, dst_y, *tile.get_pixel(x, y));
+            }
+        }
+    }
+}
+
+fn draw_badge_label(sheet: &mut RgbImage, start_x: u32, start_y: u32, text: &str) {
+    let scale = 2_u32;
+    let char_w = 5 * scale;
+    let char_h = 7 * scale;
+    let spacing = 2_u32;
+    let pad = 4_u32;
+    let char_count = u32::try_from(text.chars().count()).unwrap_or(1).max(1);
+    let box_w = pad * 2 + char_count * char_w + (char_count.saturating_sub(1)) * spacing;
+    let box_h = pad * 2 + char_h;
+
+    for dy in 0..box_h {
+        for dx in 0..box_w {
+            let px_x = start_x + dx;
+            let px_y = start_y + dy;
+            if px_x < sheet.width() && px_y < sheet.height() {
+                let is_border = dx == 0 || dy == 0 || dx + 1 == box_w || dy + 1 == box_h;
+                let color = if is_border {
+                    Rgb([255, 255, 255])
+                } else {
+                    Rgb([15, 23, 42])
+                };
+                sheet.put_pixel(px_x, px_y, color);
+            }
+        }
+    }
+
+    for (idx, ch) in text.chars().enumerate() {
+        let idx_u32 = u32::try_from(idx).unwrap_or(0);
+        let glyph = bitmap_glyph_5x7(ch);
+        let gx = start_x + pad + idx_u32 * (char_w + spacing);
+        let gy = start_y + pad;
+        for (row_idx, &row_bits) in glyph.iter().enumerate() {
+            let row_u32 = u32::try_from(row_idx).unwrap_or(0);
+            for col in 0..5_u32 {
+                if (row_bits & (1 << (4 - col))) != 0 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px_x = gx + col * scale + sx;
+                            let px_y = gy + row_u32 * scale + sy;
+                            if px_x < sheet.width() && px_y < sheet.height() {
+                                sheet.put_pixel(px_x, px_y, Rgb([250, 204, 21]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+const fn bitmap_glyph_5x7(ch: char) -> [u8; 7] {
+    match ch {
+        '#' => [
+            0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        _ => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+    }
 }
 
 enum FileMediaClass {
@@ -895,5 +1229,87 @@ mod tests {
         crafted.extend_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(parse_exif_datetime_from_jpeg_bytes(&crafted), None);
         assert_eq!(Endian::Little.read_u32(&[1, 2, 3, 4], usize::MAX - 1), None);
+    }
+
+    #[test]
+    fn allowed_files_scope_allows_exact_match_and_denies_siblings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::new("file_scope")?;
+        let dir = guard.0.join("photos");
+        fs::create_dir_all(&dir)?;
+        let allowed_img = dir.join("registered.jpg");
+        let sibling_img = dir.join("secret_sibling.jpg");
+        write_sample_image(&allowed_img, 120, 80, ImageFormat::Jpeg)?;
+        write_sample_image(&sibling_img, 120, 80, ImageFormat::Jpeg)?;
+
+        let scope = AllowedFolderScope::from_folders_and_files(
+            std::iter::empty::<PathBuf>(),
+            [&allowed_img],
+        );
+        assert!(scope.validate_path(&allowed_img).is_ok());
+        assert!(matches!(
+            scope.validate_path(&sibling_img),
+            Err(MediaInspectorError::AccessDenied(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn contact_sheet_and_extra_rotation_produce_compact_valid_jpegs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::new("contact_sheet")?;
+        let dir = guard.0.join("sheet");
+        fs::create_dir_all(&dir)?;
+        let p1 = dir.join("a.png");
+        let p2 = dir.join("b.png");
+        let p3 = dir.join("c.png");
+        write_sample_image(&p1, 640, 360, ImageFormat::Png)?;
+        write_sample_image(&p2, 360, 640, ImageFormat::Png)?;
+        write_sample_image(&p3, 500, 500, ImageFormat::Png)?;
+
+        let scope = AllowedFolderScope::from_folders([&dir]);
+        let thumb = encode_thumbnail_jpeg_base64_with_options(
+            &scope,
+            &p1,
+            ThumbnailEncodeOptions {
+                max_edge_px: 320,
+                jpeg_quality: 68,
+                extra_rotation_deg: 90,
+            },
+        )?;
+        assert_eq!((thumb.width, thumb.height), (180, 320));
+
+        let sheet = build_contact_sheet_jpeg_base64(
+            &scope,
+            &[
+                ContactSheetInput {
+                    path: p1,
+                    badge_index: 1,
+                    extra_rotation_deg: 0,
+                },
+                ContactSheetInput {
+                    path: p2,
+                    badge_index: 2,
+                    extra_rotation_deg: 0,
+                },
+                ContactSheetInput {
+                    path: p3,
+                    badge_index: 3,
+                    extra_rotation_deg: 0,
+                },
+            ],
+            ContactSheetOptions {
+                cols: 3,
+                rows: 2,
+                tile_max_edge_px: 256,
+                jpeg_quality: 68,
+            },
+        )?;
+        assert_eq!(sheet.width, 256 * 3);
+        assert_eq!(sheet.height, 256);
+        assert_eq!(sheet.tile_count, 3);
+        assert_eq!(sheet.mime_type, "image/jpeg");
+        assert_ne!(sheet.base64_data, "");
+        Ok(())
     }
 }
