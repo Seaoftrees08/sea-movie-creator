@@ -409,7 +409,9 @@ fn openai_turn_message_to_json(msg: &AiTurnMessage, native_tools: bool) -> Value
                 .collect();
             json!({ "role": "user", "content": content })
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text, tool_calls, ..
+        } => {
             if tool_calls.is_empty() || !native_tools {
                 let fallback = if tool_calls.is_empty() {
                     text.clone().unwrap_or_default()
@@ -490,6 +492,7 @@ fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
                     id,
                     name: name.to_owned(),
                     arguments: args,
+                    thought_signature: None,
                 });
             }
         }
@@ -497,6 +500,7 @@ fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
 
     Ok(AiAgentTurnResponse {
         text,
+        thinking_blocks: Vec::new(),
         tool_calls,
         model: model.to_owned(),
         finish_reason: choice["finish_reason"].as_str().map(ToOwned::to_owned),

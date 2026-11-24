@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(test)]
-use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
+use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_event,
     format_conversation_history_section, is_empty_json_value,
 };
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,16 @@ pub enum AiPluginHostEvent {
     Status {
         /// 表示用状態メッセージ。
         message: String,
+    },
+    /// 思考過程テキストチャンク。
+    Thought {
+        /// 追記思考テキスト。
+        text: String,
+    },
+    /// 作業アクティビティラベル。
+    Activity {
+        /// 表示ラベル。
+        label: String,
     },
     /// 部分生成テキストチャンク。
     Delta {
@@ -680,6 +690,9 @@ impl AiPluginProvider {
             .to_owned();
 
         let prompt_body = build_direct_acp_prompt_body(request);
+        on_event(AiStreamEvent::Status(
+            "プロンプトを送信して応答待機中...".to_owned(),
+        ));
         send_acp_jsonrpc_line(
             &mut stdin,
             &json!({
@@ -741,6 +754,30 @@ struct SeaAiV1EventsOutput {
     discovered_models: Vec<DiscoveredAiModel>,
 }
 
+fn parse_sea_ai_v1_event_line(
+    plugin_id: &str,
+    trimmed: &str,
+) -> Result<Option<AiPluginHostEvent>, AiError> {
+    let raw_val: Value = serde_json::from_str(trimmed).map_err(|err| {
+        AiError::ParseFailed(format!(
+            "AI plugin `{plugin_id}` emitted invalid NDJSON: {err} (line: {trimmed})"
+        ))
+    })?;
+    let kind = raw_val["event"].as_str().unwrap_or("").to_owned();
+    if !matches!(
+        kind.as_str(),
+        "status" | "thought" | "activity" | "delta" | "models" | "completed" | "error"
+    ) {
+        return Ok(None);
+    }
+    let event: AiPluginHostEvent = serde_json::from_value(raw_val).map_err(|err| {
+        AiError::ParseFailed(format!(
+            "AI plugin `{plugin_id}` emitted malformed `{kind}` event: {err} (line: {trimmed})"
+        ))
+    })?;
+    Ok(Some(event))
+}
+
 fn read_sea_ai_v1_events(
     plugin_id: &str,
     stdout: std::process::ChildStdout,
@@ -758,14 +795,18 @@ fn read_sea_ai_v1_events(
         if trimmed.is_empty() {
             continue;
         }
-        let event: AiPluginHostEvent = serde_json::from_str(trimmed).map_err(|err| {
-            AiError::ParseFailed(format!(
-                "AI plugin `{plugin_id}` emitted invalid NDJSON: {err} (line: {trimmed})"
-            ))
-        })?;
+        let Some(event) = parse_sea_ai_v1_event_line(plugin_id, trimmed)? else {
+            continue;
+        };
         match event {
             AiPluginHostEvent::Status { message } => {
                 on_event(AiStreamEvent::Status(message));
+            }
+            AiPluginHostEvent::Thought { text } => {
+                on_event(AiStreamEvent::ThoughtDelta(text));
+            }
+            AiPluginHostEvent::Activity { label } => {
+                on_event(AiStreamEvent::ActivityHint(label));
             }
             AiPluginHostEvent::Delta { text } => {
                 streamed_text.push_str(&text);
@@ -810,6 +851,13 @@ struct AcpCollectedResult {
     collected_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectAcpPhase {
+    Waiting,
+    Thinking,
+    Responding,
+}
+
 fn send_acp_jsonrpc_line(stdin: &mut std::process::ChildStdin, msg: &Value) -> Result<(), AiError> {
     let encoded = serde_json::to_string(msg)
         .map_err(|err| AiError::ParseFailed(format!("ACP encode error: {err}")))?;
@@ -833,6 +881,7 @@ fn read_acp_until_id_collecting<R: BufRead>(
 ) -> Result<AcpCollectedResult, AiError> {
     let mut line = String::new();
     let mut collected = String::new();
+    let mut phase = DirectAcpPhase::Waiting;
     loop {
         line.clear();
         let n = reader.read_line(&mut line)?;
@@ -848,10 +897,32 @@ fn read_acp_until_id_collecting<R: BufRead>(
         let msg: Value = serde_json::from_str(trimmed)
             .map_err(|err| AiError::ParseFailed(format!("ACP JSON parse error: {err}")))?;
         if msg["method"].as_str() == Some("session/update")
-            && let Some(delta) = extract_acp_update_delta(&msg["params"])
+            && let Some(ev) = extract_acp_update_event(&msg["params"])
         {
-            collected.push_str(&delta);
-            on_event(AiStreamEvent::DeltaText(delta));
+            match ev {
+                AcpSessionUpdateEvent::ThoughtDelta(thought) => {
+                    if phase != DirectAcpPhase::Thinking {
+                        phase = DirectAcpPhase::Thinking;
+                        on_event(AiStreamEvent::Status("思考中...".to_owned()));
+                    }
+                    on_event(AiStreamEvent::ThoughtDelta(thought));
+                }
+                AcpSessionUpdateEvent::MessageDelta(delta) => {
+                    if phase != DirectAcpPhase::Responding {
+                        phase = DirectAcpPhase::Responding;
+                        on_event(AiStreamEvent::Status("応答を生成中...".to_owned()));
+                    }
+                    collected.push_str(&delta);
+                    on_event(AiStreamEvent::DeltaText(delta));
+                }
+                AcpSessionUpdateEvent::ToolActivity { title, status } => {
+                    let label = match status.as_deref() {
+                        Some(st) => format!("{title} ({st})"),
+                        None => title,
+                    };
+                    on_event(AiStreamEvent::ActivityHint(label));
+                }
+            }
             continue;
         }
         if msg["id"].as_u64() == Some(expected_id) {
@@ -866,6 +937,7 @@ fn read_acp_until_id_collecting<R: BufRead>(
     }
 }
 
+#[cfg(test)]
 fn extract_acp_update_delta(params: &Value) -> Option<String> {
     extract_acp_update_message_delta(params)
 }
@@ -1133,5 +1205,25 @@ mod tests {
             extract_acp_update_delta(&msg).as_deref(),
             Some("字幕を更新しました")
         );
+    }
+
+    #[test]
+    fn sea_ai_v1_two_stage_parser_handles_thought_activity_and_skips_unknown_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(parse_sea_ai_v1_event_line("p", r#"{"event":"future_unknown","x":1}"#)?.is_none());
+
+        let thought = parse_sea_ai_v1_event_line("p", r#"{"event":"thought","text":"分析中"}"#)?;
+        assert!(matches!(
+            thought,
+            Some(AiPluginHostEvent::Thought { text }) if text == "分析中"
+        ));
+
+        let activity =
+            parse_sea_ai_v1_event_line("p", r#"{"event":"activity","label":"Inspecting"}"#)?;
+        assert!(matches!(
+            activity,
+            Some(AiPluginHostEvent::Activity { label }) if label == "Inspecting"
+        ));
+        Ok(())
     }
 }

@@ -20,8 +20,10 @@ fn apply_background_process_flags(cmd: &mut Command) {
 
 #[cfg(test)]
 use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
+#[cfg(test)]
+use sea_ai_protocol::extract_acp_update_message_delta;
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_event,
     format_conversation_history_section, is_empty_json_value,
 };
 use serde::Deserialize;
@@ -168,11 +170,62 @@ fn build_acp_prompt_text(params: &CallParams) -> String {
     sections.join("\n\n")
 }
 
+#[cfg(test)]
 fn extract_acp_update_text(msg: &Value) -> Option<String> {
     if msg["method"].as_str() != Some("session/update") {
         return None;
     }
     extract_acp_update_message_delta(&msg["params"])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpStreamPhase {
+    Waiting,
+    Thinking,
+    Responding,
+}
+
+fn format_acp_activity_label(title: &str, status: Option<&str>) -> String {
+    match status {
+        Some(st) => format!("{title} ({st})"),
+        None => title.to_owned(),
+    }
+}
+
+fn process_acp_update_msg(
+    msg: &Value,
+    phase: &mut AcpStreamPhase,
+    streamed: &mut String,
+    emit: &mut dyn FnMut(Value),
+) -> bool {
+    if msg["method"].as_str() != Some("session/update") {
+        return false;
+    }
+    match extract_acp_update_event(&msg["params"]) {
+        Some(AcpSessionUpdateEvent::ThoughtDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Thinking {
+                *phase = AcpStreamPhase::Thinking;
+                emit(json!({ "event": "status", "message": "思考中..." }));
+            }
+            emit(json!({ "event": "thought", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::MessageDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Responding {
+                *phase = AcpStreamPhase::Responding;
+                emit(json!({ "event": "status", "message": "応答を生成中..." }));
+            }
+            streamed.push_str(&chunk);
+            emit(json!({ "event": "delta", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::ToolActivity { title, status }) => {
+            let label = format_acp_activity_label(&title, status.as_deref());
+            emit(json!({ "event": "activity", "label": label }));
+            true
+        }
+        None => false,
+    }
 }
 
 fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), String> {
@@ -189,6 +242,7 @@ fn read_until_response<R: BufRead>(
     streamed: &mut String,
 ) -> Result<Value, String> {
     let mut line = String::new();
+    let mut phase = AcpStreamPhase::Waiting;
     loop {
         line.clear();
         let read = reader
@@ -206,9 +260,7 @@ fn read_until_response<R: BufRead>(
         let msg: Value = serde_json::from_str(trimmed)
             .map_err(|err| format!("ACP JSON 解析エラー: {err} (line: {trimmed})"))?;
 
-        if let Some(chunk) = extract_acp_update_text(&msg) {
-            streamed.push_str(&chunk);
-            emit_event(&json!({ "event": "delta", "text": chunk }));
+        if process_acp_update_msg(&msg, &mut phase, streamed, &mut |ev| emit_event(&ev)) {
             continue;
         }
 
@@ -359,6 +411,10 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
         .to_owned();
 
     let prompt_text = build_acp_prompt_text(params);
+    emit_event(&json!({
+        "event": "status",
+        "message": "プロンプトを送信して応答待機中...",
+    }));
     write_jsonrpc_line(
         &mut child_stdin,
         &json!({
@@ -566,5 +622,91 @@ mod tests {
         );
         assert!(section.len() <= MAX_HISTORY_PROMPT_BYTES);
         assert!(section.contains("ピン留め指示"));
+    }
+
+    #[test]
+    fn process_acp_update_msg_transitions_phases_and_separates_events() {
+        let mut phase = AcpStreamPhase::Waiting;
+        let mut streamed = String::new();
+        let mut events = Vec::new();
+
+        let thought_msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "字幕を確認中" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &thought_msg,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(phase, AcpStreamPhase::Thinking);
+
+        let tool_msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Inspecting clips",
+                    "status": "in_progress"
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &tool_msg,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+
+        let delta_msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "完了しました。" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &delta_msg,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(phase, AcpStreamPhase::Responding);
+        assert_eq!(streamed, "完了しました。");
+
+        assert_eq!(
+            events[0],
+            json!({ "event": "status", "message": "思考中..." })
+        );
+        assert_eq!(
+            events[1],
+            json!({ "event": "thought", "text": "字幕を確認中" })
+        );
+        assert_eq!(
+            events[2],
+            json!({ "event": "activity", "label": "Inspecting clips (in_progress)" })
+        );
+        assert_eq!(
+            events[3],
+            json!({ "event": "status", "message": "応答を生成中..." })
+        );
+        assert_eq!(
+            events[4],
+            json!({ "event": "delta", "text": "完了しました。" })
+        );
     }
 }

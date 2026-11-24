@@ -22,12 +22,12 @@ fn apply_background_process_flags(cmd: &mut Command) {
 }
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(test)]
-use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
+    AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_event,
     format_conversation_history_section, is_empty_json_value,
 };
+#[cfg(test)]
+use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -270,11 +270,62 @@ fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) 
     })
 }
 
+#[cfg(test)]
 fn extract_acp_message_delta(msg: &Value) -> Option<String> {
     if msg["method"].as_str() != Some("session/update") {
         return None;
     }
     extract_acp_update_message_delta(&msg["params"])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpStreamPhase {
+    Waiting,
+    Thinking,
+    Responding,
+}
+
+fn format_acp_activity_label(title: &str, status: Option<&str>) -> String {
+    match status {
+        Some(st) => format!("{title} ({st})"),
+        None => title.to_owned(),
+    }
+}
+
+fn process_acp_update_msg(
+    msg: &Value,
+    phase: &mut AcpStreamPhase,
+    streamed: &mut String,
+    emit: &mut dyn FnMut(Value),
+) -> bool {
+    if msg["method"].as_str() != Some("session/update") {
+        return false;
+    }
+    match extract_acp_update_event(&msg["params"]) {
+        Some(AcpSessionUpdateEvent::ThoughtDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Thinking {
+                *phase = AcpStreamPhase::Thinking;
+                emit(json!({ "event": "status", "message": "思考中..." }));
+            }
+            emit(json!({ "event": "thought", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::MessageDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Responding {
+                *phase = AcpStreamPhase::Responding;
+                emit(json!({ "event": "status", "message": "応答を生成中..." }));
+            }
+            streamed.push_str(&chunk);
+            emit(json!({ "event": "delta", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::ToolActivity { title, status }) => {
+            let label = format_acp_activity_label(&title, status.as_deref());
+            emit(json!({ "event": "activity", "label": label }));
+            true
+        }
+        None => false,
+    }
 }
 
 fn build_permission_deny_response(id: &Value, params: &Value) -> Value {
@@ -350,6 +401,7 @@ fn read_acp_until_response<R: BufRead>(
     streamed: &mut String,
 ) -> Result<Value, String> {
     let mut line = String::new();
+    let mut phase = AcpStreamPhase::Waiting;
     loop {
         line.clear();
         let read = reader
@@ -370,9 +422,7 @@ fn read_acp_until_response<R: BufRead>(
         if handle_server_request(stdin, &msg)? {
             continue;
         }
-        if let Some(chunk) = extract_acp_message_delta(&msg) {
-            streamed.push_str(&chunk);
-            emit_event(&json!({ "event": "delta", "text": chunk }));
+        if process_acp_update_msg(&msg, &mut phase, streamed, &mut |ev| emit_event(&ev)) {
             continue;
         }
         if msg["id"].as_u64() == Some(expected_id) {
@@ -593,6 +643,10 @@ fn execute_acp_conversation(
         next_id += 1;
     }
 
+    emit_event(&json!({
+        "event": "status",
+        "message": "プロンプトを送信して応答待機中...",
+    }));
     write_jsonrpc_line(
         stdin,
         &build_session_prompt_request(next_id, &session_id, params),
@@ -1041,5 +1095,66 @@ mod tests {
         assert!(normal_section.contains("直近の依頼"));
         assert!(normal_section.contains("...(earlier messages omitted)..."));
         assert!(!normal_section.contains("古い指示"));
+    }
+
+    #[test]
+    fn process_acp_update_msg_transitions_phases_without_leaking_thoughts_to_stream() {
+        let mut phase = AcpStreamPhase::Waiting;
+        let mut streamed = String::new();
+        let mut events = Vec::new();
+
+        let thought = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "内部思考テキスト" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &thought,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(streamed, "");
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "{\"type\":\"undo\"}" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &msg,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(streamed, "{\"type\":\"undo\"}");
+        assert_eq!(
+            events[0],
+            json!({ "event": "status", "message": "思考中..." })
+        );
+        assert_eq!(
+            events[1],
+            json!({ "event": "thought", "text": "内部思考テキスト" })
+        );
+        assert_eq!(
+            events[2],
+            json!({ "event": "status", "message": "応答を生成中..." })
+        );
+        assert_eq!(
+            events[3],
+            json!({ "event": "delta", "text": "{\"type\":\"undo\"}" })
+        );
     }
 }

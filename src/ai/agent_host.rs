@@ -1408,7 +1408,15 @@ fn forward_agent_stream_event(
                 let _ = tx.send(AgentHostEvent::StreamDelta { text: delta });
             }
         }
-        crate::ai::provider::AiStreamEvent::Completed(_)
+        crate::ai::provider::AiStreamEvent::ActivityHint(label) => {
+            let _ = tx.send(AgentHostEvent::Status {
+                message: label,
+                step: None,
+                total_steps: None,
+            });
+        }
+        crate::ai::provider::AiStreamEvent::ThoughtDelta(_)
+        | crate::ai::provider::AiStreamEvent::Completed(_)
         | crate::ai::provider::AiStreamEvent::Failed(_) => {}
     }
 }
@@ -1455,12 +1463,22 @@ fn send_agent_llm_turn_and_reply(
                     id: c.id,
                     name: c.name,
                     arguments: c.arguments,
+                    thought_signature: c.thought_signature,
+                })
+                .collect();
+            let thinking_blocks = resp
+                .thinking_blocks
+                .into_iter()
+                .map(|b| sea_agent_protocol::AgentThinkingBlock {
+                    thinking: b.thinking,
+                    signature: b.signature,
                 })
                 .collect();
             let _ = state.send_to_child(&HostToAgentMessage::LlmResponse {
                 request_id,
                 ok: true,
                 text: resp.text.unwrap_or_default(),
+                thinking_blocks,
                 tool_calls,
                 finish_reason: resp.finish_reason,
                 error: None,
@@ -1492,6 +1510,7 @@ fn send_llm_error(state: &mut CoordinatorState, request_id: String, error: Strin
         request_id,
         ok: false,
         text: String::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         finish_reason: None,
         error: Some(error),
@@ -1520,6 +1539,14 @@ fn convert_wire_messages_to_turn_messages(
                 }
                 AiTurnMessage::Assistant {
                     text: (!msg.text.is_empty()).then(|| msg.text.clone()),
+                    thinking_blocks: msg
+                        .thinking_blocks
+                        .iter()
+                        .map(|b| crate::ai::provider::AiThinkingBlock {
+                            thinking: b.thinking.clone(),
+                            signature: b.signature.clone(),
+                        })
+                        .collect(),
                     tool_calls: msg
                         .tool_calls
                         .iter()
@@ -1527,6 +1554,7 @@ fn convert_wire_messages_to_turn_messages(
                             id: c.id.clone(),
                             name: c.name.clone(),
                             arguments: c.arguments.clone(),
+                            thought_signature: c.thought_signature.clone(),
                         })
                         .collect(),
                 }
@@ -1866,10 +1894,12 @@ mod tests {
                 role: "assistant".to_owned(),
                 text: String::new(),
                 image_paths: Vec::new(),
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AgentLlmToolCall {
                     id: "call_abc".to_owned(),
                     name: "inspect_media_folder".to_owned(),
                     arguments: json!({"path":"C:/w"}),
+                    thought_signature: None,
                 }],
                 tool_call_id: None,
             },
@@ -1877,6 +1907,7 @@ mod tests {
                 role: "tool".to_owned(),
                 text: "{\"ok\":true}".to_owned(),
                 image_paths: Vec::new(),
+                thinking_blocks: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_abc".to_owned()),
             },
@@ -1894,6 +1925,7 @@ mod tests {
             image_paths: (0..=MAX_CHAT_IMAGE_PATHS)
                 .map(|i| format!("img_{i}.png"))
                 .collect(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }];

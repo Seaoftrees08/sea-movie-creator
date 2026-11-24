@@ -309,7 +309,9 @@ fn anthropic_turn_message_to_blocks(msg: &AiTurnMessage) -> (&'static str, Vec<V
                 .collect();
             ("user", content)
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text, tool_calls, ..
+        } => {
             let mut content = Vec::new();
             if let Some(txt) = text
                 && !txt.is_empty()
@@ -368,6 +370,7 @@ fn parse_anthropic_agent_response(
                         id,
                         name: name.to_owned(),
                         arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                        thought_signature: None,
                     });
                 }
             }
@@ -376,6 +379,7 @@ fn parse_anthropic_agent_response(
     }
     Ok(AiAgentTurnResponse {
         text: (!text_buf.is_empty()).then_some(text_buf),
+        thinking_blocks: Vec::new(),
         tool_calls,
         model: model.to_owned(),
         finish_reason: val["stop_reason"].as_str().map(ToOwned::to_owned),
@@ -591,6 +595,7 @@ mod tests {
             messages: vec![
                 AiTurnMessage::Assistant {
                     text: None,
+                    thinking_blocks: Vec::new(),
                     tool_calls: Vec::new(),
                 },
                 AiTurnMessage::ToolResult {

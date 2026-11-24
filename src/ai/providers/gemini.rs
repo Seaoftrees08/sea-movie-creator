@@ -312,7 +312,9 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
                 .collect();
             ("user", gem_parts)
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text, tool_calls, ..
+        } => {
             let mut gem_parts = Vec::new();
             if let Some(txt) = text
                 && !txt.is_empty()
@@ -320,12 +322,16 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
                 gem_parts.push(json!({ "text": txt }));
             }
             for call in tool_calls {
-                gem_parts.push(json!({
+                let mut part = json!({
                     "functionCall": {
                         "name": call.name,
                         "args": call.arguments,
                     }
-                }));
+                });
+                if let Some(sig) = &call.thought_signature {
+                    part["thoughtSignature"] = json!(sig);
+                }
+                gem_parts.push(part);
             }
             if gem_parts.is_empty() {
                 gem_parts.push(json!({ "text": "" }));
@@ -377,11 +383,13 @@ fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
                 id: format!("gem_call_{idx}"),
                 name: name.to_owned(),
                 arguments: fc.get("args").cloned().unwrap_or_else(|| json!({})),
+                thought_signature: part["thoughtSignature"].as_str().map(ToOwned::to_owned),
             });
         }
     }
     Ok(AiAgentTurnResponse {
         text: (!text_buf.is_empty()).then_some(text_buf),
+        thinking_blocks: Vec::new(),
         tool_calls,
         model: model.to_owned(),
         finish_reason: candidate["finishReason"].as_str().map(ToOwned::to_owned),

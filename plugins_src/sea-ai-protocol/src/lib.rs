@@ -32,22 +32,74 @@ pub fn is_empty_json_value(val: &Value) -> bool {
     val.is_null() || val.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
-/// ACP `session/update` の `params` から `agent_message_chunk` テキストのみを抽出する。
-///
-/// `agent_thought_chunk` や `tool_call` 等は混入防止のため `None` を返す。
-#[must_use]
-pub fn extract_acp_update_message_delta(params: &Value) -> Option<String> {
-    let update = params.get("update").unwrap_or(params);
-    if let Some(kind) = update["sessionUpdate"].as_str()
-        && kind != "agent_message_chunk"
-    {
-        return None;
-    }
+/// ACP `session/update` から抽出した構造化イベント。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpSessionUpdateEvent {
+    /// 本文チャンク（`agent_message_chunk` または種別省略時）。
+    MessageDelta(String),
+    /// 思考過程チャンク（`agent_thought_chunk`）。
+    ThoughtDelta(String),
+    /// 外部ツール実行状況（`tool_call` / `tool_call_update`）。
+    ToolActivity {
+        /// 表示用タイトル・コマンド概要。
+        title: String,
+        /// 状態（例: `"pending"`, `"in_progress"`, `"completed"`, `"failed"`）。
+        status: Option<String>,
+    },
+}
+
+fn extract_update_text(update: &Value) -> Option<String> {
     update["content"]["text"]
         .as_str()
         .or_else(|| update["text"].as_str())
         .or_else(|| update["delta"].as_str())
         .map(ToOwned::to_owned)
+}
+
+fn extract_tool_activity_title(update: &Value) -> Option<String> {
+    update["title"]
+        .as_str()
+        .or_else(|| update["content"]["text"].as_str())
+        .or_else(|| update["kind"].as_str())
+        .or_else(|| update["toolCallId"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// ACP `session/update` の `params` を本文・思考・ツール活動へ分類して抽出する。
+#[must_use]
+pub fn extract_acp_update_event(params: &Value) -> Option<AcpSessionUpdateEvent> {
+    let update = params.get("update").unwrap_or(params);
+    match update["sessionUpdate"].as_str() {
+        Some("agent_thought_chunk") => extract_update_text(update)
+            .filter(|s| !s.is_empty())
+            .map(AcpSessionUpdateEvent::ThoughtDelta),
+        Some("tool_call" | "tool_call_update") => {
+            let title = extract_tool_activity_title(update)?;
+            let status = update["status"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            Some(AcpSessionUpdateEvent::ToolActivity { title, status })
+        }
+        Some("agent_message_chunk") | None => {
+            extract_update_text(update).map(AcpSessionUpdateEvent::MessageDelta)
+        }
+        Some(_) => None,
+    }
+}
+
+/// ACP `session/update` の `params` から `agent_message_chunk` テキストのみを抽出する。
+///
+/// `agent_thought_chunk` や `tool_call` 等は混入防止のため `None` を返す。
+#[must_use]
+pub fn extract_acp_update_message_delta(params: &Value) -> Option<String> {
+    match extract_acp_update_event(params) {
+        Some(AcpSessionUpdateEvent::MessageDelta(text)) => Some(text),
+        _ => None,
+    }
 }
 
 fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
@@ -408,6 +460,31 @@ mod tests {
         assert_eq!(
             extract_acp_update_message_delta(&msg).as_deref(),
             Some("完了しました。")
+        );
+        assert_eq!(
+            extract_acp_update_event(&thought),
+            Some(AcpSessionUpdateEvent::ThoughtDelta("thinking".to_owned()))
+        );
+        assert_eq!(
+            extract_acp_update_event(&tool),
+            Some(AcpSessionUpdateEvent::ToolActivity {
+                title: "running tool".to_owned(),
+                status: None,
+            })
+        );
+        let named_tool = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "Inspecting timeline",
+                "status": "in_progress"
+            }
+        });
+        assert_eq!(
+            extract_acp_update_event(&named_tool),
+            Some(AcpSessionUpdateEvent::ToolActivity {
+                title: "Inspecting timeline".to_owned(),
+                status: Some("in_progress".to_owned()),
+            })
         );
     }
 }

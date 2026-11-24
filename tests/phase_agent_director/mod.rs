@@ -155,6 +155,7 @@ fn mock_vision_batch_reply(
     }
     AiAgentTurnResponse {
         text: Some(json!({ "analyses": analyses }).to_string()),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         model: "mock-vision-v1".to_owned(),
         finish_reason: Some("stop".to_owned()),
@@ -184,6 +185,7 @@ fn build_wedding_mock_provider(
                     })
                     .to_string(),
                 ),
+                thinking_blocks: Vec::new(),
                 tool_calls: Vec::new(),
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("stop".to_owned()),
@@ -231,6 +233,7 @@ fn build_wedding_mock_provider(
         });
         Ok(AiAgentTurnResponse {
             text: Some(valid_bp.to_string()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
@@ -256,6 +259,7 @@ fn verify_session_reload_and_followup(
         if step == 0 {
             return Ok(AiAgentTurnResponse {
                 text: None,
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AiToolCall {
                     id: "call_meta_1".to_owned(),
                     name: "apply_draft_edit_command".to_owned(),
@@ -265,6 +269,7 @@ fn verify_session_reload_and_followup(
                             "name": "太郎 & 花子 Profile Movie (Final Cut)"
                         }
                     }),
+                    thought_signature: None,
                 }],
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -273,6 +278,7 @@ fn verify_session_reload_and_followup(
         }
         Ok(AiAgentTurnResponse {
             text: Some("ご指示どおり構成タイトルをブラッシュアップしました。".to_owned()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
@@ -493,10 +499,12 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
         if idx == 0 {
             return Ok(AiAgentTurnResponse {
                 text: None,
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AiToolCall {
                     id: "ext_1".to_owned(),
                     name: "future_tts_narration".to_owned(),
                     arguments: json!({ "text": "本日はご列席ありがとうございます" }),
+                    thought_signature: None,
                 }],
                 model: "mock-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -505,6 +513,7 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
         }
         Ok(AiAgentTurnResponse {
             text: Some("外部 TTS 拡張ツールを呼び出しました。".to_owned()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),

@@ -1454,7 +1454,10 @@ impl AppController {
             .send_streaming(&req, &mut |evt| match evt {
                 AiStreamEvent::Status(msg) => status_buf = msg,
                 AiStreamEvent::DeltaText(delta) => streamed_buf.push_str(&delta),
-                AiStreamEvent::Completed(_) | AiStreamEvent::Failed(_) => {}
+                AiStreamEvent::ThoughtDelta(_)
+                | AiStreamEvent::ActivityHint(_)
+                | AiStreamEvent::Completed(_)
+                | AiStreamEvent::Failed(_) => {}
             })
             .map_err(|err| {
                 let msg = err.to_string();
@@ -2119,6 +2122,7 @@ impl AppController {
                             AiStreamEvent::DeltaText(delta) => {
                                 self.ai_chat.streaming_preview.push_str(&delta);
                             }
+                            AiStreamEvent::ThoughtDelta(_) | AiStreamEvent::ActivityHint(_) => {}
                             AiStreamEvent::Completed(resp) => completed = Some(resp),
                             AiStreamEvent::Failed(err) => failed = Some(err),
                         }

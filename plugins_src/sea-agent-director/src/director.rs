@@ -736,6 +736,7 @@ fn synthesize_and_compile_blueprint(
         role: "user".to_owned(),
         text: media_summary,
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     }];
@@ -846,6 +847,7 @@ fn append_correction_feedback(
         role: "assistant".to_owned(),
         text: assistant_text,
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -853,6 +855,7 @@ fn append_correction_feedback(
         role: "user".to_owned(),
         text: feedback_text,
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1161,6 +1164,7 @@ fn build_initial_dynamic_messages(
             role: "user".to_owned(),
             text: format!("# Session Context\n{session_context}"),
             image_paths: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         },
@@ -1168,6 +1172,7 @@ fn build_initial_dynamic_messages(
             role: "user".to_owned(),
             text: instruction_text,
             image_paths: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         },
@@ -1232,6 +1237,7 @@ fn run_dynamic_tool_loop(
             role: "assistant".to_owned(),
             text,
             image_paths: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: tool_calls.clone(),
             tool_call_id: None,
         });
@@ -1299,6 +1305,7 @@ fn try_queue_self_repair(
         role: "assistant".to_owned(),
         text: text.to_owned(),
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1310,6 +1317,7 @@ fn try_queue_self_repair(
                本当に変更が不要な場合のみ、その理由を日本語で説明してください。"
             .to_owned(),
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1334,6 +1342,7 @@ fn execute_single_dynamic_tool_call(
         id,
         name,
         mut arguments,
+        thought_signature: _,
     } = call;
     transport.status(
         format!("ツール実行中: {name} ..."),
@@ -1372,6 +1381,7 @@ fn execute_single_dynamic_tool_call(
         role: "tool".to_owned(),
         text: truncate_utf8_bytes(&raw_tool_reply, MAX_TOOL_OUTPUT_BYTES),
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: Some(id),
     });
