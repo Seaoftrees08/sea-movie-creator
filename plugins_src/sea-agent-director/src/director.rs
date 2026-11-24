@@ -11,12 +11,12 @@ use std::ops::ControlFlow;
 
 use sea_agent_protocol::{
     AgentAskChoice, AgentAskField, AgentAskFieldKind, AgentLlmMessage, AgentLlmToolCall,
-    AgentToHostMessage, AgentUserAnswerPayload,
+    AgentThinkingBlock, AgentToHostMessage, AgentToolSpec, AgentUserAnswerPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::protocol_io::{AgentTransport, RpcError};
+use crate::protocol_io::{AgentLlmReply, AgentTransport, RpcError};
 
 const MAX_DYNAMIC_TOOL_STEPS: u32 = 12;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -268,7 +268,8 @@ fn run_folder_story_workflow(
     attached_folders: &[String],
     attached_clips: &[String],
 ) -> Result<(), RpcError> {
-    ingest_folders_and_vision(session, transport, goal, attached_folders)?;
+    // ステップ 1: フォルダ走査のみ先に実施し、件数把握後にすぐ希望確認カードを提示する
+    scan_attached_folders(session, transport, attached_folders)?;
 
     if session.memory.analyzed_images.is_empty() {
         transport.send_error(
@@ -279,20 +280,26 @@ fn run_folder_story_workflow(
         return Ok(());
     }
 
-    // ステップ 3: リッチ対話質問カードでタイトル・尺・雰囲気を確認
-    transport.status("構成と字幕の希望を確認中...", Some(3), Some(4));
+    // ステップ 2 (前倒し): リッチ対話質問カードでタイトル・尺・雰囲気を確認（リトライ時は再利用）
     let suggested_duration = parse_target_duration_seconds(goal);
-    let user_answer = ask_movie_preferences_card(session, transport, suggested_duration)?;
-    session.memory.user_preferences = Some(json!({
-        "choice_id": user_answer.choice_id,
-        "field_values": user_answer.field_values,
-        "free_text": user_answer.free_text,
-        "skipped": user_answer.skipped,
-        "requested_duration_seconds": extract_preferred_duration(&user_answer, suggested_duration),
-    }));
+    if session.memory.user_preferences.is_none() {
+        transport.status("2/4 構成と字幕の希望を確認中...", Some(2), Some(4));
+        let user_answer = ask_movie_preferences_card(session, transport, suggested_duration)?;
+        session.memory.user_preferences = Some(json!({
+            "choice_id": user_answer.choice_id,
+            "field_values": user_answer.field_values,
+            "free_text": user_answer.free_text,
+            "skipped": user_answer.skipped,
+            "requested_duration_seconds": extract_preferred_duration(&user_answer, suggested_duration),
+        }));
+    }
+
+    // ステップ 3: ユーザー希望を統合したヒントを使って Vision 解析バッチを実行
+    let vision_hint = build_vision_theme_hint(goal, session.memory.user_preferences.as_ref());
+    run_vision_analysis_batches(session, transport, &vision_hint)?;
 
     // ステップ 4: MovieBlueprint 生成＋最大 3 回自律修正＋Proposal 送出
-    transport.status("タイムライン構成案を設計・検証中...", Some(4), Some(4));
+    transport.status("4/4 タイムライン構成案を設計・検証中...", Some(4), Some(4));
     let (blueprint_val, compile_summary, command_val, model_summary) =
         synthesize_and_compile_blueprint(session, transport, goal, attached_clips)?;
 
@@ -320,6 +327,19 @@ fn ingest_folders_and_vision(
     session: &mut DirectorSession,
     transport: &mut AgentTransport<'_>,
     goal_hint: &str,
+    attached_folders: &[String],
+) -> Result<(), RpcError> {
+    scan_attached_folders(session, transport, attached_folders)?;
+    if session.memory.analyzed_images.is_empty() {
+        return Ok(());
+    }
+    let vision_hint = build_vision_theme_hint(goal_hint, session.memory.user_preferences.as_ref());
+    run_vision_analysis_batches(session, transport, &vision_hint)
+}
+
+fn scan_attached_folders(
+    session: &mut DirectorSession,
+    transport: &mut AgentTransport<'_>,
     attached_folders: &[String],
 ) -> Result<(), RpcError> {
     transport.status(
@@ -360,8 +380,46 @@ fn ingest_folders_and_vision(
             session.memory.analyzed_images.push(item);
         }
     }
+    Ok(())
+}
 
-    run_vision_analysis_batches(session, transport, goal_hint)
+/// ユーザーの初期目標と確認カード回答を結合し、Vision 解析向けのテーマヒント文字列を生成する。
+#[must_use]
+pub fn build_vision_theme_hint(goal: &str, user_preferences: Option<&Value>) -> String {
+    let mut parts = Vec::new();
+    let trimmed_goal = goal.trim();
+    if !trimmed_goal.is_empty() {
+        parts.push(trimmed_goal.to_owned());
+    }
+    if let Some(pref) = user_preferences {
+        if let Some(title) = pref
+            .get("field_values")
+            .and_then(|fv| fv.get("title"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("タイトル希望: {title}"));
+        }
+        if let Some(tone) = pref
+            .get("field_values")
+            .and_then(|fv| fv.get("tone_or_notes"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("雰囲気・構成希望: {tone}"));
+        }
+        if let Some(free) = pref
+            .get("free_text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("補足メモ: {free}"));
+        }
+    }
+    parts.join(" / ")
 }
 
 fn run_vision_analysis_batches(
@@ -384,8 +442,8 @@ fn run_vision_analysis_batches(
     for (chunk_idx, idx_chunk) in pending_indices.chunks(chunk_size).enumerate() {
         let done_count = (chunk_idx * chunk_size).min(total_pending);
         transport.status(
-            format!("2/4 写真を解析して情景・字幕案を作成中 ({done_count}/{total_pending})..."),
-            Some(2),
+            format!("3/4 写真を解析して情景・字幕案を作成中 ({done_count}/{total_pending})..."),
+            Some(3),
             Some(4),
         );
         let paths: Vec<String> = idx_chunk
@@ -653,7 +711,7 @@ fn ask_movie_preferences_card(
     let default_sec = suggested_duration_sec.round().max(10.0) as u64;
 
     let msg = format!(
-        "写真 {img_count} 枚の解析と BGM 候補 {bgm_count} 曲の確認が完了しました。\nお名前や全体の雰囲気など希望があれば入力してください（「おまかせ」またはスキップも可能です）。"
+        "写真 {img_count} 枚と BGM 候補 {bgm_count} 曲が見つかりました。\nお名前や全体の雰囲気など希望があれば入力してください（「おまかせ」またはスキップも可能です）。"
     );
     transport.ask_user(
         "ムービー構成の希望を確認",
@@ -744,14 +802,14 @@ fn synthesize_and_compile_blueprint(
     // 最大 3 回まで検証エラーを LLM へフィードバックし自律修正する
     let mut last_error = String::new();
     for attempt in 0..4_u8 {
-        let (raw_text, _) =
+        let reply: AgentLlmReply =
             transport.llm_chat(Some(system_prompt), &messages, &[], blueprint_schema, true)?;
         match try_compile_llm_blueprint_reply(
             session,
             transport,
             target_duration,
             attempt,
-            raw_text,
+            reply,
             &mut messages,
         ) {
             Ok(res) => return Ok(res),
@@ -791,9 +849,11 @@ fn try_compile_llm_blueprint_reply(
     transport: &mut AgentTransport<'_>,
     target_duration: f64,
     attempt: u8,
-    raw_text: String,
+    reply: AgentLlmReply,
     messages: &mut Vec<AgentLlmMessage>,
 ) -> Result<(Value, Value, Value, Option<String>), RpcError> {
+    let raw_text = reply.text;
+    let thinking_blocks = reply.thinking_blocks;
     let candidate_raw = extract_first_json_object(&raw_text)
         .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
 
@@ -806,6 +866,7 @@ fn try_compile_llm_blueprint_reply(
         append_correction_feedback(
             messages,
             raw_text,
+            thinking_blocks,
             "Your previous reply was not a valid JSON object. Return ONLY a raw JSON object matching the MovieBlueprint schema.".to_owned(),
         );
         return Err(RpcError::Remote(err_msg));
@@ -828,6 +889,7 @@ fn try_compile_llm_blueprint_reply(
             append_correction_feedback(
                 messages,
                 serde_json::to_string(&blueprint_val).unwrap_or_default(),
+                thinking_blocks,
                 format!(
                     "Validation failed when compiling your MovieBlueprint: {err_msg}\nFix the JSON and output the corrected MovieBlueprint JSON only."
                 ),
@@ -841,13 +903,14 @@ fn try_compile_llm_blueprint_reply(
 fn append_correction_feedback(
     messages: &mut Vec<AgentLlmMessage>,
     assistant_text: String,
+    thinking_blocks: Vec<AgentThinkingBlock>,
     feedback_text: String,
 ) {
     messages.push(AgentLlmMessage {
         role: "assistant".to_owned(),
         text: assistant_text,
         image_paths: Vec::new(),
-        thinking_blocks: Vec::new(),
+        thinking_blocks,
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1187,6 +1250,77 @@ fn check_draft_has_pending_changes(transport: &mut AgentTransport<'_>) -> Result
     }
 }
 
+/// `run_dynamic_tool_loop` へ内蔵公開する対話質問仮想ツール `ask_user` の仕様を返す。
+#[must_use]
+pub fn builtin_ask_user_tool_spec() -> AgentToolSpec {
+    AgentToolSpec {
+        name: "ask_user".to_owned(),
+        description: "確認や選択が必要な場合、巨大な編集コマンドを構築する前に即座にユーザーへ対話カードを表示して回答を得る。".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["title", "message"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "カードの見出し（例: 写真の入替・回転対象の確認）"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "確認内容の説明文"
+                },
+                "choices": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "label"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "description": { "type": "string" },
+                            "is_primary": { "type": "boolean" }
+                        }
+                    }
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "label"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["text", "textarea", "number"],
+                                "default": "text"
+                            },
+                            "placeholder": { "type": "string" },
+                            "default_value": { "type": "string" }
+                        }
+                    }
+                },
+                "allow_skip": {
+                    "type": "boolean",
+                    "default": true
+                }
+            }
+        }),
+        safety_class: "read_only".to_owned(),
+        source: "builtin".to_owned(),
+    }
+}
+
+/// ホスト提供ツール一覧へ重複なく仮想ツール `ask_user` を付加した LLM 用ツール一覧を構築する。
+#[must_use]
+pub fn build_dynamic_tools_with_ask_user(host_tools: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
+    let mut out = Vec::with_capacity(host_tools.len() + 1);
+    out.extend(host_tools.iter().cloned());
+    if !out.iter().any(|t| t.name == "ask_user") {
+        out.push(builtin_ask_user_tool_spec());
+    }
+    out
+}
+
 /// フォローアップ微調整・フォルダなし依頼・将来追加ツール呼び出しを統一処理する自律ツールループ。
 fn run_dynamic_tool_loop(
     session: &mut DirectorSession,
@@ -1202,15 +1336,17 @@ fn run_dynamic_tool_loop(
         updated_blueprint: None,
         messages: build_initial_dynamic_messages(session, prompt, attached_clips),
         self_repair_attempted: false,
+        user_declined_or_cancelled_edit: false,
     };
     let mut final_text = String::new();
     let mut completed_by_model = false;
 
     for step in 0..MAX_DYNAMIC_TOOL_STEPS {
-        let (text, tool_calls) = match transport.llm_chat(
+        let tools_for_llm = build_dynamic_tools_with_ask_user(&state.tools_snapshot);
+        let reply: AgentLlmReply = match transport.llm_chat(
             Some(&system_prompt),
             &state.messages,
-            &state.tools_snapshot,
+            &tools_for_llm,
             None,
             false,
         ) {
@@ -1223,6 +1359,11 @@ fn run_dynamic_tool_loop(
             }
             Err(other) => return Err(other),
         };
+        let AgentLlmReply {
+            text,
+            tool_calls,
+            thinking_blocks,
+        } = reply;
 
         if tool_calls.is_empty() {
             if try_queue_self_repair(transport, prompt, &text, step, &mut state)? {
@@ -1237,13 +1378,25 @@ fn run_dynamic_tool_loop(
             role: "assistant".to_owned(),
             text,
             image_paths: Vec::new(),
-            thinking_blocks: Vec::new(),
+            thinking_blocks,
             tool_calls: tool_calls.clone(),
             tool_call_id: None,
         });
 
-        for call in tool_calls {
-            execute_single_dynamic_tool_call(session, transport, step, call, &mut state)?;
+        if let Some(ask_pos) = tool_calls.iter().position(|c| c.name == "ask_user") {
+            // 同一ターン内に ask_user と他のツール呼び出しが混在する場合は、
+            // ask_user のみ実行し他はスキップ結果を返して確認後の誤編集を防ぐ。
+            for (idx, call) in tool_calls.into_iter().enumerate() {
+                if idx == ask_pos {
+                    execute_builtin_ask_user_tool(transport, step, call, &mut state)?;
+                } else {
+                    push_skipped_tool_result(&mut state.messages, call.id);
+                }
+            }
+        } else {
+            for call in tool_calls {
+                execute_single_dynamic_tool_call(session, transport, step, call, &mut state)?;
+            }
         }
     }
 
@@ -1264,7 +1417,8 @@ fn run_dynamic_tool_loop(
     }
 
     // DraftSandbox に変更が蓄積されているか検証し Proposal として送出
-    let expect_timeline_edit = state.self_repair_attempted || has_edit_intent(prompt);
+    let expect_timeline_edit = !state.user_declined_or_cancelled_edit
+        && (state.self_repair_attempted || has_edit_intent(prompt));
     finalize_dynamic_proposal(
         session,
         transport,
@@ -1283,6 +1437,9 @@ fn try_queue_self_repair(
     step: u32,
     state: &mut DynamicToolLoopState,
 ) -> Result<bool, RpcError> {
+    if state.user_declined_or_cancelled_edit {
+        return Ok(false);
+    }
     let has_remaining_steps = step + 1 < MAX_DYNAMIC_TOOL_STEPS;
     let repair_candidate = !state.self_repair_attempted
         && has_remaining_steps
@@ -1329,6 +1486,192 @@ struct DynamicToolLoopState {
     updated_blueprint: Option<Value>,
     messages: Vec<AgentLlmMessage>,
     self_repair_attempted: bool,
+    user_declined_or_cancelled_edit: bool,
+}
+
+fn push_skipped_tool_result(messages: &mut Vec<AgentLlmMessage>, tool_call_id: String) {
+    messages.push(AgentLlmMessage {
+        role: "tool".to_owned(),
+        text: r#"{"skipped":true,"reason":"skipped because ask_user requires user confirmation first"}"#.to_owned(),
+        image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_call_id),
+    });
+}
+
+fn parse_ask_fields(args: &Value) -> Vec<AgentAskField> {
+    args.get("fields")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let obj = item.as_object()?;
+                    let id = obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(|| format!("field_{idx}"), ToOwned::to_owned);
+                    let label = obj
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_owned();
+                    let kind = match obj.get("kind").and_then(Value::as_str) {
+                        Some("textarea") => AgentAskFieldKind::Textarea,
+                        Some("number") => AgentAskFieldKind::Number,
+                        _ => AgentAskFieldKind::Text,
+                    };
+                    Some(AgentAskField {
+                        id,
+                        label,
+                        placeholder: obj
+                            .get("placeholder")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        default_value: obj
+                            .get("default_value")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        kind,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ask_choices(args: &Value) -> Vec<AgentAskChoice> {
+    args.get("choices")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let obj = item.as_object()?;
+                    let id = obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(|| format!("choice_{idx}"), ToOwned::to_owned);
+                    let label = obj
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_owned();
+                    Some(AgentAskChoice {
+                        id,
+                        label,
+                        description: obj
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        is_primary: obj
+                            .get("is_primary")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 仮想ツール `ask_user` の引数 JSON を UI カード構造へ安全に変換する。
+#[must_use]
+pub fn parse_ask_user_tool_args(
+    args: &Value,
+) -> (
+    String,
+    String,
+    Vec<AgentAskField>,
+    Vec<AgentAskChoice>,
+    bool,
+) {
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("確認事項")
+        .to_owned();
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("続行方法をご指定ください。")
+        .to_owned();
+    let allow_skip = args
+        .get("allow_skip")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    (
+        title,
+        message,
+        parse_ask_fields(args),
+        parse_ask_choices(args),
+        allow_skip,
+    )
+}
+
+/// `ask_user` 回答がユーザーによる編集中止・見送り・変更不要を示しているか判定する。
+#[must_use]
+pub fn is_user_declined_or_cancelled_answer(answer: &AgentUserAnswerPayload) -> bool {
+    if answer.skipped {
+        return true;
+    }
+    if let Some(choice_id) = answer.choice_id.as_deref() {
+        let lower = choice_id.trim().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "cancel" | "skip" | "no_change" | "abort" | "none" | "decline" | "stop"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn execute_builtin_ask_user_tool(
+    transport: &mut AgentTransport<'_>,
+    step: u32,
+    call: AgentLlmToolCall,
+    state: &mut DynamicToolLoopState,
+) -> Result<(), RpcError> {
+    let (title, message, fields, choices, allow_skip) = parse_ask_user_tool_args(&call.arguments);
+    transport.status(
+        format!("ユーザーへ確認中: {title}"),
+        Some(step + 1),
+        Some(MAX_DYNAMIC_TOOL_STEPS),
+    );
+    let answer = transport.ask_user(title, message, fields, choices, allow_skip)?;
+    if is_user_declined_or_cancelled_answer(&answer) {
+        state.user_declined_or_cancelled_edit = true;
+    }
+    let reply_json = json!({
+        "skipped": answer.skipped,
+        "choice_id": answer.choice_id,
+        "field_values": answer.field_values,
+        "free_text": answer.free_text,
+    });
+    state.messages.push(AgentLlmMessage {
+        role: "tool".to_owned(),
+        text: serde_json::to_string(&reply_json).unwrap_or_else(|_| "{}".to_owned()),
+        image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(call.id),
+    });
+    Ok(())
 }
 
 fn execute_single_dynamic_tool_call(
@@ -1599,6 +1942,8 @@ fn build_followup_system_prompt(session: &DirectorSession) -> String {
          modify existing clips/subtitles via `apply_draft_edit_command`, or recompile the overall structure via `compile_movie_blueprint`.\n\
          CRITICAL: To modify the timeline, you MUST invoke `apply_draft_edit_command` or `compile_movie_blueprint` via tool calls. \
          Writing `EditCommand` or ```json blocks in plain text does NOT modify the timeline.\n\
+         CRITICAL: When user clarification or selection is needed before editing (e.g., ambiguous photo number, rotation angle, or confirmation), \
+         call the `ask_user` tool IMMEDIATELY and ALONE in that turn BEFORE generating edit commands or writing a long explanation.\n\
          When you need exact JSON parameter shapes for `SetParameter` (such as subtitle outline color/width or clip rotation), \
          call `get_capabilities` with `{{\"include_schemas\": true}}` to inspect the full `EditCommand` JSON Schema.\n\
          Keep exact target duration constraints when adjusting individual slides/endings.\n\
@@ -1981,5 +2326,68 @@ mod tests {
 
         let keep_other = "例:\n```json\n{\"type\":\"set_project_meta\",\"name\":\"Demo\"}\n```";
         assert_eq!(strip_empty_batch_json_blocks(keep_other), keep_other);
+    }
+
+    #[test]
+    fn ask_user_builtin_tool_spec_and_answer_guards_work() {
+        let spec = builtin_ask_user_tool_spec();
+        assert_eq!(spec.name, "ask_user");
+        assert_eq!(spec.safety_class, "read_only");
+        assert!(
+            spec.input_schema["properties"]["fields"]["items"]["properties"]["kind"].is_object()
+        );
+
+        let merged = build_dynamic_tools_with_ask_user(&[spec]);
+        assert_eq!(merged.iter().filter(|t| t.name == "ask_user").count(), 1);
+
+        let (title, msg, fields, choices, allow_skip) = parse_ask_user_tool_args(&json!({
+            "title": "回転対象の確認",
+            "message": "どの写真を回転しますか？",
+            "fields": [{ "id": "target", "label": "番号", "kind": "number", "default_value": "3" }],
+            "choices": [{ "id": "cw90", "label": "時計回り90度", "is_primary": true }],
+            "allow_skip": false
+        }));
+        assert_eq!(title, "回転対象の確認");
+        assert_eq!(msg, "どの写真を回転しますか？");
+        assert!(!allow_skip);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].kind, AgentAskFieldKind::Number);
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].is_primary);
+
+        let declined = AgentUserAnswerPayload {
+            choice_id: Some("cancel".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: false,
+        };
+        assert!(is_user_declined_or_cancelled_answer(&declined));
+
+        let confirmed = AgentUserAnswerPayload {
+            choice_id: Some("cw90".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: false,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&confirmed));
+
+        let mut skipped_msgs = Vec::new();
+        push_skipped_tool_result(&mut skipped_msgs, "call_other".to_owned());
+        assert_eq!(skipped_msgs.len(), 1);
+        assert_eq!(skipped_msgs[0].role, "tool");
+        assert_eq!(skipped_msgs[0].tool_call_id.as_deref(), Some("call_other"));
+        assert!(skipped_msgs[0].text.contains("ask_user"));
+
+        let hint = build_vision_theme_hint(
+            "3分のプロフィールムービー",
+            Some(&json!({
+                "field_values": { "title": "太郎 & 花子", "tone_or_notes": "明るく感動的に" },
+                "free_text": "花見の写真を多めに"
+            })),
+        );
+        assert!(hint.contains("3分のプロフィールムービー"));
+        assert!(hint.contains("太郎 & 花子"));
+        assert!(hint.contains("明るく感動的に"));
+        assert!(hint.contains("花見の写真を多めに"));
     }
 }

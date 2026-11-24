@@ -2209,10 +2209,14 @@ impl AppController {
                 self.ai_chat.streaming_preview.push_str(&text);
                 (false, false)
             }
+            AgentHostEvent::ThoughtDelta { .. } | AgentHostEvent::ToolStarted { .. } => {
+                (false, false)
+            }
             AgentHostEvent::ToolActivity {
                 tool_name,
                 ok,
                 summary,
+                ..
             } => {
                 self.ai_chat.streaming_preview.clear();
                 let banner = if ok {

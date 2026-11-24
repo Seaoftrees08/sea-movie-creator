@@ -7,12 +7,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-#[cfg(test)]
-use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use sea_ai_protocol::{
     AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_event,
     format_conversation_history_section, is_empty_json_value,
 };
+#[cfg(test)]
+use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;

@@ -377,7 +377,7 @@ fn wedding_three_minute_agent_workflow_session_resume_and_followup()
         Some(director.clone()),
     )?;
 
-    // 1) Vision 解析完了後、ask_user リッチ対話カードへ到達するのを待機
+    // 1) フォルダ走査直後（Vision 解析前）、ask_user リッチ対話カードへ到達するのを待機
     poll_until(&mut controller, Duration::from_secs(20), |c| {
         c.ai_chat.pending_question.is_some()
     })?;
@@ -587,16 +587,9 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
     Ok(())
 }
 
-#[test]
-fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_question()
--> Result<(), Box<dyn std::error::Error>> {
-    let reg = AgentPluginRegistry::discover_default();
-    let director = reg
-        .find_by_id("sea.agent.director")
-        .cloned()
-        .ok_or("sea.agent.director plugin manifest missing")?;
-
-    let guard = TempDirGuard::new("partial_429")?;
+fn setup_partial_429_fixture(
+    guard: &TempDirGuard,
+) -> Result<(PathBuf, PathBuf, Arc<MockAiProvider>), Box<dyn std::error::Error>> {
     let media_dir = guard.0.join("photos");
     let store_dir = guard.0.join("sessions");
     fs::create_dir_all(&media_dir)?;
@@ -609,18 +602,30 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
     }
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let call_ref = Arc::clone(&call_count);
-    let paths_for_mock = paths.clone();
     let provider = Arc::new(MockAiProvider::with_agent_handler(move |req| {
-        let call_idx = call_ref.fetch_add(1, Ordering::SeqCst);
+        let call_idx = call_count.fetch_add(1, Ordering::SeqCst);
         if call_idx == 0 {
-            return Ok(mock_vision_batch_reply(req, &paths_for_mock));
+            return Ok(mock_vision_batch_reply(req, &paths));
         }
         Err(sea_movie_creator::ai::provider::AiError::HttpStatus {
             status: 429,
             body: "rate limit exceeded".to_owned(),
         })
     }));
+    Ok((media_dir, store_dir, provider))
+}
+
+#[test]
+fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_question()
+-> Result<(), Box<dyn std::error::Error>> {
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let guard = TempDirGuard::new("partial_429")?;
+    let (media_dir, store_dir, provider) = setup_partial_429_fixture(&guard)?;
 
     let store = AiSessionStore::new(&store_dir);
     let mut controller = AppController::new();
@@ -633,6 +638,17 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
         "写真を整理してムービーにして",
         provider,
         Some(director.clone()),
+    )?;
+
+    // 先に提示される初回希望確認カードへ応答し、後続の Vision バッチ解析へ進める
+    poll_until(&mut controller, Duration::from_secs(20), |c| {
+        c.ai_chat.pending_question.is_some()
+    })?;
+    controller.answer_pending_agent_question(
+        Some("auto".to_owned()),
+        BTreeMap::new(),
+        None,
+        false,
     )?;
 
     let start = Instant::now();
