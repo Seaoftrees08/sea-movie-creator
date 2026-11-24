@@ -533,6 +533,7 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
             min_llm_interval_ms: 120,
             vision_batch_size: 4,
             vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
         },
         tool_registry: Some(toolbox),
         extra_extensions: Vec::new(),

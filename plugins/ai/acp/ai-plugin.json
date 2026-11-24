@@ -7,6 +7,9 @@
   "args": [],
   "protocol": "sea_ai_v1",
   "requires_external_cli": null,
+  "capabilities": {
+    "vision": true
+  },
   "profiles": [
     {
       "id": "claude",

@@ -10,16 +10,18 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
-    format_conversation_history_section, is_empty_json_value,
+    AcpImageInput, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, acp_supports_image_prompt,
+    build_acp_prompt_content_blocks, extract_acp_update_message_delta,
+    format_conversation_history_section, is_empty_json_value, validate_acp_images,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiRole, AiStreamEvent,
-    AiThinkingLevel, AiTokenUsage,
+    AiAgentTurnRequest, AiAgentTurnResponse, AiChatMessage, AiError, AiProvider, AiRequest,
+    AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage,
+    build_fallback_legacy_request, parse_fallback_agent_response,
 };
 use crate::ai::settings::ProbedModelEntry;
 use crate::core::PluginAiHints;
@@ -50,6 +52,17 @@ pub struct AiPluginProfile {
     pub args: Vec<String>,
 }
 
+/// `ai-plugin.json` が宣言する外部 AI プラグインの静的能力フラグ。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiPluginCapabilities {
+    /// 画像（マルチモーダル）入力に対応しているか。
+    pub vision: bool,
+}
+
+/// 外部 AI プラグイン呼び出しへ添付する画像入力（[`AcpImageInput`] の再エクスポート）。
+pub type AiPluginImageInput = AcpImageInput;
+
 /// `plugins/ai/<id>/ai-plugin.json` のマニフェスト定義。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiPluginManifest {
@@ -72,6 +85,9 @@ pub struct AiPluginManifest {
     /// プラグインが内部で呼び出す既定外部 CLI ヒント（任意）。
     #[serde(default)]
     pub requires_external_cli: Option<String>,
+    /// 静的能力宣言（`vision` 対応有無等）。
+    #[serde(default)]
+    pub capabilities: AiPluginCapabilities,
     /// 選択可能なプロファイル一覧（`ACP` 用など）。
     #[serde(default)]
     pub profiles: Vec<AiPluginProfile>,
@@ -168,6 +184,9 @@ pub struct AiPluginCallParams {
     /// 外部 CLI 向けの追加引数上書き。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_args: Vec<String>,
+    /// Vision 対応プラグインへ渡す Base64 画像配列（空時は省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<AiPluginImageInput>,
 }
 
 /// `"method": "list_models"` により AI プラグインから取得された利用可能モデル／CLI 情報。
@@ -396,6 +415,7 @@ pub struct AiPluginProvider {
     executable_path: PathBuf,
     args: Vec<String>,
     protocol: AiPluginProtocol,
+    supports_vision: bool,
     model_override: Option<String>,
     thinking_level_override: Option<String>,
     external_cli_override: Option<String>,
@@ -413,6 +433,7 @@ impl AiPluginProvider {
             executable_path,
             args: plugin.manifest.args.clone(),
             protocol: plugin.manifest.protocol,
+            supports_vision: plugin.manifest.capabilities.vision,
             model_override: None,
             thinking_level_override: None,
             external_cli_override: None,
@@ -531,8 +552,12 @@ impl AiPluginProvider {
     fn run_sea_ai_v1(
         &self,
         request: &AiRequest,
+        images: &[AiPluginImageInput],
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
+        if !images.is_empty() {
+            validate_acp_images(images).map_err(AiError::PluginError)?;
+        }
         let mut cmd = Command::new(&self.executable_path);
         sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
@@ -565,6 +590,7 @@ impl AiPluginProvider {
                 thinking_level: self.thinking_level_override.clone(),
                 external_cli: self.external_cli_override.clone(),
                 external_args: self.external_args_override.clone(),
+                images: images.to_vec(),
             },
         };
         let payload = serde_json::to_string(&envelope).map_err(|err| {
@@ -620,8 +646,12 @@ impl AiPluginProvider {
     fn run_direct_acp_stdio(
         &self,
         request: &AiRequest,
+        images: &[AiPluginImageInput],
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
+        if !images.is_empty() {
+            validate_acp_images(images).map_err(AiError::PluginError)?;
+        }
         let mut cmd = Command::new(&self.executable_path);
         sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
@@ -661,7 +691,16 @@ impl AiPluginProvider {
                 }
             }),
         )?;
-        let _init_res = read_acp_until_id(&mut reader, 1, on_event)?;
+        let init_res = read_acp_until_id(&mut reader, 1, on_event)?;
+        if !images.is_empty() && acp_supports_image_prompt(&init_res) == Some(false) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AiError::PluginError(
+                "vision_unsupported: ACP agent reported promptCapabilities.image = false"
+                    .to_owned(),
+            ));
+        }
 
         let cwd = env::current_dir().map_or_else(|_| ".".to_owned(), |p| p.display().to_string());
         send_acp_jsonrpc_line(
@@ -680,6 +719,7 @@ impl AiPluginProvider {
             .to_owned();
 
         let prompt_body = build_direct_acp_prompt_body(request);
+        let prompt_blocks = build_acp_prompt_content_blocks(&prompt_body, images);
         send_acp_jsonrpc_line(
             &mut stdin,
             &json!({
@@ -688,7 +728,7 @@ impl AiPluginProvider {
                 "method": "session/prompt",
                 "params": {
                     "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": prompt_body }]
+                    "prompt": prompt_blocks
                 }
             }),
         )?;
@@ -723,15 +763,43 @@ impl AiProvider for AiPluginProvider {
         &self.display_name
     }
 
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     fn send_streaming(
         &self,
         request: &AiRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
         match self.protocol {
-            AiPluginProtocol::SeaAiV1 => self.run_sea_ai_v1(request, on_event),
-            AiPluginProtocol::AcpStdio => self.run_direct_acp_stdio(request, on_event),
+            AiPluginProtocol::SeaAiV1 => self.run_sea_ai_v1(request, &[], on_event),
+            AiPluginProtocol::AcpStdio => self.run_direct_acp_stdio(request, &[], on_event),
         }
+    }
+
+    fn send_agent_turn(
+        &self,
+        request: &AiAgentTurnRequest,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        let (legacy_req, raw_images) = build_fallback_legacy_request(request, self.supports_vision);
+        let images: Vec<AiPluginImageInput> = raw_images
+            .into_iter()
+            .map(|(mime_type, base64_data)| AiPluginImageInput {
+                mime_type,
+                base64_data,
+            })
+            .collect();
+        let resp = match self.protocol {
+            AiPluginProtocol::SeaAiV1 => self.run_sea_ai_v1(&legacy_req, &images, on_event)?,
+            AiPluginProtocol::AcpStdio => {
+                self.run_direct_acp_stdio(&legacy_req, &images, on_event)?
+            }
+        };
+        let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
+        parsed.usage = resp.usage;
+        Ok(parsed)
     }
 }
 
@@ -1133,5 +1201,57 @@ mod tests {
             extract_acp_update_delta(&msg).as_deref(),
             Some("字幕を更新しました")
         );
+    }
+
+    #[test]
+    fn manifest_capabilities_vision_and_acp_image_helpers_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDirGuard::create("vision-cap")?;
+        let ai_dir = dir.0.join("agy");
+        fs::create_dir_all(&ai_dir)?;
+        let exe_name = if std::env::consts::EXE_SUFFIX.is_empty() {
+            "agy-stub".to_owned()
+        } else {
+            format!("agy-stub{}", std::env::consts::EXE_SUFFIX)
+        };
+        fs::write(ai_dir.join(&exe_name), b"stub")?;
+        fs::write(
+            ai_dir.join("ai-plugin.json"),
+            r#"{"schema_version":1,"id":"test.ai.vision","name":"Vision CLI","version":"0.1.0","entrypoint":"agy-stub","capabilities":{"vision":true}}"#,
+        )?;
+        let reg = AiPluginRegistry::discover_in_dirs(std::slice::from_ref(&dir.0));
+        let provider = reg.resolve_provider("test.ai.vision")?;
+        assert!(provider.supports_vision());
+
+        let too_many: Vec<AiPluginImageInput> = (0..13)
+            .map(|_| AiPluginImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            })
+            .collect();
+        assert!(validate_acp_images(&too_many).is_err());
+
+        let oversized = vec![AiPluginImageInput {
+            mime_type: "image/jpeg".to_owned(),
+            base64_data: "A".repeat(sea_ai_protocol::MAX_PLUGIN_VISION_BASE64_BYTES + 1),
+        }];
+        assert!(validate_acp_images(&oversized).is_err());
+
+        let unsupported_init = json!({
+            "result": { "agentCapabilities": { "promptCapabilities": { "image": false } } }
+        });
+        assert_eq!(acp_supports_image_prompt(&unsupported_init), Some(false));
+        let blocks = build_acp_prompt_content_blocks(
+            "analyze",
+            &[AiPluginImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            }],
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], json!("image"));
+        assert_eq!(blocks[1]["mimeType"], json!("image/jpeg"));
+        assert_eq!(blocks[1]["data"], json!("AQID"));
+        Ok(())
     }
 }

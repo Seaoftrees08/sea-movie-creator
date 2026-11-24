@@ -7,6 +7,9 @@
   "args": [],
   "protocol": "sea_ai_v1",
   "requires_external_cli": "agy",
+  "capabilities": {
+    "vision": true
+  },
   "profiles": [
     {
       "id": "agy-default",
