@@ -23,8 +23,9 @@ fn apply_background_process_flags(cmd: &mut Command) {
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sea_ai_protocol::{
-    AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_event,
-    format_conversation_history_section, is_empty_json_value,
+    AcpImageInput, AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES,
+    acp_supports_image_prompt, build_acp_prompt_content_blocks, extract_acp_update_event,
+    format_conversation_history_section, is_empty_json_value, validate_acp_images,
 };
 #[cfg(test)]
 use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
@@ -81,6 +82,7 @@ struct CallParams {
     thinking_level: Option<String>,
     external_cli: Option<String>,
     external_args: Vec<String>,
+    images: Vec<AcpImageInput>,
 }
 
 fn emit_event(event: &Value) {
@@ -259,13 +261,14 @@ fn build_agy_prompt_text(params: &CallParams) -> String {
 
 fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) -> Value {
     let prompt_text = build_agy_prompt_text(params);
+    let blocks = build_acp_prompt_content_blocks(&prompt_text, &params.images);
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": prompt_text }]
+            "prompt": blocks
         }
     })
 }
@@ -598,6 +601,16 @@ struct AcpConversationOutcome {
     usage: Option<Value>,
 }
 
+fn ensure_acp_vision_supported(init_resp: &Value, images: &[AcpImageInput]) -> Result<(), String> {
+    if !images.is_empty() && acp_supports_image_prompt(init_resp) == Some(false) {
+        return Err(
+            "vision_unsupported: 接続先の ACP エージェントは画像入力 (promptCapabilities.image) に非対応です"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn execute_acp_conversation(
     reader: &mut BufReader<std::process::ChildStdout>,
     stdin: &mut ChildStdin,
@@ -606,7 +619,8 @@ fn execute_acp_conversation(
     streamed: &mut String,
 ) -> Result<AcpConversationOutcome, String> {
     write_jsonrpc_line(stdin, &build_initialize_request(1))?;
-    let _init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
+    let init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
+    ensure_acp_vision_supported(&init_resp, &params.images)?;
 
     write_jsonrpc_line(stdin, &build_session_new_request(2, sandbox_cwd))?;
     let session_resp = read_acp_until_response(reader, stdin, 2, streamed)?;
@@ -744,6 +758,9 @@ fn run_list_models(params: &CallParams) -> Result<(), String> {
 }
 
 fn run_request(params: &CallParams) -> Result<(), String> {
+    if !params.images.is_empty() {
+        validate_acp_images(&params.images)?;
+    }
     let agy_bin = resolve_agy_cli(params.external_cli.as_deref()).map_err(|msg| {
         emit_event(&json!({
             "event": "error",
@@ -854,7 +871,12 @@ fn main() -> ExitCode {
         _ => run_request(&req.params),
     };
     if let Err(err) = res {
-        emit_event(&json!({ "event": "error", "code": "execution_failed", "message": err }));
+        let code = if err.starts_with("vision_unsupported:") {
+            "vision_unsupported"
+        } else {
+            "execution_failed"
+        };
+        emit_event(&json!({ "event": "error", "code": code, "message": err }));
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -1156,5 +1178,31 @@ mod tests {
             events[3],
             json!({ "event": "delta", "text": "{\"type\":\"undo\"}" })
         );
+    }
+
+    #[test]
+    fn prompt_request_embeds_images_and_rejects_false_prompt_capabilities() {
+        let params = CallParams {
+            system_prompt: "SYS".to_owned(),
+            user_prompt: "check image".to_owned(),
+            images: vec![AcpImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            }],
+            ..CallParams::default()
+        };
+        let req = build_session_prompt_request(3, "s1", &params);
+        let prompt_arr = req["params"]["prompt"].as_array().expect("prompt array");
+        assert_eq!(prompt_arr.len(), 2);
+        assert_eq!(prompt_arr[1]["type"], json!("image"));
+        assert_eq!(prompt_arr[1]["mimeType"], json!("image/jpeg"));
+        assert_eq!(prompt_arr[1]["data"], json!("AQID"));
+
+        let unsupported_init = json!({
+            "result": { "agentCapabilities": { "promptCapabilities": { "image": false } } }
+        });
+        let err = ensure_acp_vision_supported(&unsupported_init, &params.images)
+            .expect_err("must reject when promptCapabilities.image is false");
+        assert!(err.starts_with("vision_unsupported:"));
     }
 }

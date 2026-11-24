@@ -688,6 +688,7 @@ mod tests {
             min_llm_interval_ms: 400,
             vision_batch_size: 8,
             vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
         };
         store.save_runtime_settings(&settings)?;
         assert_eq!(store.load_runtime_settings()?, settings);

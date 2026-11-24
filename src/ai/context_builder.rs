@@ -14,6 +14,7 @@ use crate::timeline::document::{
     Asset, AssetKind, AssetStatus, AudioProperties, Clip, ClipKind, ProjectDocument,
     TimelineLengthMode,
 };
+use crate::timeline::serialization::resolve_existing_asset_path;
 
 /// AI プロンプトへ渡す素材要約。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +221,151 @@ pub struct TimelineContextSummary {
     /// `@ファイル名` メンションおよびタイムライン添付で明示された注目対象詳細。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub referenced_targets: Vec<ReferencedTargetDetail>,
+}
+
+/// 画像クリップの時間区間に重なる 1 件の字幕クリップ要約。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlappingSubtitleSummary {
+    /// 字幕クリップ ID。
+    pub clip_id: String,
+    /// 所属レイヤー ID。
+    pub layer_id: String,
+    /// 字幕本文。
+    pub text: String,
+    /// 開始フレーム番号。
+    pub timeline_start_frame: u64,
+    /// 終了フレーム番号（排他的）。
+    pub timeline_end_frame: u64,
+}
+
+/// タイムライン上の画像クリップと全重複字幕を 1 スライド単位にまとめたクロス監査用要約。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineSlidePairSummary {
+    /// タイムライン時系列順の 1-based スライド番号。
+    pub slide_index: usize,
+    /// 画像クリップ ID。
+    pub image_clip_id: String,
+    /// 所属レイヤー ID。
+    pub image_layer_id: String,
+    /// 参照アセット ID。
+    pub asset_id: String,
+    /// 画像ファイルの実体または登録パス文字列（取得可能な場合）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_path: Option<String>,
+    /// 正立基準の元画像解像度 `[width, height]`（取得可能な場合）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_dimensions: Option<[u32; 2]>,
+    /// 画像クリップ開始フレーム。
+    pub timeline_start_frame: u64,
+    /// 画像クリップ終了フレーム（排他的）。
+    pub timeline_end_frame: u64,
+    /// 現在のタイムライン上で評価された時計回り回転角（度）。
+    pub current_rotation_deg: f64,
+    /// 回転角パラメータがアニメーション（非固定値）であるか。
+    pub rotation_is_animated: bool,
+    /// 現在のタイムライン上で評価された X 拡大率。
+    pub current_scale_x: f64,
+    /// 現在のタイムライン上で評価された Y 拡大率。
+    pub current_scale_y: f64,
+    /// 拡大率 (`scale_x` または `scale_y`) がアニメーション（非固定値）であるか。
+    pub scale_is_animated: bool,
+    /// 画像クリップと時間的に 1 フレーム以上重なるすべての字幕クリップ。
+    pub overlapping_subtitles: Vec<OverlappingSubtitleSummary>,
+}
+
+/// タイムライン上の全画像クリップを時系列順に収集し、各画像と全重複字幕のペア一覧を構築する。
+#[must_use]
+pub fn build_timeline_slide_pairs(doc: &ProjectDocument) -> Vec<TimelineSlidePairSummary> {
+    let asset_dims: HashMap<&str, [u32; 2]> = doc
+        .assets
+        .iter()
+        .filter_map(|asset| match asset.kind {
+            AssetKind::Image { width, height } => Some((asset.id.as_str(), [width, height])),
+            _ => None,
+        })
+        .collect();
+    let asset_paths: HashMap<&str, String> = doc
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            let resolved = resolve_existing_asset_path(&asset.path, None)
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| asset.path.absolute.clone())
+                .or_else(|| asset.path.relative.clone())?;
+            Some((asset.id.as_str(), resolved))
+        })
+        .collect();
+
+    let mut subtitle_entries = Vec::new();
+    let mut image_entries = Vec::new();
+    for (layer_idx, layer) in doc.layers.iter().enumerate() {
+        for clip in &layer.clips {
+            let start = clip.timeline_start.get();
+            let end = start.saturating_add(clip.duration.get());
+            match &clip.kind {
+                ClipKind::Subtitle(sub) => {
+                    subtitle_entries.push(OverlappingSubtitleSummary {
+                        clip_id: clip.id.as_str().to_owned(),
+                        layer_id: layer.id.as_str().to_owned(),
+                        text: sub.text.clone(),
+                        timeline_start_frame: start,
+                        timeline_end_frame: end,
+                    });
+                }
+                ClipKind::Image { asset_id, visual } => {
+                    image_entries.push((start, layer_idx, clip, layer, asset_id, visual));
+                }
+                ClipKind::Video { .. } | ClipKind::Audio { .. } => {}
+            }
+        }
+    }
+
+    subtitle_entries.sort_by(|a, b| {
+        a.timeline_start_frame
+            .cmp(&b.timeline_start_frame)
+            .then_with(|| a.clip_id.cmp(&b.clip_id))
+    });
+    image_entries.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.id.as_str().cmp(b.2.id.as_str()))
+    });
+
+    image_entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (start, _, clip, layer, asset_id, visual))| {
+            let end = start.saturating_add(clip.duration.get());
+            let mid_frame = FrameIndex::new(start.saturating_add(clip.duration.get() / 2));
+            let eval_ctx = eval_context_clamped(doc, clip, mid_frame);
+            let eval = visual.evaluate(eval_ctx).ok();
+            let overlapping_subtitles = subtitle_entries
+                .iter()
+                .filter(|sub| start < sub.timeline_end_frame && sub.timeline_start_frame < end)
+                .cloned()
+                .collect();
+            TimelineSlidePairSummary {
+                slide_index: idx + 1,
+                image_clip_id: clip.id.as_str().to_owned(),
+                image_layer_id: layer.id.as_str().to_owned(),
+                asset_id: asset_id.as_str().to_owned(),
+                asset_path: asset_paths.get(asset_id.as_str()).cloned(),
+                asset_dimensions: asset_dims.get(asset_id.as_str()).copied(),
+                timeline_start_frame: start,
+                timeline_end_frame: end,
+                current_rotation_deg: eval.map_or(0.0, |v| v.rotation_deg),
+                rotation_is_animated: !matches!(
+                    visual.rotation_deg,
+                    AnimatedParameter::Constant { .. }
+                ),
+                current_scale_x: eval.map_or(1.0, |v| v.scale_x),
+                current_scale_y: eval.map_or(1.0, |v| v.scale_y),
+                scale_is_animated: !matches!(visual.scale_x, AnimatedParameter::Constant { .. })
+                    || !matches!(visual.scale_y, AnimatedParameter::Constant { .. }),
+                overlapping_subtitles,
+            }
+        })
+        .collect()
 }
 
 /// ドキュメントから AI 向けのコンパクト要約構造体を生成する。
@@ -1034,6 +1180,99 @@ mod tests {
             .map(|a| a.gain_db)
             .ok_or("missing audio")?;
         assert!((gain - (-6.0)).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn build_timeline_slide_pairs_collects_all_overlapping_subtitles_and_animation_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::animation::{EasingCurve, ExtrapolationMode, Keyframe};
+        use crate::core::ids::AssetId;
+        use crate::core::time::FrameCount;
+        use crate::media::visual_properties::SubtitleProperties;
+        use crate::timeline::document::{AssetPath, Layer};
+
+        let mut doc = ProjectDocument::new("SlidePairs");
+        let a1 = AssetId::new("a_sakura")?;
+        doc.assets.push(Asset {
+            id: a1.clone(),
+            name: "sakura.jpg".to_owned(),
+            path: AssetPath::new(None, Some("C:/photos/sakura.jpg".to_owned())),
+            kind: AssetKind::Image {
+                width: 1200,
+                height: 800,
+            },
+            status: AssetStatus::Available,
+        });
+
+        let mut img_layer = Layer::new(LayerId::new("L_IMG")?, "Photos");
+        img_layer.clips.push(Clip {
+            id: ClipId::new("C_IMG1")?,
+            name: "sakura.jpg".to_owned(),
+            timeline_start: FrameIndex::new(60),
+            duration: FrameCount::new(180)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: a1,
+                visual: VisualProperties {
+                    scale_x: AnimatedParameter::Keyframes {
+                        keyframes: vec![
+                            Keyframe::with_easing(0, 1.0, EasingCurve::Linear),
+                            Keyframe::new(179, 1.08),
+                        ],
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                    scale_y: AnimatedParameter::Keyframes {
+                        keyframes: vec![
+                            Keyframe::with_easing(0, 1.0, EasingCurve::Linear),
+                            Keyframe::new(179, 1.08),
+                        ],
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                    rotation_deg: AnimatedParameter::constant(90.0),
+                    ..VisualProperties::default()
+                },
+            },
+        });
+        let mut sub_layer = Layer::new(LayerId::new("L_SUB")?, "Subtitles");
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_YEAR")?,
+            name: "Year".to_owned(),
+            timeline_start: FrameIndex::new(60),
+            duration: FrameCount::new(180)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("2023年")),
+        });
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_MAIN")?,
+            name: "Main".to_owned(),
+            timeline_start: FrameIndex::new(100),
+            duration: FrameCount::new(100)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("りんご飴がおいしかった")),
+        });
+        doc.layers.push(img_layer);
+        doc.layers.push(sub_layer);
+
+        let pairs = build_timeline_slide_pairs(&doc);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].slide_index, 1);
+        assert_eq!(pairs[0].asset_dimensions, Some([1200, 800]));
+        assert!((pairs[0].current_rotation_deg - 90.0).abs() < 1e-9);
+        assert!(!pairs[0].rotation_is_animated);
+        assert!(pairs[0].scale_is_animated);
+        assert_eq!(pairs[0].overlapping_subtitles.len(), 2);
+        assert_eq!(pairs[0].overlapping_subtitles[0].text, "2023年");
+        assert_eq!(
+            pairs[0].overlapping_subtitles[1].text,
+            "りんご飴がおいしかった"
+        );
         Ok(())
     }
 }

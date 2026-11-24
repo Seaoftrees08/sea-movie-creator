@@ -13,6 +13,79 @@ pub const PINNED_INSTRUCTION_MAX_BYTES: usize = 64 * 1024;
 /// 自律エージェントの元指示を識別・ピン留めするための先頭マーカー。
 pub const ORIGINAL_INSTRUCTION_MARKER: &str = "# Original User Instruction";
 
+/// 外部 AI プラグインの 1 呼び出しあたり許可する最大画像枚数。
+pub const MAX_PLUGIN_VISION_IMAGES: usize = 12;
+
+/// 外部 AI プラグインの 1 呼び出しあたり許可する画像 Base64 データ合計上限（8 MiB）。
+pub const MAX_PLUGIN_VISION_BASE64_BYTES: usize = 8 * 1024 * 1024;
+
+/// 外部 AI プラグインおよび ACP `session/prompt` へ渡す画像入力パート。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcpImageInput {
+    /// 画像 MIME タイプ（例: `"image/jpeg"`）。
+    pub mime_type: String,
+    /// Base64 エンコード済み画像バイト列。
+    pub base64_data: String,
+}
+
+/// 外部プラグインへ送信する画像配列の枚数・サイズ・必須項目の妥当性を検証する。
+///
+/// # Errors
+///
+/// 枚数上限・合計サイズ上限超過、または `mime_type` / `base64_data` が空の場合にエラー文字列を返す。
+pub fn validate_acp_images(images: &[AcpImageInput]) -> Result<(), String> {
+    if images.len() > MAX_PLUGIN_VISION_IMAGES {
+        return Err(format!(
+            "plugin vision image count {} exceeds limit {MAX_PLUGIN_VISION_IMAGES}",
+            images.len()
+        ));
+    }
+    let mut total_bytes = 0_usize;
+    for (idx, img) in images.iter().enumerate() {
+        if img.mime_type.trim().is_empty() || img.base64_data.trim().is_empty() {
+            return Err(format!(
+                "plugin vision image[{idx}] has empty mime_type or base64_data"
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(img.base64_data.len());
+    }
+    if total_bytes > MAX_PLUGIN_VISION_BASE64_BYTES {
+        return Err(format!(
+            "plugin vision total base64 size {total_bytes} bytes exceeds limit {MAX_PLUGIN_VISION_BASE64_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// ACP `initialize` 応答から画像入力対応 (`promptCapabilities.image`) を読み取る。
+///
+/// 明示的に `true`/`false` が返された場合は `Some(bool)`、未記載時は `None` を返す。
+#[must_use]
+pub fn acp_supports_image_prompt(init_resp: &Value) -> Option<bool> {
+    init_resp["result"]["agentCapabilities"]["promptCapabilities"]["image"]
+        .as_bool()
+        .or_else(|| init_resp["result"]["capabilities"]["promptCapabilities"]["image"].as_bool())
+}
+
+/// ACP `session/prompt` 用の `prompt` コンテンツブロック配列を構築する。
+#[must_use]
+pub fn build_acp_prompt_content_blocks(prompt_text: &str, images: &[AcpImageInput]) -> Vec<Value> {
+    let mut blocks = Vec::with_capacity(1 + images.len());
+    blocks.push(serde_json::json!({
+        "type": "text",
+        "text": prompt_text,
+    }));
+    for img in images {
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "mimeType": img.mime_type,
+            "data": img.base64_data,
+        }));
+    }
+    blocks
+}
+
 const HISTORY_HEADER: &str = "# Conversation History\n";
 const OMITTED_MARKER: &str = "...(earlier messages omitted)...";
 

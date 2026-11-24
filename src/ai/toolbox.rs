@@ -12,13 +12,16 @@ use crate::ai::blueprint::{MovieBlueprint, compile_blueprint_to_edit_command};
 use crate::ai::capabilities::{InstalledExtensionSummary, collect_host_capabilities};
 use crate::ai::context_builder::build_timeline_context;
 use crate::ai::media_inspector::{
-    AllowedFolderScope, encode_thumbnail_jpeg_base64, inspect_media_folder,
+    AllowedFolderScope, ContactSheetInput, ContactSheetOptions, ThumbnailEncodeOptions,
+    build_contact_sheet_jpeg_base64, encode_thumbnail_jpeg_base64_with_options,
+    inspect_media_folder,
 };
 use crate::ai::planner::dry_run_validate_command;
 use crate::ai::provider::{
     AgentRuntimeSettings, AiAgentTurnRequest, AiContentPart, AiError, AiProvider, AiTokenUsage,
-    AiToolDefinition, AiTurnMessage,
+    AiToolDefinition, AiTurnMessage, VisionPackingMode,
 };
+use crate::ai::vision_audit::execute_audit_timeline_slides;
 use crate::core::time::FrameIndex;
 use crate::timeline::command::EditCommand;
 use crate::timeline::dispatcher::CommandDispatcher;
@@ -254,6 +257,7 @@ impl HostToolRegistry {
         reg.register(Box::new(GetTimelineSummaryTool));
         reg.register(Box::new(InspectMediaFolderTool));
         reg.register(Box::new(InspectImagesVisionTool));
+        reg.register(Box::new(AuditTimelineSlidesTool));
         reg.register(Box::new(CompileMovieBlueprintTool));
         reg.register(Box::new(ApplyDraftEditCommandTool));
         reg.register(Box::new(ResetDraftToLiveTool));
@@ -404,6 +408,40 @@ impl AgentTool for InspectMediaFolderTool {
     }
 }
 
+const VISION_UNSUPPORTED_WARNING: &str =
+    "⚠ Vision 非対応のためファイル名・EXIF 情報のみで字幕を生成しました";
+
+struct AuditTimelineSlidesTool;
+
+impl AgentTool for AuditTimelineSlidesTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        AgentToolDescriptor {
+            name: "audit_timeline_slides".to_owned(),
+            category: "vision".to_owned(),
+            description: "タイムライン上の画像スライドと重なっている全字幕を、実画像（現行回転適用済みコンタクトシート＋低信頼時の単体再確認）でクロス監査し、内容不一致と回転補正＋スケール再フィット案を返します。".to_owned(),
+            safety_class: ToolSafetyClass::ReadOnly,
+            supports_progress: true,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slide_indices": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 1 },
+                        "description": "監査する 1-based スライド番号一覧（省略時は全スライド）"
+                    },
+                    "check_subtitle_mismatch": { "type": "boolean", "default": true },
+                    "check_orientation": { "type": "boolean", "default": true },
+                    "focus_hint": { "type": "string", "description": "ユーザーが特に気にしている点" }
+                }
+            }),
+        }
+    }
+
+    fn execute(&self, args: &Value, ctx: &mut ToolExecutionContext<'_>) -> Result<Value, String> {
+        execute_audit_timeline_slides(args, ctx)
+    }
+}
+
 struct InspectImagesVisionTool;
 
 impl AgentTool for InspectImagesVisionTool {
@@ -411,7 +449,7 @@ impl AgentTool for InspectImagesVisionTool {
         AgentToolDescriptor {
             name: "inspect_images_vision".to_owned(),
             category: "vision".to_owned(),
-            description: "画像パス一覧を長辺512px相当へ軽量縮小し、Vision 対応 LLM で情景説明・章候補・適切な日本語字幕案をバッチ生成します。".to_owned(),
+            description: "画像パス一覧を軽量縮小／コンタクトシート圧縮し、Vision 対応 LLM で情景説明・章候補・適切な日本語字幕案をバッチ生成します。".to_owned(),
             safety_class: ToolSafetyClass::ReadOnly,
             supports_progress: true,
             input_schema: json!({
@@ -452,7 +490,7 @@ impl AgentTool for InspectImagesVisionTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("ja");
         let Some(provider) = ctx.llm_provider.filter(|p| p.supports_vision()) else {
-            // Vision 非対応時はファイル名ベースの安全フォールバックを返す
+            // Vision 非対応時はファイル名ベースの安全フォールバックを返し、UI/ユーザー向け警告を添える
             let fallback: Vec<Value> = paths
                 .iter()
                 .map(|p| build_filename_fallback_analysis(p))
@@ -460,11 +498,53 @@ impl AgentTool for InspectImagesVisionTool {
             return Ok(json!({
                 "analyses": fallback,
                 "used_vision": false,
+                "warning": VISION_UNSUPPORTED_WARNING,
                 "note": "selected provider does not support Vision; generated metadata-only fallback",
             }));
         };
 
         execute_vision_batches(provider, &paths, theme_hint, language, ctx)
+    }
+}
+
+struct VisionBatchConfig<'a> {
+    packing_mode: VisionPackingMode,
+    max_edge: u32,
+    jpeg_quality: u8,
+    sheet_opts: ContactSheetOptions,
+    batch_size: usize,
+    theme_hint: &'a str,
+    language: &'a str,
+}
+
+fn build_vision_batch_config<'a>(
+    settings: &AgentRuntimeSettings,
+    theme_hint: &'a str,
+    language: &'a str,
+) -> VisionBatchConfig<'a> {
+    let packing_mode = settings.vision_packing_mode;
+    let max_edge = settings.vision_max_edge_px.clamp(128, 1024);
+    let jpeg_quality = settings.vision_jpeg_quality.clamp(40, 90);
+    let cols = u32::from(settings.vision_contact_sheet_cols.clamp(1, 4));
+    let rows = u32::from(settings.vision_contact_sheet_rows.clamp(1, 4));
+    let tile_max_edge_px = settings.vision_contact_sheet_tile_px.clamp(192, 512);
+    let batch_size = match packing_mode {
+        VisionPackingMode::ContactSheet => usize::try_from(cols * rows).unwrap_or(6).max(1),
+        VisionPackingMode::Individual => settings.vision_batch_size.clamp(1, 12),
+    };
+    VisionBatchConfig {
+        packing_mode,
+        max_edge,
+        jpeg_quality,
+        sheet_opts: ContactSheetOptions {
+            cols,
+            rows,
+            tile_max_edge_px,
+            jpeg_quality,
+        },
+        batch_size,
+        theme_hint,
+        language,
     }
 }
 
@@ -475,15 +555,15 @@ fn execute_vision_batches(
     language: &str,
     ctx: &mut ToolExecutionContext<'_>,
 ) -> Result<Value, String> {
-    let max_edge = ctx.runtime_settings.vision_max_edge_px.clamp(128, 1024);
-    let batch_size = ctx.runtime_settings.vision_batch_size.clamp(1, 12);
+    let cfg = build_vision_batch_config(ctx.runtime_settings, theme_hint, language);
     let mut all_analyses = Vec::with_capacity(paths.len());
     let total = paths.len();
     let mut used_vision_ok = true;
     let mut fallback_note: Option<String> = None;
+    let mut vision_warning: Option<&'static str> = None;
 
-    for (chunk_idx, chunk) in paths.chunks(batch_size).enumerate() {
-        let done_so_far = (chunk_idx * batch_size).min(total);
+    for (chunk_idx, chunk) in paths.chunks(cfg.batch_size).enumerate() {
+        let done_so_far = (chunk_idx * cfg.batch_size).min(total);
         if ctx.is_cancelled() {
             return Ok(partial_vision_json(
                 &all_analyses,
@@ -506,14 +586,14 @@ fn execute_vision_batches(
             ));
         }
 
-        let (outcome, batch_usage) = run_single_vision_batch(
-            provider,
-            ctx.folder_scope,
-            chunk,
-            max_edge,
-            theme_hint,
-            language,
-        );
+        let (outcome, batch_usage) = match cfg.packing_mode {
+            VisionPackingMode::ContactSheet => {
+                run_single_contact_sheet_vision_batch(provider, ctx.folder_scope, chunk, &cfg)
+            }
+            VisionPackingMode::Individual => {
+                run_single_vision_batch(provider, ctx.folder_scope, chunk, &cfg)
+            }
+        };
         if let (Some(cb), Some(usage)) = (ctx.on_usage.as_deref_mut(), batch_usage) {
             cb(usage);
         }
@@ -527,6 +607,7 @@ fn execute_vision_batches(
             VisionBatchOutcome::VisionUnsupported(reason) => {
                 used_vision_ok = false;
                 fallback_note = Some(reason);
+                vision_warning = Some(VISION_UNSUPPORTED_WARNING);
                 for remaining_path in &paths[done_so_far..] {
                     all_analyses.push(build_filename_fallback_analysis(remaining_path));
                 }
@@ -551,6 +632,9 @@ fn execute_vision_batches(
         "analyses": all_analyses,
         "used_vision": used_vision_ok,
     });
+    if let Some(warn) = vision_warning {
+        out["warning"] = Value::String(warn.to_owned());
+    }
     if let Some(note) = fallback_note {
         out["note"] = Value::String(note);
     }
@@ -582,7 +666,26 @@ enum VisionBatchOutcome {
     Failed { code: &'static str, message: String },
 }
 
-fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
+fn is_vision_unsupported_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "vision_unsupported",
+        "does not support vision",
+        "vision not supported",
+        "vision is not supported",
+        "does not support image",
+        "image input not supported",
+        "multimodal not supported",
+        "not a vision",
+        "does not support",
+        "not supported",
+        "unknown variant",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+pub(crate) fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
     let msg = err.to_string();
     match err {
         AiError::HttpStatus { status: 429, .. } => ("rate_limited", false, msg),
@@ -590,23 +693,9 @@ fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
         AiError::HttpStatus {
             status: 400 | 404 | 422,
             body,
-        } => {
-            let lower = body.to_ascii_lowercase();
-            let unsupported = [
-                "does not support vision",
-                "vision not supported",
-                "vision is not supported",
-                "does not support image",
-                "image input not supported",
-                "multimodal not supported",
-                "not a vision",
-                "does not support",
-                "not supported",
-                "unknown variant",
-            ]
-            .iter()
-            .any(|kw| lower.contains(kw));
-            if unsupported {
+        }
+        | AiError::PluginError(body) => {
+            if is_vision_unsupported_text(body) {
                 ("vision_unsupported", true, msg)
             } else {
                 ("llm_error", false, msg)
@@ -624,20 +713,81 @@ fn describe_target_language(code: &str) -> String {
     }
 }
 
+fn run_single_contact_sheet_vision_batch(
+    provider: &dyn AiProvider,
+    scope: &AllowedFolderScope,
+    paths: &[String],
+    cfg: &VisionBatchConfig<'_>,
+) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
+    let mut inputs = Vec::with_capacity(paths.len());
+    let mut manifest_lines = Vec::with_capacity(paths.len());
+    for (idx, p) in paths.iter().enumerate() {
+        let badge = idx + 1;
+        let path_buf = std::path::PathBuf::from(p);
+        let fname = path_buf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("photo");
+        manifest_lines.push(format!("[index={idx}, badge=#{badge}] file={fname}"));
+        inputs.push(ContactSheetInput {
+            path: path_buf,
+            badge_index: badge,
+            extra_rotation_deg: 0,
+        });
+    }
+    let sheet = match build_contact_sheet_jpeg_base64(scope, &inputs, cfg.sheet_opts) {
+        Ok(s) => s,
+        Err(err) => {
+            return (
+                VisionBatchOutcome::Failed {
+                    code: "media_error",
+                    message: err.to_string(),
+                },
+                None,
+            );
+        }
+    };
+    let lang_desc = describe_target_language(cfg.language);
+    let prompt = format!(
+        "Analyze every tile in the attached contact sheet for the video theme: \"{}\".\n\
+         Each tile has a yellow badge `#1`, `#2`, ... corresponding to `index = badge - 1` below.\n\
+         Return ONLY a valid JSON object:\n\
+         {{\"analyses\":[{{\"index\":0,\"path\":\"...\",\"scene_description\":\"...\",\"suggested_chapter\":\"...\",\"suggested_subtitle\":\"...\",\"mood\":\"warm|joyful|nostalgic|calm\",\"recommended_motion\":\"zoom_in|zoom_out|pan_left|pan_right\"}}]}}\n\
+         Keep `suggested_subtitle` warm, {lang_desc} (12-26 chars) matching what is actually visible in that tile.\n\
+         Tiles:\n{}",
+        cfg.theme_hint,
+        manifest_lines.join("\n")
+    );
+    let parts = vec![
+        AiContentPart::text(prompt),
+        AiContentPart::ImageData {
+            mime_type: sheet.mime_type,
+            base64_data: sheet.base64_data,
+        },
+    ];
+    execute_vision_analysis_turn(provider, parts, &sheet.paths)
+}
+
 fn run_single_vision_batch(
     provider: &dyn AiProvider,
     scope: &AllowedFolderScope,
     paths: &[String],
-    max_edge: u32,
-    theme_hint: &str,
-    language: &str,
+    cfg: &VisionBatchConfig<'_>,
 ) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let mut parts = Vec::new();
     let mut manifest_lines = Vec::new();
     let mut valid_paths = Vec::new();
 
     for (idx, p) in paths.iter().enumerate() {
-        let thumb = match encode_thumbnail_jpeg_base64(scope, std::path::Path::new(p), max_edge) {
+        let thumb = match encode_thumbnail_jpeg_base64_with_options(
+            scope,
+            std::path::Path::new(p),
+            ThumbnailEncodeOptions {
+                max_edge_px: cfg.max_edge,
+                jpeg_quality: cfg.jpeg_quality,
+                extra_rotation_deg: 0,
+            },
+        ) {
             Ok(t) => t,
             Err(err) => {
                 return (
@@ -662,17 +812,25 @@ fn run_single_vision_batch(
         valid_paths.push(thumb.path);
     }
 
-    let lang_desc = describe_target_language(language);
+    let lang_desc = describe_target_language(cfg.language);
     let prompt_head = format!(
-        "Analyze the attached photos for the video theme: \"{theme_hint}\".\n\
+        "Analyze the attached photos for the video theme: \"{}\".\n\
          Return ONLY a valid JSON object of the form:\n\
          {{\"analyses\":[{{\"index\":0,\"path\":\"...\",\"scene_description\":\"...\",\"suggested_chapter\":\"...\",\"suggested_subtitle\":\"...\",\"mood\":\"warm|joyful|nostalgic|calm\",\"recommended_motion\":\"zoom_in|zoom_out|pan_left|pan_right\"}}]}}\n\
          Keep `suggested_subtitle` warm, {lang_desc} (12-26 chars) matching what is actually visible in the photo.\n\
          Images:\n{}",
+        cfg.theme_hint,
         manifest_lines.join("\n")
     );
     parts.insert(0, AiContentPart::text(prompt_head));
+    execute_vision_analysis_turn(provider, parts, &valid_paths)
+}
 
+fn execute_vision_analysis_turn(
+    provider: &dyn AiProvider,
+    parts: Vec<AiContentPart>,
+    valid_paths: &[String],
+) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let req = AiAgentTurnRequest {
         system_prompt:
             "You are a sensitive photo curator for video storytelling. Always output strict JSON."
@@ -707,7 +865,7 @@ fn run_single_vision_batch(
         .usage
         .unwrap_or_else(|| AiTokenUsage::estimate_from_chars(in_chars, out_chars));
     let raw_text = resp.text.unwrap_or_default();
-    if let Some(parsed) = parse_vision_analyses_json(&raw_text, &valid_paths) {
+    if let Some(parsed) = parse_vision_analyses_json(&raw_text, valid_paths) {
         return (VisionBatchOutcome::Parsed(parsed), Some(usage));
     }
     let fallback = valid_paths
@@ -1133,5 +1291,77 @@ mod tests {
                 .and_then(|v| v["path"].as_str()),
             Some("D:/wedding/01.jpg")
         );
+    }
+
+    struct FailingVisionTestProvider(String);
+
+    impl AiProvider for FailingVisionTestProvider {
+        fn id(&self) -> &'static str {
+            "failing-vision"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Failing Vision"
+        }
+
+        fn supports_vision(&self) -> bool {
+            true
+        }
+
+        fn send_streaming(
+            &self,
+            _request: &crate::ai::provider::AiRequest,
+            _on_event: &mut dyn FnMut(crate::ai::provider::AiStreamEvent),
+        ) -> Result<crate::ai::provider::AiResponse, AiError> {
+            Err(AiError::PluginError(self.0.clone()))
+        }
+
+        fn send_agent_turn(
+            &self,
+            _request: &AiAgentTurnRequest,
+            _on_event: &mut dyn FnMut(crate::ai::provider::AiStreamEvent),
+        ) -> Result<crate::ai::provider::AiAgentTurnResponse, AiError> {
+            Err(AiError::PluginError(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn inspect_images_vision_emits_explicit_warning_on_plugin_vision_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::new("vision_warn")?;
+        let p1 = guard.0.join("sakura.png");
+        write_png(&p1)?;
+
+        let registry = HostToolRegistry::with_builtin_tools();
+        assert!(registry.find_descriptor("audit_timeline_slides").is_some());
+
+        let mut sandbox = DraftSandbox::new(ProjectDocument::new("WarnTest"));
+        let scope = AllowedFolderScope::from_folders([&guard.0]);
+        let settings = AgentRuntimeSettings::default();
+        let mock_err = FailingVisionTestProvider(
+            "vision_unsupported: promptCapabilities.image = false".to_owned(),
+        );
+        let mut last_at = None;
+        let mut progress = |_: &str| {};
+        let mut ctx = ToolExecutionContext {
+            folder_scope: &scope,
+            sandbox: &mut sandbox,
+            llm_provider: Some(&mock_err),
+            runtime_settings: &settings,
+            last_llm_call_at: &mut last_at,
+            cancelled: None,
+            on_progress: &mut progress,
+            on_usage: None,
+            extra_extensions: Vec::new(),
+        };
+
+        let res = registry.execute(
+            "inspect_images_vision",
+            &json!({ "paths": [p1.to_string_lossy()] }),
+            &mut ctx,
+        )?;
+        assert_eq!(res["used_vision"], false);
+        assert_eq!(res["warning"], VISION_UNSUPPORTED_WARNING);
+        Ok(())
     }
 }

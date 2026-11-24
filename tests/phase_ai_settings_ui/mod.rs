@@ -62,6 +62,7 @@ fn startup_restores_last_selection_custom_models_and_runtime_settings()
             min_llm_interval_ms: 1500,
             vision_batch_size: 4,
             vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
         });
     }
 

@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::timeline::document::{AssetPath, AssetStatus, DocumentValidationError, ProjectDocument};
+use crate::timeline::document::{
+    AssetKind, AssetPath, AssetStatus, DocumentValidationError, ProjectDocument,
+};
 
 /// プロジェクトの保存・読込時に発生し得るエラー。
 #[derive(Debug, Error)]
@@ -79,11 +81,21 @@ pub fn load_project_file(path: &Path) -> Result<ProjectDocument, SerializationEr
     Ok(document)
 }
 
-/// ドキュメント内の全アセットの解決先を判定し、`status` を更新する。
+/// ドキュメント内の全アセットの解決先を判定し、`status` および画像の実寸を最新化する。
 pub fn resolve_document_assets(document: &mut ProjectDocument, project_dir: Option<&Path>) {
     for asset in &mut document.assets {
         match resolve_existing_asset_path(&asset.path, project_dir) {
-            Some(_) => asset.status = AssetStatus::Available,
+            Some(resolved_path) => {
+                asset.status = AssetStatus::Available;
+                // 旧仕様等で EXIF 回転前の寸法が保存されたままの .seaproj を読込時に正立寸法へ同期する
+                if let AssetKind::Image { width, height } = &mut asset.kind
+                    && let Ok(info) = crate::media::image_loader::inspect_image_file(&resolved_path)
+                    && (*width != info.width || *height != info.height)
+                {
+                    *width = info.width;
+                    *height = info.height;
+                }
+            }
             None => {
                 asset.status = AssetStatus::Missing {
                     expected_path: preferred_display_path(&asset.path, project_dir),
@@ -205,6 +217,60 @@ mod tests {
 
         resolve_document_assets(&mut doc, Some(Path::new(".")));
         assert!(matches!(doc.assets[0].status, AssetStatus::Missing { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_document_assets_syncs_exif_oriented_image_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("sea_ser_exif_{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let jpg_path = dir.join("portrait_exif.jpg");
+
+        let img = image::DynamicImage::new_rgb8(20, 10);
+        let mut cursor = io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Jpeg)
+            .map_err(io::Error::other)?;
+        let raw = cursor.into_inner();
+        let tiff: [u8; 26] = [
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let seg_len = u16::try_from(6 + tiff.len() + 2).unwrap_or(0);
+        let mut out = Vec::new();
+        out.extend_from_slice(&raw[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(&tiff);
+        out.extend_from_slice(&raw[2..]);
+        fs::write(&jpg_path, out)?;
+
+        let mut doc = ProjectDocument::new("EXIF Sync");
+        doc.assets.push(Asset {
+            id: AssetId::new("a1")?,
+            name: "portrait_exif.jpg".to_owned(),
+            path: AssetPath::new(Some("portrait_exif.jpg".to_owned()), None),
+            kind: AssetKind::Image {
+                width: 20,
+                height: 10,
+            },
+            status: AssetStatus::Missing {
+                expected_path: String::new(),
+            },
+        });
+        let proj_path = dir.join("proj.seaproj");
+        save_project_file(&doc, &proj_path)?;
+
+        let loaded = load_project_file(&proj_path)?;
+        assert_eq!(
+            loaded.assets[0].kind,
+            AssetKind::Image {
+                width: 10,
+                height: 20,
+            }
+        );
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

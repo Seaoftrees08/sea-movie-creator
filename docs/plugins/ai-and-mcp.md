@@ -84,6 +84,9 @@ sea-movie-creator mcp --project path/to/project.smc.json
   "args": [],
   "protocol": "sea_ai_v1",
   "requires_external_cli": "example-cli",
+  "capabilities": {
+    "vision": true
+  },
   "profiles": [
     {
       "id": "default",
@@ -103,6 +106,7 @@ sea-movie-creator mcp --project path/to/project.smc.json
 | `args` | `string[]` | - | 起動時固定引数（既定 `[]`） |
 | `protocol` | `string` | - | `"sea_ai_v1"`（既定）または `"acp_stdio"` |
 | `requires_external_cli` | `string \| null` | - | 内部で呼び出す外部 CLI のヒント名 |
+| `capabilities` | `object` | - | 能力フラグ（例: `{"vision": true}`、省略時はすべて `false`） |
 | `profiles` | `object[]` | - | サブプロファイル一覧（`id`, `label`, `cli`, `args`） |
 
 ### 2.2 プロトコル A: `sea_ai_v1`（推奨 NDJSON エンベロープ）
@@ -125,10 +129,15 @@ sea-movie-creator mcp --project path/to/project.smc.json
        "model": "gemini-4-argon",
        "thinking_level": "medium",
        "external_cli": null,
-       "external_args": []
+       "external_args": [],
+       "images": [
+         { "mime_type": "image/jpeg", "base64_data": "<Base64>" }
+       ]
      }
    }
    ```
+   - `params.images`（省略時は空配列、1 呼び出しあたり最大 `12` 枚・合計 Base64 `8 MiB` 以下）が渡された場合、`capabilities.vision == true` かつ接続先 ACP エージェントが画像入力に対応していれば `session/prompt` のコンテンツブロック（`{"type": "image", "mimeType": ..., "data": ...}`）へ変換して送信してください。
+   - 接続先 CLI の `initialize` 応答にある `result.agentCapabilities.promptCapabilities.image`（または `result.capabilities.promptCapabilities.image`）が明示的に `false` であるにもかかわらず `params.images` が空でない場合は、誤推測を防ぐため `{"event":"error","code":"vision_unsupported","message":"..."}` を出力して失敗終了してください。
    - `params.history`（省略時は空配列）を受け取るプラグインは、役割（`[system]` / `[user]` / `[assistant]`）付きの時系列コンテキストとしてプロンプトへ展開してください（上限目安: `128 KiB`）。
      - 履歴内に `# Original User Instruction` で始まるメッセージが含まれる場合（自律エージェントの複数ステップ実行中）、そのメッセージを最優先でピン留め保持し、`# Session Context` や古い `[ToolResult ` 本文の圧縮を優先したうえで中間ステップを省略します（UTF-8 文字境界を破壊しないこと）。
      - `command_schema_json` や `context_summary` が `null` または空オブジェクト `{}` の場合は、対応するプロンプトセクション自体を省略してください。
@@ -153,12 +162,13 @@ sea-movie-creator mcp --project path/to/project.smc.json
    - 生成完了: `{"event":"completed","raw_text":"{\"type\":\"add_layer\",\"name\":\"...\"}","model":"example:model-1","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"cost_usd":null,"is_estimated":false}}`
      - `raw_text` が空文字の場合、ホストはそれまでに受信した `delta` の連結文字列を最終応答として採用します。
      - `usage` フィールドは任意（`#[serde(default)]`）であり、省略時は後方互換としてホスト側が推定・未指定扱いにフォールバックします。
-   - エラー通知: `{"event":"error","code":"missing_external_cli","message":"詳細説明"}`
+   - エラー通知: `{"event":"error","code":"missing_external_cli","message":"詳細説明"}`（画像入力非対応時は `code: "vision_unsupported"` を使用。ホスト側の初回フォルダ制作 `inspect_images_vision` は警告付きメタデータフォールバックを継続し、既存タイムライン監査 `audit_timeline_slides` は推測誤編集を防ぐため安全停止します）
    - **後方互換性（2 段階 NDJSON パース）**: ホスト側（[`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs)）は `serde_json::Value` による 2 段階パースを行い、上記にない未知の `"event"` を受け取った場合もエラー終了せず安全にスキップします。
 
 ### 2.3 プロトコル B: `acp_stdio`（直接 ACP JSON-RPC 2.0）
 
 `protocol: "acp_stdio"` を指定した場合、ホストは子プロセスに直接 ACP over stdio（JSON-RPC 2.0）で話しかけます（`initialize` → `session/new` → `session/prompt`、`session/update` 通知でテキスト収集）。
+- 画像が添付されている場合、`initialize` 応答の `promptCapabilities.image` が明示 `false` なら `"vision_unsupported"` エラーを返し、対応時は `session/prompt` のコンテンツ配列へ `{"type":"image","mimeType":...,"data":...}` ブロックを追加します。
 - ホスト側の `acp_stdio` プロンプト組み立ておよびリファレンスプラグイン `sea-ai-acp` でも、`history` は `128 KiB` 上限で時系列展開（`# Original User Instruction` ピン留め・圧縮・省略）され、空の `command_schema_json` / `context_summary` セクションは省略されます。
 - `session/update` 通知を解釈する際は、`update.sessionUpdate` により `"agent_message_chunk"`（本文）、`"agent_thought_chunk"`（思考ライブ表示）、`"tool_call"` / `"tool_call_update"`（作業活動ヒント）を明確に分離し、思考やツール進捗を本文レスポンスへ混入させないことを推奨します（[`plugins_src/sea-ai-protocol/src/lib.rs`](../../plugins_src/sea-ai-protocol/src/lib.rs) の `extract_acp_update_event`）。
 また、外部エージェントからツール権限要求（`session/request_permission`）を受ける構成では、[`sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs) のように**プロジェクトファイル破壊やシェル実行を防ぐため明示的に拒否応答する**のが推奨パターンです。
