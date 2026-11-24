@@ -279,6 +279,10 @@ pub struct AppController {
     pub timeline_scroll_y_px: f32,
     /// プレイヘッド移動時に再生位置上のクリップを選択追従させるか。
     pub follow_selected_on_seek: bool,
+    /// 再生中・シーク時のタイムライン水平スクロール追随モード。
+    pub playhead_follow_mode: crate::ui::editor_prefs::TimelinePlayheadFollowMode,
+    /// 再生中の手動水平スクロール操作により自動追随を一時休止しているか。
+    pub playhead_follow_paused_by_manual_scroll: bool,
     /// 再生停止・一時停止時に再生開始位置のフレームへ再生バーを戻すか。
     pub return_playhead_to_start_on_stop: bool,
     /// 直近の再生開始時に記録されたタイムラインフレーム位置。
@@ -404,6 +408,7 @@ impl AppController {
             .and_then(|l| l.clips.first())
             .map(|c| c.id.clone());
 
+        let prefs = crate::ui::editor_prefs::EditorPreferences::load_or_default();
         let last_saved_document = document.clone();
         let mut controller = Self {
             document,
@@ -422,6 +427,8 @@ impl AppController {
             timeline_row_density: TimelineRowDensity::Medium,
             timeline_scroll_y_px: 0.0,
             follow_selected_on_seek: false,
+            playhead_follow_mode: prefs.playhead_follow_mode,
+            playhead_follow_paused_by_manual_scroll: false,
             return_playhead_to_start_on_stop: false,
             playback_start_frame: None,
             show_preview_guides: true,
@@ -1259,8 +1266,10 @@ impl AppController {
             self.clock.seek_to_frame(FrameIndex::ZERO);
         }
         self.playback_start_frame = Some(self.clock.current_frame());
+        self.playhead_follow_paused_by_manual_scroll = false;
         self.clock.set_playing(true);
         self.playback_state = PlaybackState::Playing;
+        self.ensure_playhead_visible_in_timeline(false);
         self.schedule_playback_prefetch(self.clock.current_frame());
     }
 
@@ -1314,8 +1323,18 @@ impl AppController {
         self.refresh_preview_now();
     }
 
-    /// 指定フレームへシークし、プレビューを即時更新する。
+    /// 指定フレームへシークし、プレビューを即時更新する（設定モードに応じてタイムライン追随も実行）。
     pub fn seek_to_frame(&mut self, frame: FrameIndex) {
+        self.playhead_follow_paused_by_manual_scroll = false;
+        self.seek_to_frame_internal(frame, true);
+    }
+
+    /// ルーラードラッグスクラブ用シーク（操作中に画面が横スクロールで逃げないよう追随を行わない）。
+    pub fn scrub_to_frame(&mut self, frame: FrameIndex) {
+        self.seek_to_frame_internal(frame, false);
+    }
+
+    fn seek_to_frame_internal(&mut self, frame: FrameIndex, follow_timeline: bool) {
         self.clock
             .update_timeline_metrics(self.document.fps, self.document.total_duration_frames());
         let max_frame = self.document.seek_upper_bound_frames();
@@ -1329,6 +1348,9 @@ impl AppController {
         self.rendered_frame_was_stale = false;
         self.clock.seek_to_frame(clamped);
         self.apply_follow_selected_on_seek();
+        if follow_timeline {
+            self.ensure_playhead_visible_in_timeline(false);
+        }
         self.dirty_preview = true;
         self.refresh_preview_now();
         self.playback_state = if was_playing {
@@ -1369,9 +1391,99 @@ impl AppController {
         {
             if self.last_rendered_frame != Some(now_frame.get()) {
                 self.apply_follow_selected_on_seek();
+                if self.playback_state == PlaybackState::Playing {
+                    self.ensure_playhead_visible_in_timeline(false);
+                }
             }
             self.refresh_preview_now();
         }
+    }
+
+    /// タイムラインの最大水平スクロール上限（フレーム）を返す。全尺が 1 画面内に収まる場合は `0` を返す。
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    pub fn timeline_max_scroll_frames(&self) -> u64 {
+        let ppf = self.timeline_px_per_frame.max(MIN_TIMELINE_PX_PER_FRAME);
+        let visible_u64 =
+            ((self.timeline_viewport_canvas_width_px.max(320.0) / ppf).floor() as u64).max(1);
+        let span = self.document.ruler_display_span_frames();
+        if span <= visible_u64 {
+            0
+        } else {
+            span.saturating_sub(visible_u64 / 2)
+        }
+    }
+
+    /// 再生中の手動水平スクロール操作を記録し、自動追随を一時休止する（停止中・ズーム時は休止しない）。
+    pub fn mark_timeline_manual_scroll(&mut self) {
+        if self.playback_state == PlaybackState::Playing {
+            self.playhead_follow_paused_by_manual_scroll = true;
+        }
+    }
+
+    /// 現在の追随モードに応じて再生バーが可視範囲に入るようタイムラインを水平スクロールする。
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    pub fn ensure_playhead_visible_in_timeline(&mut self, force_recenter: bool) {
+        use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
+        if self.playhead_follow_mode == TimelinePlayheadFollowMode::Off {
+            return;
+        }
+        if !force_recenter && self.playhead_follow_paused_by_manual_scroll {
+            return;
+        }
+        let ppf = self.timeline_px_per_frame.max(MIN_TIMELINE_PX_PER_FRAME);
+        let visible_u64 =
+            ((self.timeline_viewport_canvas_width_px.max(320.0) / ppf).floor() as u64).max(1);
+        let max_scroll = self.timeline_max_scroll_frames();
+        let head = self.clock.current_frame().get();
+
+        match self.playhead_follow_mode {
+            TimelinePlayheadFollowMode::Off => {}
+            TimelinePlayheadFollowMode::Page => {
+                let right_trigger_offset = ((visible_u64 as f64) * 0.90).floor().max(1.0) as u64;
+                let raw_lead = ((visible_u64 as f64) * 0.12).floor() as u64;
+                // 高ズーム保護: 可視幅が極小のときもページ送りループを避ける
+                let lead = raw_lead.min(right_trigger_offset.saturating_sub(1));
+                let scroll = self.timeline_scroll_x_frames;
+                if head < scroll || head >= scroll.saturating_add(right_trigger_offset) {
+                    self.timeline_scroll_x_frames = head.saturating_sub(lead).min(max_scroll);
+                }
+            }
+            TimelinePlayheadFollowMode::Center => {
+                self.timeline_scroll_x_frames =
+                    head.saturating_sub(visible_u64 / 2).min(max_scroll);
+            }
+        }
+    }
+
+    /// 再生位置追随スクロールモードを変更し、プリファレンスファイルへ保存する。
+    pub fn set_playhead_follow_mode(
+        &mut self,
+        mode: crate::ui::editor_prefs::TimelinePlayheadFollowMode,
+    ) {
+        self.playhead_follow_mode = mode;
+        self.playhead_follow_paused_by_manual_scroll = false;
+        if mode != crate::ui::editor_prefs::TimelinePlayheadFollowMode::Off {
+            self.ensure_playhead_visible_in_timeline(true);
+        }
+        let _ = crate::ui::editor_prefs::EditorPreferences {
+            playhead_follow_mode: mode,
+        }
+        .save();
+    }
+
+    /// 再生位置追随スクロールモードを順送りする (`Page -> Center -> Off -> Page`)。
+    pub fn cycle_playhead_follow_mode(&mut self) {
+        let next = self.playhead_follow_mode.cycle();
+        self.set_playhead_follow_mode(next);
     }
 
     /// `follow_selected_on_seek` 有効時、現在フレーム上にある最前面のロック外クリップへ選択を追従する。
@@ -4378,6 +4490,74 @@ mod tests {
                 .get(&FrameCacheKey::new(img_id, 0, 100))
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn playhead_follow_modes_scroll_scrub_and_manual_pause_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::ids::LayerId;
+        use crate::core::time::FrameCount;
+        use crate::timeline::document::{Layer, TimelineLengthMode};
+        use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
+
+        let mut controller = AppController::new();
+        controller.timeline_viewport_canvas_width_px = 600.0;
+        controller.timeline_px_per_frame = 0.5; // visible = 1200 frames >= 750f (150f + 10s)
+        // 1) 全尺が 1 画面に収まる時は max_scroll == 0
+        controller.document.timeline_length = TimelineLengthMode::Manual {
+            end_frame: FrameCount::new(150)?,
+        };
+        assert_eq!(controller.timeline_max_scroll_frames(), 0);
+        controller.ensure_playhead_visible_in_timeline(true);
+        assert_eq!(controller.timeline_scroll_x_frames, 0);
+
+        // 2) 長尺ドキュメント（1800f + 10s = 2400f, ppf=2.0 で visible=300f）での Page / Center 挙動
+        controller.timeline_px_per_frame = 2.0;
+        let lid = LayerId::new("L_TEST")?;
+        controller.document.layers.push(Layer::new(lid, "Track"));
+        controller.document.timeline_length = TimelineLengthMode::Manual {
+            end_frame: FrameCount::new(1800)?,
+        };
+        assert_eq!(controller.timeline_max_scroll_frames(), 2250);
+
+        controller.playhead_follow_mode = TimelinePlayheadFollowMode::Page;
+        controller.timeline_scroll_x_frames = 0;
+        // 90% (=270f) 未満はスクロールしない
+        controller.seek_to_frame(FrameIndex::new(260));
+        assert_eq!(controller.timeline_scroll_x_frames, 0);
+        // 90% 到達 (270f) で 12% (=36f) 手前へページ送り: 270 - 36 = 234
+        controller.seek_to_frame(FrameIndex::new(270));
+        assert_eq!(controller.timeline_scroll_x_frames, 234);
+
+        // Center モード: 中央 50% (=150f) 追従
+        controller.playhead_follow_mode = TimelinePlayheadFollowMode::Center;
+        controller.seek_to_frame(FrameIndex::new(600));
+        assert_eq!(controller.timeline_scroll_x_frames, 450);
+
+        // scrub_to_frame は手動スクロール状態を変えずタイムライン追随しない
+        controller.scrub_to_frame(FrameIndex::new(100));
+        assert_eq!(controller.timeline_scroll_x_frames, 450);
+
+        // 再生中の手動水平スクロールは追随を一時休止し、seek_to_frame / play で復帰する
+        controller.play();
+        controller.mark_timeline_manual_scroll();
+        assert!(controller.playhead_follow_paused_by_manual_scroll);
+        controller.timeline_scroll_x_frames = 0;
+        controller.ensure_playhead_visible_in_timeline(false);
+        assert_eq!(controller.timeline_scroll_x_frames, 0);
+
+        controller.seek_to_frame(FrameIndex::new(500));
+        assert!(!controller.playhead_follow_paused_by_manual_scroll);
+        assert_eq!(controller.timeline_scroll_x_frames, 350);
+
+        // 高ズーム保護（visible が小さくても right_trigger > lead を保証）
+        controller.timeline_px_per_frame = 60.0; // visible = 10 -> right=9, lead=1
+        controller.playhead_follow_mode = TimelinePlayheadFollowMode::Page;
+        controller.timeline_scroll_x_frames = 100;
+        controller.seek_to_frame(FrameIndex::new(109));
+        assert_eq!(controller.timeline_scroll_x_frames, 108);
+        let _ = FrameCount::new(1)?;
         Ok(())
     }
 }

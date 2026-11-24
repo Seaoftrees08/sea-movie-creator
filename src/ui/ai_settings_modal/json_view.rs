@@ -1,8 +1,8 @@
 //! AI 設定モーダル: `{ } JSON` 直接編集ビュー描画。
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Textarea;
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::input::Editor;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, IntoElement as _, ParentElement as _, Styled as _, div, px, rgba,
 };
@@ -44,15 +44,20 @@ pub(super) fn render_json_mode_view(
         );
     }
 
+    let theme = cx.theme();
     col.child(
         div()
             .w_full()
             .h(px(360.))
             .rounded(px(6.0))
             .border_1()
-            .border_color(rgba(0x3341_55ff))
-            .bg(rgba(0x0f17_2aff))
-            .child(Textarea::new(&modal.json_editor).appearance(false).small()),
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                Editor::new(&modal.json_editor)
+                    .h(px(360.))
+                    .appearance(false),
+            ),
     )
     .child(
         h_flex()

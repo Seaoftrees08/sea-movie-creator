@@ -7,11 +7,12 @@ use std::sync::Arc;
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::slider::{Slider, SliderState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, ThemeMode, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, BorderStyle, Bounds, Context, Corners, Edges, Entity, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, PathBuilder, Pixels, RenderImage,
-    ScrollDelta, ScrollEvent, Styled as _, Window, canvas, div, fill, point, px, quad, rgba, size,
+    AnyElement, BorderStyle, Bounds, ContentMask, Context, Corners, Edges, Entity,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
+    PathBuilder, Pixels, RenderImage, Rgba, ScrollDelta, ScrollEvent, Styled as _, Window, canvas,
+    div, fill, point, px, quad, rgba, size,
 };
 
 use crate::core::ids::ClipId;
@@ -35,6 +36,42 @@ const MASTER_WAVEFORM_HEIGHT_PX: f32 = 34.0;
 /// 下部トランスポートバー高さ (px)。
 const TRANSPORT_BAR_HEIGHT_PX: f32 = 36.0;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PreviewPalette {
+    pub(crate) backdrop_bg: Rgba,
+    pub(crate) canvas_inner_bg: Rgba,
+    pub(crate) canvas_border: Rgba,
+}
+
+pub(crate) fn preview_palette(is_dark: bool) -> PreviewPalette {
+    if is_dark {
+        PreviewPalette {
+            backdrop_bg: rgba(0x2b30_3bff),
+            canvas_inner_bg: rgba(0x0000_00ff),
+            canvas_border: rgba(0x6474_8bcc),
+        }
+    } else {
+        PreviewPalette {
+            backdrop_bg: rgba(0xd4d8_e0ff),
+            canvas_inner_bg: rgba(0x0000_00ff),
+            canvas_border: rgba(0x4755_69cc),
+        }
+    }
+}
+
+pub(crate) fn outer_canvas_border_bounds(canvas_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(
+            canvas_bounds.origin.x - px(1.0),
+            canvas_bounds.origin.y - px(1.0),
+        ),
+        size: size(
+            canvas_bounds.size.width + px(2.0),
+            canvas_bounds.size.height + px(2.0),
+        ),
+    }
+}
+
 #[derive(Clone)]
 struct PreviewCanvasDrawPayload {
     bounds_cell: Rc<Cell<(f32, f32, f32, f32)>>,
@@ -42,6 +79,7 @@ struct PreviewCanvasDrawPayload {
     zoom: PreviewZoomMode,
     pan_px: (f32, f32),
     image: Option<Arc<RenderImage>>,
+    is_dark: bool,
     show_grid: bool,
     show_guides: bool,
     selected_ids: Vec<ClipId>,
@@ -271,12 +309,15 @@ fn render_preview_viewport(
         PreviewHoverKind::Handle { handle, .. } => Some(handle),
         _ => None,
     });
+    let is_dark = cx.theme().mode == ThemeMode::Dark;
+    let palette = preview_palette(is_dark);
     let payload = PreviewCanvasDrawPayload {
         bounds_cell: Rc::clone(&controller.preview_viewport_bounds),
         proj_size: (proj_w, proj_h),
         zoom: controller.preview_zoom,
         pan_px: controller.preview_pan_offset_px,
         image: controller.surface_bridge.front_image(),
+        is_dark,
         show_grid: controller.show_preview_grid,
         show_guides: controller.show_preview_guides,
         selected_ids: controller.effective_selected_clip_ids(),
@@ -310,7 +351,7 @@ fn render_preview_viewport(
         .w_full()
         .min_h(px(120.0))
         .overflow_hidden()
-        .bg(rgba(0x0b0e_14ff))
+        .bg(palette.backdrop_bg)
         .cursor(hover_cursor)
         .on_mouse_down(
             MouseButton::Left,
@@ -464,33 +505,44 @@ fn paint_preview_viewport_canvas(
         origin: point(px(rx), px(ry)),
         size: size(px(rw), px(rh)),
     };
+    let palette = preview_palette(data.is_dark);
 
-    window.paint_quad(quad(
-        canvas_bounds,
-        Corners::all(px(0.0)),
-        rgba(0x1115_1eff),
-        Edges::all(px(1.0)),
-        rgba(0x3341_55ff),
-        BorderStyle::Solid,
-    ));
+    window.with_content_mask(
+        Some(ContentMask {
+            bounds: viewport_bounds,
+        }),
+        |window| {
+            window.paint_quad(fill(canvas_bounds, palette.canvas_inner_bg));
 
-    if let Some(image) = &data.image {
-        let _ = window.paint_image(
-            viewport_bounds,
-            canvas_bounds,
-            Corners::all(px(0.0)),
-            Arc::clone(image),
-            0,
-            false,
-        );
-    }
+            if let Some(image) = &data.image {
+                let _ = window.paint_image(
+                    viewport_bounds,
+                    canvas_bounds,
+                    Corners::all(px(0.0)),
+                    Arc::clone(image),
+                    0,
+                    false,
+                );
+            }
 
-    if data.show_grid {
-        paint_grid_lines(viewport_bounds, &tf, data.proj_size, window);
-    }
-    if data.show_guides {
-        paint_selection_wireframes(&tf, data, window);
-    }
+            // 動画ピクセル端を潰さず、かつ拡大時は viewport_bounds クリップ内に収まるよう外周 1px 枠線を後描画
+            window.paint_quad(quad(
+                outer_canvas_border_bounds(canvas_bounds),
+                Corners::all(px(0.0)),
+                rgba(0x0000_0000),
+                Edges::all(px(1.0)),
+                palette.canvas_border,
+                BorderStyle::Solid,
+            ));
+
+            if data.show_grid {
+                paint_grid_lines(viewport_bounds, &tf, data.proj_size, window);
+            }
+            if data.show_guides {
+                paint_selection_wireframes(&tf, data, window);
+            }
+        },
+    );
 }
 
 fn paint_grid_lines(
@@ -1183,4 +1235,37 @@ fn add_transport_buttons(
                 cx.notify();
             })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_palette_distinguishes_backdrop_from_black_canvas() {
+        let dark = preview_palette(true);
+        assert_eq!(dark.backdrop_bg, rgba(0x2b30_3bff));
+        assert_eq!(dark.canvas_inner_bg, rgba(0x0000_00ff));
+        assert_eq!(dark.canvas_border, rgba(0x6474_8bcc));
+        assert_ne!(dark.backdrop_bg, dark.canvas_inner_bg);
+
+        let light = preview_palette(false);
+        assert_eq!(light.backdrop_bg, rgba(0xd4d8_e0ff));
+        assert_eq!(light.canvas_inner_bg, rgba(0x0000_00ff));
+        assert_eq!(light.canvas_border, rgba(0x4755_69cc));
+        assert_ne!(light.backdrop_bg, light.canvas_inner_bg);
+    }
+
+    #[test]
+    fn outer_canvas_border_bounds_expands_by_one_pixel_on_each_side() {
+        let inner = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: size(px(640.0), px(360.0)),
+        };
+        let outer = outer_canvas_border_bounds(inner);
+        assert!((f32::from(outer.origin.x) - 99.0).abs() < 1e-4);
+        assert!((f32::from(outer.origin.y) - 49.0).abs() < 1e-4);
+        assert!((f32::from(outer.size.width) - 642.0).abs() < 1e-4);
+        assert!((f32::from(outer.size.height) - 362.0).abs() < 1e-4);
+    }
 }

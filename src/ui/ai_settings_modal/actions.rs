@@ -1,6 +1,6 @@
 //! AI 設定モーダルに対する操作アクション・保存ハンドラ。
 
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{EditorState, InputState};
 use gpui_kit::{App, AppContext as _, Context, Focusable as _, Window};
 
 use crate::ai::provider::{AiProviderKind, AiThinkingLevel, SecretString};
@@ -86,7 +86,12 @@ impl SeaEditorWindow {
                 .placeholder(crate::ui::i18n::tr("ai.settings_budget_placeholder"))
                 .default_value(initial_budget)
         });
-        let json_editor = cx.new(|cx| TextareaState::new(window, cx).rows(14).soft_wrap(false));
+        // Ctrl+F 検索パネルとモーダル内の Escape 閉じ操作が競合しないよう searchable(false) を明示する。
+        let json_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("json")
+                .searchable(false)
+        });
         json_editor.update(cx, |s, cx| s.set_value(&initial_json, window, cx));
 
         let mut focus_subs = Vec::new();
