@@ -23,6 +23,7 @@ pub(super) fn render_agent_budget_tab(
 ) -> AnyElement {
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_2p5()
         .child(render_agent_safety_card(&chat.runtime_settings, cx))
         .child(render_budget_and_display_card(modal, chat, cx))
@@ -106,6 +107,8 @@ fn render_agent_safety_card(
     }
 
     v_flex()
+        .w_full()
+        .min_w(px(0.))
         .gap_2()
         .p_2p5()
         .rounded(px(6.0))
@@ -155,6 +158,8 @@ fn render_budget_and_display_card(
     }
 
     v_flex()
+        .w_full()
+        .min_w(px(0.))
         .gap_2()
         .p_2p5()
         .rounded(px(6.0))
@@ -170,20 +175,25 @@ fn render_budget_and_display_card(
         )
         .child(
             h_flex()
+                .w_full()
+                .min_w(px(0.))
                 .gap_1p5()
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.))
                         .child(Input::new(&modal.budget_usd_input).small()),
                 )
                 .child(
-                    Button::new("ai-modal-save-budget")
-                        .xsmall()
-                        .primary()
-                        .label(tr("ai.settings_save_budget"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.save_modal_budget(cx);
-                        })),
+                    div().flex_shrink_0().child(
+                        Button::new("ai-modal-save-budget")
+                            .xsmall()
+                            .primary()
+                            .label(tr("ai.settings_save_budget"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_modal_budget(cx);
+                            })),
+                    ),
                 ),
         )
         .child(pref_row)

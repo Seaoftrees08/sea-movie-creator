@@ -53,6 +53,7 @@ pub(super) fn render_json_mode_view(
             .border_1()
             .border_color(theme.border)
             .bg(theme.background)
+            .overflow_hidden()
             .child(
                 Editor::new(&modal.json_editor)
                     .h(px(360.))

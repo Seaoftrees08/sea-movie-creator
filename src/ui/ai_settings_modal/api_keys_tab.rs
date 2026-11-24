@@ -30,12 +30,17 @@ pub(super) fn render_api_keys_tab(
 
     let mut panel = v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_2p5()
         .child(render_provider_pills(kind, "ai-cfg-prov", cx))
         .child(
             h_flex()
+                .w_full()
+                .min_w(px(0.))
                 .items_center()
                 .justify_between()
+                .gap_2()
+                .flex_wrap()
                 .p_2()
                 .rounded(px(6.0))
                 .bg(rgba(0x0f17_2aff))
@@ -94,6 +99,7 @@ fn render_api_key_controls(
     let has_keyring = kind.keyring_account().is_some();
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_1p5()
         .p_2p5()
         .rounded(px(6.0))
@@ -158,6 +164,8 @@ fn render_cli_auth_note(kind: &AiProviderKind) -> AnyElement {
         _ => "ACP CLI は各ツール (`claude` / `codex` / `copilot`) の既存ログイン状態を使用します。",
     };
     div()
+        .w_full()
+        .min_w(px(0.))
         .p_2p5()
         .rounded(px(6.0))
         .bg(rgba(0x0f17_2a99))
@@ -177,6 +185,7 @@ fn render_base_url_controls(
     let heading = tr("ai.settings_base_url_heading").replace("{url}", kind.default_base_url());
     v_flex()
         .w_full()
+        .min_w(px(0.))
         .gap_1p5()
         .p_2p5()
         .rounded(px(6.0))
