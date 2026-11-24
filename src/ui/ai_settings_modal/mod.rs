@@ -12,7 +12,7 @@ use std::process::Command;
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{EditorState, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -75,8 +75,8 @@ pub struct AiSettingsModalState {
     pub custom_model_supports_thinking: bool,
     /// ユーザー設定予算上限 (USD) 入力欄。
     pub budget_usd_input: Entity<InputState>,
-    /// `{ } JSON` 生編集テキストエリア。
-    pub json_editor: Entity<TextareaState>,
+    /// `{ } JSON` 直接編集コードエディタ状態（`tree-sitter` JSON ハイライト対応）。
+    pub json_editor: Entity<EditorState>,
     /// 操作結果のフィードバック (`(is_error, message)`)。
     pub feedback: Option<(bool, String)>,
 }
