@@ -71,6 +71,43 @@ pub fn get_json_sync(request: &HttpGetRequest<'_>) -> Result<Value, AiError> {
 
 /// 指定 URL へ JSON POST を行い、2xx 以外のステータス時に本文付き [`AiError::HttpStatus`] を返す。
 ///
+/// ストリーミング応答時は `text/event-stream` イベント単位パーサを呼び出し、非 SSE の JSON 応答へも自動フォールバックする。
+/// 状態値 `state` をクロージャ間で所有権引き回しすることで、呼び出し側の二重可変借用を回避する。
+/// `on_sse_event(&mut state, event_name, payload)` は各 SSE イベントごとに呼ばれ、`Ok(true)` を返すとストリーム読み取りを正常終了する。
+///
+/// # Errors
+///
+/// 通信失敗・HTTP エラー・JSON/SSE 解析エラー時に [`AiError`] を返す。
+pub fn post_json_sse_or_sync<S, T, FSse, FFinish, FSync>(
+    request: &HttpJsonRequest<'_>,
+    mut state: S,
+    mut on_sse_event: FSse,
+    finish_sse: FFinish,
+    on_sync_json: FSync,
+) -> Result<T, AiError>
+where
+    FSse: FnMut(&mut S, Option<&str>, &str) -> Result<bool, AiError>,
+    FFinish: FnOnce(S) -> Result<T, AiError>,
+    FSync: FnOnce(S, &Value) -> Result<T, AiError>,
+{
+    let (mut resp, content_type) = send_json_post(request, "text/event-stream, application/json")?;
+
+    if content_type.contains("text/event-stream") {
+        read_sse_events(resp.body_mut().as_reader(), &mut |evt, payload| {
+            on_sse_event(&mut state, evt, payload)
+        })?;
+        finish_sse(state)
+    } else {
+        let json_val: Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))?;
+        on_sync_json(state, &json_val)
+    }
+}
+
+/// 指定 URL へ JSON POST を行い、2xx 以外のステータス時に本文付き [`AiError::HttpStatus`] を返す。
+///
 /// ストリーミング応答時は `text/event-stream` 行単位パーサを呼び出し、非 SSE の JSON 応答へも自動フォールバックする。
 ///
 /// # Errors
@@ -86,21 +123,41 @@ where
     FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
     FSync: FnMut(&Value) -> Result<String, AiError>,
 {
-    let (mut resp, content_type) = send_json_post(request, "text/event-stream, application/json")?;
+    post_json_sse_or_sync(
+        request,
+        (String::new(), on_event),
+        |(collected, evt_cb), _event_name, payload| {
+            if let Some(delta) = on_sse_payload(payload)?
+                && !delta.is_empty()
+            {
+                append_collected_delta(collected, &delta, *evt_cb)?;
+            }
+            Ok(false)
+        },
+        |(collected, _)| Ok(collected),
+        |(_, evt_cb), json_val| {
+            let text = on_sync_json(json_val)?;
+            if !text.is_empty() {
+                evt_cb(AiStreamEvent::DeltaText(text.clone()));
+            }
+            Ok(text)
+        },
+    )
+}
 
-    if content_type.contains("text/event-stream") {
-        read_sse_lines(resp.body_mut().as_reader(), &mut on_sse_payload, on_event)
-    } else {
-        let json_val: Value = resp
-            .body_mut()
-            .read_json()
-            .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))?;
-        let text = on_sync_json(&json_val)?;
-        if !text.is_empty() {
-            on_event(AiStreamEvent::DeltaText(text.clone()));
-        }
-        Ok(text)
+fn append_collected_delta(
+    collected: &mut String,
+    delta: &str,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<(), AiError> {
+    if collected.len().saturating_add(delta.len()) > MAX_SSE_COLLECTED_BYTES {
+        return Err(AiError::ParseFailed(format!(
+            "SSE accumulated stream exceeded max size ({MAX_SSE_COLLECTED_BYTES} bytes)"
+        )));
     }
+    on_event(AiStreamEvent::DeltaText(delta.to_owned()));
+    collected.push_str(delta);
+    Ok(())
 }
 
 /// 指定 URL へ非ストリーミングの JSON POST を行い、完全な JSON 応答オブジェクトを返す。
@@ -227,6 +284,7 @@ fn send_json_post(
     Ok((resp, content_type))
 }
 
+#[cfg(test)]
 fn read_sse_lines<R, FChunk>(
     reader: R,
     on_sse_payload: &mut FChunk,
@@ -236,11 +294,27 @@ where
     R: std::io::Read,
     FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
 {
+    let mut collected = String::new();
+    read_sse_events(reader, &mut |_event_name, payload| {
+        if let Some(delta) = on_sse_payload(payload)?
+            && !delta.is_empty()
+        {
+            append_collected_delta(&mut collected, &delta, on_event)?;
+        }
+        Ok(false)
+    })?;
+    Ok(collected)
+}
+
+fn read_sse_events<R, FSse>(reader: R, on_sse_event: &mut FSse) -> Result<(), AiError>
+where
+    R: std::io::Read,
+    FSse: FnMut(Option<&str>, &str) -> Result<bool, AiError>,
+{
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     let mut event_name: Option<String> = None;
     let mut event_data = String::new();
-    let mut collected = String::new();
     let line_limit = u64::try_from(MAX_SSE_LINE_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
 
     loop {
@@ -248,13 +322,7 @@ where
         let read = std::io::Read::take(&mut buf_reader, line_limit).read_line(&mut line)?;
         if read == 0 {
             if !event_data.is_empty() {
-                let _ = flush_sse_event(
-                    &mut event_name,
-                    &mut event_data,
-                    &mut collected,
-                    on_sse_payload,
-                    on_event,
-                )?;
+                let _ = flush_sse_event(&mut event_name, &mut event_data, on_sse_event)?;
             }
             break;
         }
@@ -265,13 +333,7 @@ where
         }
         let raw_line = line.trim_end_matches(['\r', '\n']);
         if raw_line.is_empty() {
-            if flush_sse_event(
-                &mut event_name,
-                &mut event_data,
-                &mut collected,
-                on_sse_payload,
-                on_event,
-            )? {
+            if flush_sse_event(&mut event_name, &mut event_data, on_sse_event)? {
                 break;
             }
             continue;
@@ -296,18 +358,16 @@ where
             event_data.push_str(value);
         }
     }
-    Ok(collected)
+    Ok(())
 }
 
-fn flush_sse_event<FChunk>(
+fn flush_sse_event<FSse>(
     event_name: &mut Option<String>,
     event_data: &mut String,
-    collected: &mut String,
-    on_sse_payload: &mut FChunk,
-    on_event: &mut dyn FnMut(AiStreamEvent),
+    on_sse_event: &mut FSse,
 ) -> Result<bool, AiError>
 where
-    FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
+    FSse: FnMut(Option<&str>, &str) -> Result<bool, AiError>,
 {
     let name = event_name.take();
     if event_data.is_empty() {
@@ -325,18 +385,7 @@ where
         let snippet: String = payload.chars().take(600).collect();
         return Err(AiError::ParseFailed(format!("SSE error event: {snippet}")));
     }
-    if let Some(delta) = on_sse_payload(payload)?
-        && !delta.is_empty()
-    {
-        if collected.len().saturating_add(delta.len()) > MAX_SSE_COLLECTED_BYTES {
-            return Err(AiError::ParseFailed(format!(
-                "SSE accumulated stream exceeded max size ({MAX_SSE_COLLECTED_BYTES} bytes)"
-            )));
-        }
-        on_event(AiStreamEvent::DeltaText(delta.clone()));
-        collected.push_str(&delta);
-    }
-    Ok(false)
+    on_sse_event(name.as_deref(), payload)
 }
 
 #[cfg(test)]
@@ -454,6 +503,59 @@ mod tests {
             ));
         };
         assert!(err.to_string().contains("overloaded"));
+        Ok(())
+    }
+
+    #[test]
+    fn post_json_sse_or_sync_supports_sse_and_json_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sse = "event: ping\ndata: {\"n\":1}\n\ndata: {\"n\":2}\n\ndata: [DONE]\n\n";
+        let (addr1, srv1) = test_http::spawn_single_response_server("text/event-stream", sse)?;
+        let url1 = format!("http://{addr1}/v1/test");
+        let body = serde_json::json!({"ok": true});
+        let req1 = HttpJsonRequest {
+            url: &url1,
+            headers: &[],
+            body: &body,
+            timeout_secs: 5,
+        };
+        let (sum, seen) = post_json_sse_or_sync(
+            &req1,
+            Vec::new(),
+            |seen, evt, payload| {
+                let v: Value = serde_json::from_str(payload)
+                    .map_err(|e| AiError::ParseFailed(e.to_string()))?;
+                seen.push((evt.map(ToOwned::to_owned), v["n"].as_u64().unwrap_or(0)));
+                Ok(false)
+            },
+            |seen| {
+                let sum = seen.iter().map(|(_, n)| *n).sum::<u64>();
+                Ok((sum, seen))
+            },
+            |seen, _| Ok((0, seen)),
+        )?;
+        assert_eq!(sum, 3);
+        assert_eq!(seen, vec![(Some("ping".to_owned()), 1), (None, 2)]);
+        let _ = srv1.join().map_err(|_| "srv1 join")??;
+
+        let (addr2, srv2) =
+            test_http::spawn_single_response_server("application/json", r#"{"n":42}"#)?;
+        let url2 = format!("http://{addr2}/v1/test");
+        let req2 = HttpJsonRequest {
+            url: &url2,
+            headers: &[],
+            body: &body,
+            timeout_secs: 5,
+        };
+        let fallback = post_json_sse_or_sync(
+            &req2,
+            (),
+            |(), _, _| Ok(false),
+            |()| Ok(0),
+            |(), v| Ok(v["n"].as_u64().unwrap_or(0)),
+        )?;
+        assert_eq!(fallback, 42);
+        let _ = srv2.join().map_err(|_| "srv2 join")??;
         Ok(())
     }
 }

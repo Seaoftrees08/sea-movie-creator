@@ -5,9 +5,9 @@
 use std::io::{self, BufReader, StdinLock, StdoutLock};
 
 use sea_agent_protocol::{
-    AgentAskChoice, AgentAskField, AgentLlmMessage, AgentLlmToolCall, AgentToHostMessage,
-    AgentToolSpec, AgentUserAnswerPayload, HostToAgentMessage, protocol_error_with_memory,
-    read_ndjson_line, write_ndjson_line,
+    AgentAskChoice, AgentAskField, AgentLlmMessage, AgentLlmToolCall, AgentThinkingBlock,
+    AgentToHostMessage, AgentToolSpec, AgentUserAnswerPayload, HostToAgentMessage,
+    protocol_error_with_memory, read_ndjson_line, write_ndjson_line,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -31,6 +31,17 @@ impl std::fmt::Display for RpcError {
             Self::Remote(e) => write!(f, "{e}"),
         }
     }
+}
+
+/// `llm_chat` 応答で返却されるテキスト・ツール呼び出し・思考署名ブロック一式。
+#[derive(Debug, Clone, Default)]
+pub struct AgentLlmReply {
+    /// 生成されたテキスト応答。
+    pub text: String,
+    /// モデルが要求したツール呼び出し一覧。
+    pub tool_calls: Vec<AgentLlmToolCall>,
+    /// 次ターンへ引き回す思考署名ブロック一覧。
+    pub thinking_blocks: Vec<AgentThinkingBlock>,
 }
 
 /// ホストとの双方向 NDJSON 会話セッション I/O ハンドル。
@@ -177,7 +188,7 @@ impl<'a> AgentTransport<'a> {
         tools: &[AgentToolSpec],
         response_json_schema: Option<&Value>,
         prefer_json_object: bool,
-    ) -> Result<(String, Vec<AgentLlmToolCall>), RpcError> {
+    ) -> Result<AgentLlmReply, RpcError> {
         #[derive(Serialize)]
         struct LlmChatRef<'a> {
             #[serde(rename = "type")]
@@ -216,12 +227,17 @@ impl<'a> AgentTransport<'a> {
                     request_id,
                     ok,
                     text,
+                    thinking_blocks,
                     tool_calls,
                     error,
                     ..
                 }) if request_id == req_id => {
                     if ok {
-                        return Ok((text, tool_calls));
+                        return Ok(AgentLlmReply {
+                            text,
+                            tool_calls,
+                            thinking_blocks,
+                        });
                     }
                     return Err(RpcError::Remote(
                         error.unwrap_or_else(|| "llm_chat returned failure".to_owned()),

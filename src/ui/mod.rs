@@ -1,5 +1,6 @@
 //! GPUI ベースのメイン画面・プレビュー・各種パネル UI モジュール。
 
+pub mod ai_activity_view;
 pub mod ai_agent_widgets;
 pub mod ai_chat_panel;
 pub mod ai_settings_modal;

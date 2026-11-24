@@ -147,18 +147,29 @@ sea-movie-creator mcp --project path/to/project.smc.json
 2. **プラグイン → ホスト（`stdout` NDJSON イベント）**:
    - 状態通知: `{"event":"status","message":"接続中..."}`
    - ストリーミング差分: `{"event":"delta","text":"{\"type\":\"add_layer\","}`
+   - 思考過程デルタ（任意）: `{"event":"thought","text":"字幕 #1 の設定値を確認中..."}`
+   - ツール・作業ステップ通知（任意）: `{"event":"activity","label":"Inspecting workspace metadata"}`
    - 利用可能モデル一覧（`list_models` 用）: `{"event":"models","models":[{"id":"gemini-4-argon","display_name":"Gemini 4 Argon","badge":null,"thinking_levels":["low","medium","high"],"default_thinking":"medium","available":true,"note":"ACP利用可能"}]}`
    - 生成完了: `{"event":"completed","raw_text":"{\"type\":\"add_layer\",\"name\":\"...\"}","model":"example:model-1","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"cost_usd":null,"is_estimated":false}}`
      - `raw_text` が空文字の場合、ホストはそれまでに受信した `delta` の連結文字列を最終応答として採用します。
      - `usage` フィールドは任意（`#[serde(default)]`）であり、省略時は後方互換としてホスト側が推定・未指定扱いにフォールバックします。
    - エラー通知: `{"event":"error","code":"missing_external_cli","message":"詳細説明"}`
+   - **後方互換性（2 段階 NDJSON パース）**: ホスト側（[`src/ai/plugin_host.rs`](../../src/ai/plugin_host.rs)）は `serde_json::Value` による 2 段階パースを行い、上記にない未知の `"event"` を受け取った場合もエラー終了せず安全にスキップします。
 
 ### 2.3 プロトコル B: `acp_stdio`（直接 ACP JSON-RPC 2.0）
 
 `protocol: "acp_stdio"` を指定した場合、ホストは子プロセスに直接 ACP over stdio（JSON-RPC 2.0）で話しかけます（`initialize` → `session/new` → `session/prompt`、`session/update` 通知でテキスト収集）。
 - ホスト側の `acp_stdio` プロンプト組み立ておよびリファレンスプラグイン `sea-ai-acp` でも、`history` は `128 KiB` 上限で時系列展開（`# Original User Instruction` ピン留め・圧縮・省略）され、空の `command_schema_json` / `context_summary` セクションは省略されます。
-- `session/update` 通知を解釈する際は、`update.sessionUpdate` が存在する場合 `"agent_message_chunk"` のみを応答本文として採用し、`agent_thought_chunk` や `tool_call` が混入しないようフィルタすることを推奨します。
-また、外部エージェントからツール権限要求（`session/request_permission`）を受ける構成では、[`sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs#L268-L322) のように**プロジェクトファイル破壊やシェル実行を防ぐため明示的に拒否応答する**のが推奨パターンです。
+- `session/update` 通知を解釈する際は、`update.sessionUpdate` により `"agent_message_chunk"`（本文）、`"agent_thought_chunk"`（思考ライブ表示）、`"tool_call"` / `"tool_call_update"`（作業活動ヒント）を明確に分離し、思考やツール進捗を本文レスポンスへ混入させないことを推奨します（[`plugins_src/sea-ai-protocol/src/lib.rs`](../../plugins_src/sea-ai-protocol/src/lib.rs) の `extract_acp_update_event`）。
+また、外部エージェントからツール権限要求（`session/request_permission`）を受ける構成では、[`sea-ai-antigravity/src/main.rs`](../../plugins_src/sea-ai-antigravity/src/main.rs) のように**プロジェクトファイル破壊やシェル実行を防ぐため明示的に拒否応答する**のが推奨パターンです。
+
+### 2.4 自律エージェントプラグインプロトコル（`sea_agent_v1` 拡張ポイント）
+
+`plugins/agent/<id>/agent-plugin.json` で分離された別プロセス型自律エージェントプラグイン（リファレンス実装: [`plugins_src/sea-agent-director/src/director.rs`](../../plugins_src/sea-agent-director/src/director.rs)）との `sea_agent_v1` 通信仕様（[`plugins_src/sea-agent-protocol/src/lib.rs`](../../plugins_src/sea-agent-protocol/src/lib.rs)）では、プロバイダ連携の後方互換拡張として以下の任意フィールド（`#[serde(default, skip_serializing_if = ...)]`）が定義されています。
+
+- `HostToAgentMessage::LlmResponse.thinking_blocks` / `AgentLlmMessage.thinking_blocks`: Anthropic 拡張思考等で返却された署名付き思考ブロック（`AgentThinkingBlock { thinking, signature }`）を次ターンへそのまま引き回すための任意配列。
+- `AgentLlmToolCall.thought_signature`: Gemini 等が返すツール呼び出しに紐づく思考署名文字列（任意）。
+- 既存の `CallTool` / `AskUser` に対する VS Code 風アクティビティ（開始・完了・実処理時間計測）は本体機能モジュール [`src/ai/agent_host.rs`](../../src/ai/agent_host.rs) がホスト側で生成するため、プラグイン側へ新しい必須メッセージは課しません。
 
 ### 2.4 テスト用フィクスチャ
 

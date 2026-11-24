@@ -1000,6 +1000,7 @@ mod tests {
                 })
                 .to_string(),
             ),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-vision".to_owned(),
             finish_reason: Some("stop".to_owned()),

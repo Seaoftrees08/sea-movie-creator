@@ -934,6 +934,10 @@ pub struct AiResponse {
 pub enum AiStreamEvent {
     /// 接続中・待機中などの状態変化通知。
     Status(String),
+    /// 思考過程の逐次テキスト差分チャンク。
+    ThoughtDelta(String),
+    /// 外部ツール等の作業アクティビティヒント。
+    ActivityHint(String),
     /// 逐次生成されたテキスト差分チャンク。
     DeltaText(String),
     /// 全文受信完了。
@@ -1055,6 +1059,17 @@ pub struct AiToolDefinition {
     pub parameters_schema: serde_json::Value,
 }
 
+/// Anthropic 等がマルチターン Tool Use 時に再送を要求する署名付き思考ブロック。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThinkingBlock {
+    /// 思考テキスト本体。
+    #[serde(default)]
+    pub thinking: String,
+    /// プロバイダ発行の署名文字列。
+    #[serde(default)]
+    pub signature: String,
+}
+
 /// LLM 応答から抽出された 1 件のツール呼び出し要求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiToolCall {
@@ -1065,6 +1080,9 @@ pub struct AiToolCall {
     /// ツール引数 JSON。
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Gemini 3/4 等が返すツール呼び出し思考署名（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// マルチターン・ツール実行を含むエージェント推論用メッセージ。
@@ -1086,6 +1104,9 @@ pub enum AiTurnMessage {
         /// 応答テキスト（ツール呼び出しのみ時は `None`）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// モデルが返した署名付き思考ブロック群（任意）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<AiThinkingBlock>,
         /// 要求されたツール呼び出し一覧。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<AiToolCall>,
@@ -1167,6 +1188,9 @@ pub struct AiAgentTurnResponse {
     /// テキスト応答（存在する場合）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// モデルが返した署名付き思考ブロック群（任意）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<AiThinkingBlock>,
     /// モデルが要求したツール呼び出し一覧。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AiToolCall>,
@@ -1378,7 +1402,9 @@ fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
             }
             (AiRole::User, texts.join("\n"))
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text, tool_calls, ..
+        } => {
             if tool_calls.is_empty() {
                 (AiRole::Assistant, text.clone().unwrap_or_default())
             } else {
@@ -1426,6 +1452,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                     id,
                     name: name.to_owned(),
                     arguments,
+                    thought_signature: None,
                 });
             }
         }
@@ -1436,6 +1463,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                 .map(ToOwned::to_owned);
             return AiAgentTurnResponse {
                 text: note,
+                thinking_blocks: Vec::new(),
                 tool_calls: parsed_calls,
                 model: model.to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -1446,6 +1474,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
 
     AiAgentTurnResponse {
         text: (!raw_text.trim().is_empty()).then(|| raw_text.to_owned()),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         model: model.to_owned(),
         finish_reason: Some("stop".to_owned()),
@@ -1571,16 +1600,19 @@ mod tests {
                 },
                 AiTurnMessage::Assistant {
                     text: Some("確認します".to_owned()),
+                    thinking_blocks: Vec::new(),
                     tool_calls: vec![
                         AiToolCall {
                             id: "c1".to_owned(),
                             name: "get_timeline_summary".to_owned(),
                             arguments: serde_json::json!({}),
+                            thought_signature: None,
                         },
                         AiToolCall {
                             id: "c2".to_owned(),
                             name: "get_capabilities".to_owned(),
                             arguments: serde_json::json!({ "include_schemas": true }),
+                            thought_signature: None,
                         },
                     ],
                 },

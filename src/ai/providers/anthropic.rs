@@ -1,14 +1,16 @@
 //! Anthropic Messages API クライアント。
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
-    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, AiToolCall,
-    AiTurnMessage, SecretString,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingBlock, AiThinkingLevel, AiTokenUsage,
+    AiToolCall, AiTurnMessage, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
-use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
+use crate::ai::providers::sse::{HttpJsonRequest, post_json_sse_or_sync};
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
@@ -143,11 +145,19 @@ impl AnthropicProvider {
             }));
         }
 
-        // マルチターン Tool Use で thinking ブロック（signature）を保持するまでは、
-        // tools 併用時の thinking 付与を抑止し 2 ターン目 HTTP 400 を防ぐ
-        let budget = request
-            .tools
-            .is_empty()
+        // 過去の tool_use 付き Assistant メッセージに thinking 署名が欠落している履歴を含む場合のみ、
+        // API の HTTP 400（tool_use 直前に署名付き thinking ブロック必須）を回避するため thinking を抑止する。
+        let missing_history_thinking_signature = request.messages.iter().any(|turn| {
+            matches!(
+                turn,
+                AiTurnMessage::Assistant {
+                    thinking_blocks,
+                    tool_calls,
+                    ..
+                } if !tool_calls.is_empty() && thinking_blocks.is_empty()
+            )
+        });
+        let budget = (!missing_history_thinking_signature)
             .then(|| self.config.thinking_level.anthropic_budget_tokens())
             .flatten();
         let max_tokens = match budget {
@@ -159,7 +169,7 @@ impl AnthropicProvider {
             "max_tokens": max_tokens,
             "system": system_text,
             "messages": messages,
-            "stream": false,
+            "stream": self.config.use_streaming,
         });
         if !request.tools.is_empty() {
             let tools: Vec<Value> = request
@@ -234,13 +244,26 @@ impl AiProvider for AnthropicProvider {
             body: &body,
             timeout_secs: self.config.timeout_secs,
         };
-        let mut sse_usage: Option<AiTokenUsage> = None;
-        let mut sync_usage: Option<AiTokenUsage> = None;
-        let raw_text = post_json_streaming_or_sync(
+        let (raw_text, sse_usage, sync_usage, on_event) = post_json_sse_or_sync(
             &http_req,
-            |payload| parse_anthropic_sse_chunk(payload, &mut sse_usage),
-            |val| parse_anthropic_sync_text(val, &mut sync_usage),
-            on_event,
+            (
+                String::new(),
+                None::<AiTokenUsage>,
+                None::<AiTokenUsage>,
+                on_event,
+            ),
+            |(collected, sse_u, _, evt_cb), _event_name, payload| {
+                process_anthropic_streaming_sse_payload(payload, collected, sse_u, *evt_cb)?;
+                Ok(false)
+            },
+            |(collected, sse_u, sync_u, evt_cb)| Ok((collected, sse_u, sync_u, evt_cb)),
+            |(_, sse_u, mut sync_u, evt_cb), val| {
+                let text = parse_anthropic_sync_text(val, &mut sync_u)?;
+                if !text.is_empty() {
+                    evt_cb(AiStreamEvent::DeltaText(text.clone()));
+                }
+                Ok((text, sse_u, sync_u, evt_cb))
+            },
         )?;
 
         let response = AiResponse {
@@ -281,8 +304,22 @@ impl AiProvider for AnthropicProvider {
             body: &body,
             timeout_secs: self.config.timeout_secs,
         };
-        let val = post_json_sync(&http_req)?;
-        parse_anthropic_agent_response(&val, &self.config.model)
+        post_json_sse_or_sync(
+            &http_req,
+            (AnthropicAgentStreamAcc::default(), on_event),
+            |(acc, evt_cb), _event_name, payload| {
+                process_anthropic_agent_sse_payload(acc, payload, *evt_cb)?;
+                Ok(false)
+            },
+            |(state, _)| finalize_anthropic_agent_stream(state, &self.config.model),
+            |(_, evt_cb), val| {
+                let parsed = parse_anthropic_agent_response(val, &self.config.model)?;
+                if let Some(txt) = parsed.text.as_ref().filter(|s| !s.is_empty()) {
+                    evt_cb(AiStreamEvent::DeltaText(txt.clone()));
+                }
+                Ok(parsed)
+            },
+        )
     }
 }
 
@@ -309,8 +346,21 @@ fn anthropic_turn_message_to_blocks(msg: &AiTurnMessage) -> (&'static str, Vec<V
                 .collect();
             ("user", content)
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text,
+            thinking_blocks,
+            tool_calls,
+        } => {
             let mut content = Vec::new();
+            for tb in thinking_blocks {
+                if !tb.signature.is_empty() {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": tb.thinking,
+                        "signature": tb.signature,
+                    }));
+                }
+            }
             if let Some(txt) = text
                 && !txt.is_empty()
             {
@@ -343,6 +393,229 @@ fn anthropic_turn_message_to_blocks(msg: &AiTurnMessage) -> (&'static str, Vec<V
     }
 }
 
+#[derive(Debug)]
+enum AnthropicStreamBlock {
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    Text,
+    ToolUse {
+        id: String,
+        name: String,
+        partial_json: String,
+    },
+}
+
+#[derive(Debug, Default)]
+struct AnthropicAgentStreamAcc {
+    text_buf: String,
+    blocks: BTreeMap<usize, AnthropicStreamBlock>,
+    finish_reason: Option<String>,
+    usage: Option<AiTokenUsage>,
+}
+
+fn process_anthropic_streaming_sse_payload(
+    payload: &str,
+    collected: &mut String,
+    captured_usage: &mut Option<AiTokenUsage>,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<(), AiError> {
+    let val: Value = serde_json::from_str(payload)
+        .map_err(|err| AiError::ParseFailed(format!("Anthropic SSE JSON parse failed: {err}")))?;
+    if val["type"].as_str() == Some("error") {
+        let msg = val["error"]["message"]
+            .as_str()
+            .unwrap_or("Anthropic SSE error");
+        return Err(AiError::ParseFailed(format!("Anthropic SSE error: {msg}")));
+    }
+    if val["type"].as_str() == Some("message_start")
+        && let Some(msg_usage) = extract_anthropic_usage_obj(val["message"].get("usage"))
+    {
+        merge_anthropic_usage(captured_usage, &msg_usage);
+    } else if val["type"].as_str() == Some("message_delta")
+        && let Some(delta_usage) = extract_anthropic_usage_obj(val.get("usage"))
+    {
+        merge_anthropic_usage(captured_usage, &delta_usage);
+    }
+    if val["type"].as_str() == Some("content_block_delta") {
+        match val["delta"]["type"].as_str() {
+            Some("thinking_delta") => {
+                if let Some(thinking) = val["delta"]["thinking"].as_str().filter(|s| !s.is_empty())
+                {
+                    on_event(AiStreamEvent::ThoughtDelta(thinking.to_owned()));
+                }
+            }
+            Some("text_delta") => {
+                if let Some(txt) = val["delta"]["text"].as_str().filter(|s| !s.is_empty()) {
+                    on_event(AiStreamEvent::DeltaText(txt.to_owned()));
+                    collected.push_str(txt);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn process_anthropic_agent_sse_payload(
+    acc: &mut AnthropicAgentStreamAcc,
+    payload: &str,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<(), AiError> {
+    let val: Value = serde_json::from_str(payload).map_err(|err| {
+        AiError::ParseFailed(format!("Anthropic agent SSE JSON parse failed: {err}"))
+    })?;
+    match val["type"].as_str() {
+        Some("error") => {
+            let msg = val["error"]["message"]
+                .as_str()
+                .unwrap_or("Anthropic SSE error");
+            return Err(AiError::ParseFailed(format!("Anthropic SSE error: {msg}")));
+        }
+        Some("message_start") => {
+            if let Some(msg_usage) = extract_anthropic_usage_obj(val["message"].get("usage")) {
+                merge_anthropic_usage(&mut acc.usage, &msg_usage);
+            }
+        }
+        Some("message_delta") => {
+            if let Some(delta_usage) = extract_anthropic_usage_obj(val.get("usage")) {
+                merge_anthropic_usage(&mut acc.usage, &delta_usage);
+            }
+            if let Some(reason) = val["delta"]["stop_reason"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                acc.finish_reason = Some(reason.to_owned());
+            }
+        }
+        Some("content_block_start") => {
+            let fallback_idx = acc.blocks.len();
+            let idx = val["index"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(fallback_idx);
+            let cb = &val["content_block"];
+            let block = match cb["type"].as_str() {
+                Some("thinking") => AnthropicStreamBlock::Thinking {
+                    thinking: cb["thinking"].as_str().unwrap_or("").to_owned(),
+                    signature: cb["signature"].as_str().unwrap_or("").to_owned(),
+                },
+                Some("tool_use") => AnthropicStreamBlock::ToolUse {
+                    id: cb["id"]
+                        .as_str()
+                        .map_or_else(|| format!("ant_call_{idx}"), ToOwned::to_owned),
+                    name: cb["name"].as_str().unwrap_or("").to_owned(),
+                    partial_json: String::new(),
+                },
+                _ => AnthropicStreamBlock::Text,
+            };
+            acc.blocks.insert(idx, block);
+        }
+        Some("content_block_delta") => {
+            let idx = val["index"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0);
+            let delta = &val["delta"];
+            match delta["type"].as_str() {
+                Some("thinking_delta") => {
+                    if let Some(chunk) = delta["thinking"].as_str().filter(|s| !s.is_empty()) {
+                        on_event(AiStreamEvent::ThoughtDelta(chunk.to_owned()));
+                        if let Some(AnthropicStreamBlock::Thinking { thinking, .. }) =
+                            acc.blocks.get_mut(&idx)
+                        {
+                            thinking.push_str(chunk);
+                        }
+                    }
+                }
+                Some("signature_delta") => {
+                    if let Some(sig) = delta["signature"].as_str()
+                        && let Some(AnthropicStreamBlock::Thinking { signature, .. }) =
+                            acc.blocks.get_mut(&idx)
+                    {
+                        signature.push_str(sig);
+                    }
+                }
+                Some("text_delta") => {
+                    if let Some(txt) = delta["text"].as_str().filter(|s| !s.is_empty()) {
+                        on_event(AiStreamEvent::DeltaText(txt.to_owned()));
+                        acc.text_buf.push_str(txt);
+                    }
+                }
+                Some("input_json_delta") => {
+                    if let Some(part) = delta["partial_json"].as_str()
+                        && let Some(AnthropicStreamBlock::ToolUse { partial_json, .. }) =
+                            acc.blocks.get_mut(&idx)
+                    {
+                        partial_json.push_str(part);
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn finalize_anthropic_agent_stream(
+    acc: AnthropicAgentStreamAcc,
+    model: &str,
+) -> Result<AiAgentTurnResponse, AiError> {
+    let mut thinking_blocks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in acc.blocks.into_values() {
+        match block {
+            AnthropicStreamBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                if !signature.is_empty() {
+                    thinking_blocks.push(AiThinkingBlock {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+            AnthropicStreamBlock::ToolUse {
+                id,
+                name,
+                partial_json,
+            } => {
+                if name.trim().is_empty() {
+                    continue;
+                }
+                let trimmed = partial_json.trim();
+                let arguments = if trimmed.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(trimmed).map_err(|err| {
+                        AiError::ParseFailed(format!(
+                            "Anthropic tool_use input JSON parse failed: {err}"
+                        ))
+                    })?
+                };
+                tool_calls.push(AiToolCall {
+                    id,
+                    name,
+                    arguments,
+                    thought_signature: None,
+                });
+            }
+            AnthropicStreamBlock::Text => {}
+        }
+    }
+    Ok(AiAgentTurnResponse {
+        text: (!acc.text_buf.is_empty()).then_some(acc.text_buf),
+        thinking_blocks,
+        tool_calls,
+        model: model.to_owned(),
+        finish_reason: acc.finish_reason,
+        usage: acc.usage,
+    })
+}
+
 fn parse_anthropic_agent_response(
     val: &Value,
     model: &str,
@@ -351,9 +624,18 @@ fn parse_anthropic_agent_response(
         AiError::ParseFailed("Anthropic response missing content array".to_owned())
     })?;
     let mut text_buf = String::new();
+    let mut thinking_blocks = Vec::new();
     let mut tool_calls = Vec::new();
     for (idx, block) in blocks.iter().enumerate() {
         match block["type"].as_str() {
+            Some("thinking") => {
+                if let Some(sig) = block["signature"].as_str().filter(|s| !s.is_empty()) {
+                    thinking_blocks.push(AiThinkingBlock {
+                        thinking: block["thinking"].as_str().unwrap_or("").to_owned(),
+                        signature: sig.to_owned(),
+                    });
+                }
+            }
             Some("text") => {
                 if let Some(txt) = block["text"].as_str() {
                     text_buf.push_str(txt);
@@ -368,6 +650,7 @@ fn parse_anthropic_agent_response(
                         id,
                         name: name.to_owned(),
                         arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                        thought_signature: None,
                     });
                 }
             }
@@ -376,6 +659,7 @@ fn parse_anthropic_agent_response(
     }
     Ok(AiAgentTurnResponse {
         text: (!text_buf.is_empty()).then_some(text_buf),
+        thinking_blocks,
         tool_calls,
         model: model.to_owned(),
         finish_reason: val["stop_reason"].as_str().map(ToOwned::to_owned),
@@ -383,6 +667,7 @@ fn parse_anthropic_agent_response(
     })
 }
 
+#[cfg(test)]
 fn parse_anthropic_sse_chunk(
     payload: &str,
     captured_usage: &mut Option<AiTokenUsage>,
@@ -581,7 +866,7 @@ mod tests {
     #[test]
     fn anthropic_merges_tool_results_and_ignores_thinking_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
-        // 並列 ToolResult マージ、空 Assistant 除外、tools 併用時の thinking 抑止・temperature 反映、thinking ブロック除外を検証
+        // 並列 ToolResult マージ、空 Assistant 除外、署名欠落 tool_use 履歴時の thinking 抑止・temperature 反映、thinking ブロック除外を検証
         let multi_provider = AnthropicProvider::new(
             AnthropicConfig::new("claude-sonnet-4-20250514", None)
                 .with_thinking_level(AiThinkingLevel::High),
@@ -591,7 +876,13 @@ mod tests {
             messages: vec![
                 AiTurnMessage::Assistant {
                     text: None,
-                    tool_calls: Vec::new(),
+                    thinking_blocks: Vec::new(),
+                    tool_calls: vec![AiToolCall {
+                        id: "t0".to_owned(),
+                        name: "legacy_tool".to_owned(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }],
                 },
                 AiTurnMessage::ToolResult {
                     tool_call_id: "t1".to_owned(),
@@ -615,10 +906,10 @@ mod tests {
             temperature: Some(0.3),
         };
         let multi_body = multi_provider.build_agent_request_body(&multi_req);
-        assert_eq!(multi_body["messages"].as_array().map(Vec::len), Some(1));
-        assert_eq!(multi_body["messages"][0]["role"], json!("user"));
+        assert_eq!(multi_body["messages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(multi_body["messages"][1]["role"], json!("user"));
         assert_eq!(
-            multi_body["messages"][0]["content"]
+            multi_body["messages"][1]["content"]
                 .as_array()
                 .map(Vec::len),
             Some(2)
@@ -651,6 +942,111 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_agent_turn_streams_thinking_and_preserves_signature_across_turns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"確認先決めよう\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_ant_xyz\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ユーザーに確認します。\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_ask_1\",\"name\":\"ask_user\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"title\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"対象選択\\\"}\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n"
+        );
+        let (addr, srv) = spawn_single_response_server("text/event-stream", sse)?;
+        let mut cfg = AnthropicConfig::new(
+            "claude-sonnet-4-20250514",
+            Some(SecretString::new("sk-ant-sse")),
+        )
+        .with_thinking_level(AiThinkingLevel::High);
+        cfg.base_url = format!("http://{addr}/v1");
+        let provider = AnthropicProvider::new(cfg);
+
+        let turn1 = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![AiTurnMessage::User {
+                parts: vec![AiContentPart::text("直して")],
+            }],
+            tools: vec![crate::ai::provider::AiToolDefinition {
+                name: "ask_user".to_owned(),
+                description: "ask".to_owned(),
+                parameters_schema: json!({ "type": "object" }),
+            }],
+            response_json_schema: None,
+            temperature: Some(0.2),
+        };
+        let mut thoughts = Vec::new();
+        let mut texts = Vec::new();
+        let res1 = provider.send_agent_turn(&turn1, &mut |evt| match evt {
+            AiStreamEvent::ThoughtDelta(t) => thoughts.push(t),
+            AiStreamEvent::DeltaText(t) => texts.push(t),
+            _ => {}
+        })?;
+        assert_eq!(thoughts, vec!["確認先決めよう"]);
+        assert_eq!(texts, vec!["ユーザーに確認します。"]);
+        assert_eq!(res1.thinking_blocks.len(), 1);
+        assert_eq!(res1.thinking_blocks[0].thinking, "確認先決めよう");
+        assert_eq!(res1.thinking_blocks[0].signature, "sig_ant_xyz");
+        assert_eq!(res1.tool_calls.len(), 1);
+        assert_eq!(res1.tool_calls[0].arguments["title"], "対象選択");
+        assert_eq!(res1.usage.as_ref().map(|u| u.total_tokens), Some(140));
+        let cap1 = srv.join().map_err(|_| "srv join")??;
+        let (_, json_body1) = cap1.split_once("\r\n\r\n").ok_or("missing HTTP body")?;
+        let parsed_body1: Value = serde_json::from_str(json_body1)?;
+        assert_eq!(parsed_body1["stream"], json!(true));
+        assert_eq!(parsed_body1["thinking"]["type"], json!("enabled"));
+        assert_eq!(parsed_body1["thinking"]["budget_tokens"], json!(10240));
+
+        // 2ターン目: thinking_blocks 付き履歴を引き回した場合、tools 併用時でも thinking が有効で
+        // assistant の content 配列で thinking が tool_use より前に配置される
+        let turn2 = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![
+                AiTurnMessage::User {
+                    parts: vec![AiContentPart::text("直して")],
+                },
+                AiTurnMessage::Assistant {
+                    text: res1.text,
+                    thinking_blocks: res1.thinking_blocks,
+                    tool_calls: res1.tool_calls,
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "toolu_ask_1".to_owned(),
+                    name: "ask_user".to_owned(),
+                    content_json: "{\"ok\":true}".to_owned(),
+                    is_error: false,
+                },
+            ],
+            tools: turn1.tools,
+            response_json_schema: None,
+            temperature: Some(0.2),
+        };
+        let body2 = provider.build_agent_request_body(&turn2);
+        assert!(body2.get("thinking").is_some());
+        let assistant_content = body2["messages"][1]["content"]
+            .as_array()
+            .ok_or("assistant content array")?;
+        assert_eq!(assistant_content[0]["type"], "thinking");
+        assert_eq!(assistant_content[0]["signature"], "sig_ant_xyz");
+        assert_eq!(assistant_content[1]["type"], "text");
+        assert_eq!(assistant_content[2]["type"], "tool_use");
         Ok(())
     }
 

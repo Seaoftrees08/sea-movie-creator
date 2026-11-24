@@ -341,14 +341,38 @@ pub enum AgentHostEvent {
         /// 追記テキスト。
         text: String,
     },
+    /// LLM が生成している推論・思考テキストチャンク。
+    ThoughtDelta {
+        /// 追記思考テキスト。
+        text: String,
+    },
+    /// ホストツール（または対話確認）実行開始のアクティビティログ。
+    ToolStarted {
+        /// 呼び出し単位の識別子。
+        call_id: String,
+        /// 実行開始されたツール名。
+        tool_name: String,
+        /// VS Code 風の動詞カテゴリ（例: `Analyzed`, `Editing`, `Asking`）。
+        verb: String,
+        /// 対象説明。
+        target: String,
+    },
     /// ホストツール実行結果のアクティビティログ。
     ToolActivity {
+        /// 呼び出し単位の識別子。
+        call_id: String,
         /// 実行されたツール名。
         tool_name: String,
+        /// VS Code 風の動詞カテゴリ。
+        verb: String,
+        /// 対象説明。
+        target: String,
         /// 成功フラグ。
         ok: bool,
         /// 短い結果サマリ。
         summary: String,
+        /// 実実行所要ミリ秒（Manual 承認待ち時間は除外）。
+        duration_ms: Option<u64>,
     },
     /// エージェントからのリッチ対話質問（UI 上の入力カード表示を要求）。
     AskUser {
@@ -660,6 +684,7 @@ impl AgentSessionRunner {
             last_llm_call_at: None,
             turn_step_count: 0,
             pending_approvals: HashMap::new(),
+            active_ask_targets: HashMap::new(),
             cancelled: Arc::clone(&cancelled),
             alive: Arc::clone(&alive),
             stderr_tail: Arc::clone(&stderr_tail),
@@ -866,6 +891,7 @@ struct CoordinatorState {
     last_llm_call_at: Option<Instant>,
     turn_step_count: u32,
     pending_approvals: HashMap<String, PendingApprovalCall>,
+    active_ask_targets: HashMap<String, String>,
     cancelled: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
@@ -957,6 +983,15 @@ impl CoordinatorState {
         arguments: &Value,
         event_tx: &mpsc::Sender<AgentHostEvent>,
     ) {
+        let (verb, target) = describe_tool_activity(tool_name, arguments);
+        let _ = event_tx.send(AgentHostEvent::ToolStarted {
+            call_id: request_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            verb: verb.clone(),
+            target: target.clone(),
+        });
+
+        let exec_started = Instant::now();
         let prev_count = self.tool_registry.list_descriptors().len();
         let result = {
             let mut on_usage = |usage| {
@@ -981,6 +1016,7 @@ impl CoordinatorState {
             };
             self.tool_registry.execute(tool_name, arguments, &mut ctx)
         };
+        let duration_ms = u64::try_from(exec_started.elapsed().as_millis()).ok();
 
         let new_count = self.tool_registry.list_descriptors().len();
         let updated_tools =
@@ -989,9 +1025,13 @@ impl CoordinatorState {
         match result {
             Ok(val) => {
                 let _ = event_tx.send(AgentHostEvent::ToolActivity {
+                    call_id: request_id.to_owned(),
                     tool_name: tool_name.to_owned(),
+                    verb,
+                    target,
                     ok: true,
                     summary: "ok".to_owned(),
+                    duration_ms,
                 });
                 let _ = self.send_to_child(&HostToAgentMessage::ToolResult {
                     request_id: request_id.to_owned(),
@@ -1003,9 +1043,13 @@ impl CoordinatorState {
             }
             Err(err) => {
                 let _ = event_tx.send(AgentHostEvent::ToolActivity {
+                    call_id: request_id.to_owned(),
                     tool_name: tool_name.to_owned(),
+                    verb,
+                    target,
                     ok: false,
                     summary: err.clone(),
+                    duration_ms,
                 });
                 let _ = self.send_to_child(&HostToAgentMessage::ToolResult {
                     request_id: request_id.to_owned(),
@@ -1088,7 +1132,7 @@ fn run_coordinator_loop(
                 timeline_summary,
             ),
             CoordinatorMsg::UserAnswer { request_id, answer } => {
-                let _ = state.send_to_child(&HostToAgentMessage::UserAnswer { request_id, answer });
+                handle_user_answer_msg(&mut state, request_id, answer, event_tx);
             }
             CoordinatorMsg::ToolApprovalDecision {
                 request_id,
@@ -1115,6 +1159,33 @@ fn run_coordinator_loop(
     }
 }
 
+fn handle_user_answer_msg(
+    state: &mut CoordinatorState,
+    request_id: String,
+    answer: AgentUserAnswerPayload,
+    event_tx: &mpsc::Sender<AgentHostEvent>,
+) {
+    let ask_title = state
+        .active_ask_targets
+        .remove(&request_id)
+        .unwrap_or_else(|| "ユーザーへの確認".to_owned());
+    let summary = if answer.skipped {
+        "skipped".to_owned()
+    } else {
+        "answered".to_owned()
+    };
+    let _ = event_tx.send(AgentHostEvent::ToolActivity {
+        call_id: format!("ask_{request_id}"),
+        tool_name: "ask_user".to_owned(),
+        verb: "Asking".to_owned(),
+        target: ask_title,
+        ok: !answer.skipped,
+        summary,
+        duration_ms: None,
+    });
+    let _ = state.send_to_child(&HostToAgentMessage::UserAnswer { request_id, answer });
+}
+
 fn handle_follow_up_msg(
     state: &mut CoordinatorState,
     prompt: String,
@@ -1125,6 +1196,7 @@ fn handle_follow_up_msg(
 ) {
     state.turn_step_count = 0;
     state.pending_approvals.clear();
+    state.active_ask_targets.clear();
     state.sandbox = DraftSandbox::new(base_document);
     if !attached_folders.is_empty() {
         let mut combined = state.attached_folders_raw.clone();
@@ -1223,6 +1295,15 @@ fn handle_agent_message(
             choices,
             allow_skip,
         } => {
+            state
+                .active_ask_targets
+                .insert(request_id.clone(), title.clone());
+            let _ = event_tx.send(AgentHostEvent::ToolStarted {
+                call_id: format!("ask_{request_id}"),
+                tool_name: "ask_user".to_owned(),
+                verb: "Asking".to_owned(),
+                target: title.clone(),
+            });
             let _ = event_tx.send(AgentHostEvent::AskUser {
                 request_id,
                 title,
@@ -1378,6 +1459,92 @@ fn handle_llm_chat(
     send_agent_llm_turn_and_reply(state, request_id, &req, event_tx);
 }
 
+/// ツール名と引数 JSON から VS Code 風の動詞カテゴリと日本語対象説明を生成する。
+#[must_use]
+pub fn describe_tool_activity(tool_name: &str, arguments: &Value) -> (String, String) {
+    match tool_name {
+        "get_timeline_summary" => ("Analyzed".to_owned(), "タイムライン構成".to_owned()),
+        "list_media_assets" | "inspect_media_folder" => {
+            let folder_hint = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty());
+            let target = match folder_hint {
+                Some(name) => format!("メディア素材 ({name})"),
+                None => "メディア素材".to_owned(),
+            };
+            ("Analyzed".to_owned(), target)
+        }
+        "inspect_images_vision" => {
+            let count = arguments
+                .get("paths")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let target = if count > 0 {
+                format!("画像内容の解析 ({count}枚)")
+            } else {
+                "画像内容の解析".to_owned()
+            };
+            ("Analyzed".to_owned(), target)
+        }
+        "get_capabilities" => ("Checked".to_owned(), "利用可能機能とスキーマ".to_owned()),
+        "get_clip_detail" => {
+            let clip_id = arguments
+                .get("clip_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let target = match clip_id {
+                Some(id) => format!("クリップ ({id})"),
+                None => "クリップ詳細".to_owned(),
+            };
+            ("Checked".to_owned(), target)
+        }
+        "validate_draft_plan" => ("Verified".to_owned(), "編集計画の整合性".to_owned()),
+        "compile_movie_blueprint" => {
+            let title = arguments
+                .get("blueprint")
+                .and_then(|b| b.get("project_name"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let target = match title {
+                Some(t) => format!("ムービー構成 ({t})"),
+                None => "ムービー構成の構築".to_owned(),
+            };
+            ("Editing".to_owned(), target)
+        }
+        "apply_draft_edit_command" => {
+            let cmd = arguments.get("command");
+            let cmd_type = cmd
+                .and_then(|c| c.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let target = if cmd_type == "batch" {
+                let count = cmd
+                    .and_then(|c| c.get("commands"))
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                format!("タイムライン編集 ({count}件)")
+            } else if !cmd_type.is_empty() {
+                format!("タイムライン編集 ({cmd_type})")
+            } else {
+                "タイムライン編集".to_owned()
+            };
+            ("Editing".to_owned(), target)
+        }
+        "ask_user" => {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("ユーザーへの確認");
+            ("Asking".to_owned(), title.to_owned())
+        }
+        other => ("Ran".to_owned(), other.to_owned()),
+    }
+}
+
 fn forward_agent_stream_event(
     ev: crate::ai::provider::AiStreamEvent,
     suppress_raw_delta: bool,
@@ -1393,6 +1560,11 @@ fn forward_agent_stream_event(
                 total_steps: None,
             });
         }
+        crate::ai::provider::AiStreamEvent::ThoughtDelta(text) => {
+            if !text.is_empty() {
+                let _ = tx.send(AgentHostEvent::ThoughtDelta { text });
+            }
+        }
         crate::ai::provider::AiStreamEvent::DeltaText(delta) => {
             if suppress_raw_delta {
                 *structured_chars = structured_chars.saturating_add(delta.chars().count());
@@ -1407,6 +1579,13 @@ fn forward_agent_stream_event(
             } else {
                 let _ = tx.send(AgentHostEvent::StreamDelta { text: delta });
             }
+        }
+        crate::ai::provider::AiStreamEvent::ActivityHint(label) => {
+            let _ = tx.send(AgentHostEvent::Status {
+                message: label,
+                step: None,
+                total_steps: None,
+            });
         }
         crate::ai::provider::AiStreamEvent::Completed(_)
         | crate::ai::provider::AiStreamEvent::Failed(_) => {}
@@ -1455,12 +1634,22 @@ fn send_agent_llm_turn_and_reply(
                     id: c.id,
                     name: c.name,
                     arguments: c.arguments,
+                    thought_signature: c.thought_signature,
+                })
+                .collect();
+            let thinking_blocks = resp
+                .thinking_blocks
+                .into_iter()
+                .map(|b| sea_agent_protocol::AgentThinkingBlock {
+                    thinking: b.thinking,
+                    signature: b.signature,
                 })
                 .collect();
             let _ = state.send_to_child(&HostToAgentMessage::LlmResponse {
                 request_id,
                 ok: true,
                 text: resp.text.unwrap_or_default(),
+                thinking_blocks,
                 tool_calls,
                 finish_reason: resp.finish_reason,
                 error: None,
@@ -1492,6 +1681,7 @@ fn send_llm_error(state: &mut CoordinatorState, request_id: String, error: Strin
         request_id,
         ok: false,
         text: String::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         finish_reason: None,
         error: Some(error),
@@ -1520,6 +1710,14 @@ fn convert_wire_messages_to_turn_messages(
                 }
                 AiTurnMessage::Assistant {
                     text: (!msg.text.is_empty()).then(|| msg.text.clone()),
+                    thinking_blocks: msg
+                        .thinking_blocks
+                        .iter()
+                        .map(|b| crate::ai::provider::AiThinkingBlock {
+                            thinking: b.thinking.clone(),
+                            signature: b.signature.clone(),
+                        })
+                        .collect(),
                     tool_calls: msg
                         .tool_calls
                         .iter()
@@ -1527,6 +1725,7 @@ fn convert_wire_messages_to_turn_messages(
                             id: c.id.clone(),
                             name: c.name.clone(),
                             arguments: c.arguments.clone(),
+                            thought_signature: c.thought_signature.clone(),
                         })
                         .collect(),
                 }
@@ -1866,10 +2065,12 @@ mod tests {
                 role: "assistant".to_owned(),
                 text: String::new(),
                 image_paths: Vec::new(),
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AgentLlmToolCall {
                     id: "call_abc".to_owned(),
                     name: "inspect_media_folder".to_owned(),
                     arguments: json!({"path":"C:/w"}),
+                    thought_signature: None,
                 }],
                 tool_call_id: None,
             },
@@ -1877,6 +2078,7 @@ mod tests {
                 role: "tool".to_owned(),
                 text: "{\"ok\":true}".to_owned(),
                 image_paths: Vec::new(),
+                thinking_blocks: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_abc".to_owned()),
             },
@@ -1894,6 +2096,7 @@ mod tests {
             image_paths: (0..=MAX_CHAT_IMAGE_PATHS)
                 .map(|i| format!("img_{i}.png"))
                 .collect(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }];
@@ -1933,6 +2136,56 @@ mod tests {
             rx.try_recv(),
             Ok(AgentHostEvent::Status { message, .. }) if message.contains("220文字")
         ));
+
+        forward_agent_stream_event(
+            crate::ai::provider::AiStreamEvent::ThoughtDelta("構想中...".to_owned()),
+            true,
+            &mut structured,
+            &mut reported,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentHostEvent::ThoughtDelta { text }) if text == "構想中..."
+        ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn describe_tool_activity_maps_known_and_unknown_tools() {
+        assert_eq!(
+            describe_tool_activity("get_timeline_summary", &json!({})),
+            ("Analyzed".to_owned(), "タイムライン構成".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity("inspect_media_folder", &json!({ "path": "C:/trip/sakura" })),
+            ("Analyzed".to_owned(), "メディア素材 (sakura)".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity(
+                "apply_draft_edit_command",
+                &json!({ "command": { "type": "batch", "commands": [{}, {}, {}] } })
+            ),
+            ("Editing".to_owned(), "タイムライン編集 (3件)".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity(
+                "compile_movie_blueprint",
+                &json!({ "blueprint": { "project_name": "春旅行" } })
+            ),
+            ("Editing".to_owned(), "ムービー構成 (春旅行)".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity("validate_draft_plan", &json!({})),
+            ("Verified".to_owned(), "編集計画の整合性".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity("ask_user", &json!({ "title": "対象選択" })),
+            ("Asking".to_owned(), "対象選択".to_owned())
+        );
+        assert_eq!(
+            describe_tool_activity("custom_plugin_tool", &json!({})),
+            ("Ran".to_owned(), "custom_plugin_tool".to_owned())
+        );
     }
 }

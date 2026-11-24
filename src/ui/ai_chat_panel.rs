@@ -1,6 +1,6 @@
 //! VS Code 風 AI チャットパネル状態管理、非同期ストリーミングポーリング、差分適用/1クリック Undo UI。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +14,12 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
     Anchor, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    px,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use sea_agent_protocol::AgentUserAnswerPayload;
 use serde_json::{Value, json};
@@ -48,8 +47,8 @@ use crate::ai::providers::openai_compat::{
     OpenAiCompatConfig, OpenAiCompatProvider, OpenRouterCreditsSnapshot, fetch_openrouter_credits,
 };
 use crate::ai::session_store::{
-    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage, AiTurnBadge,
-    PendingAgentQuestionSnapshot, StoredChatTurn,
+    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage, AiTurnActivitySummary,
+    AiTurnBadge, PendingAgentQuestionSnapshot, StoredChatTurn,
 };
 use crate::ai::settings::{
     AI_SETTINGS_FILE_NAME, AiUserSettings, ProbedModelEntry, ResolvedAiModel,
@@ -57,6 +56,10 @@ use crate::ai::settings::{
 };
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
+use crate::ui::ai_activity_view::{
+    AiLiveActivityState, ToolCompletionUpdate, render_live_activity_card,
+    render_turn_activity_summary,
+};
 use crate::ui::ai_agent_widgets::{
     render_agent_mode_menu_button, render_ask_user_card, render_attached_folder_chip,
     render_folder_attach_button, render_session_history_drawer, render_tool_approval_card,
@@ -79,6 +82,8 @@ pub struct AiChatTurn {
     pub rendered_markdown: SharedString,
     /// 完了・停止・エラー状態を示す任意バッジ。
     pub status_badge: Option<AiTurnBadge>,
+    /// 完了済みターンに紐づく折りたたみアクティビティ要約。
+    pub activity_log: Option<AiTurnActivitySummary>,
 }
 
 const CHAT_HISTORY_COLLAPSE_THRESHOLD: usize = 200;
@@ -138,6 +143,18 @@ impl AiChatTurn {
     /// 指定された ID・ロール・本文・状態バッジからチャットターンを構築する。
     #[must_use]
     pub fn new(id: u64, role: AiRole, text: String, status_badge: Option<AiTurnBadge>) -> Self {
+        Self::new_with_activity(id, role, text, status_badge, None)
+    }
+
+    /// 完了済みアクティビティログ付きでチャットターンを構築する。
+    #[must_use]
+    pub fn new_with_activity(
+        id: u64,
+        role: AiRole,
+        text: String,
+        status_badge: Option<AiTurnBadge>,
+        activity_log: Option<AiTurnActivitySummary>,
+    ) -> Self {
         let rendered_markdown = match role {
             AiRole::User => SharedString::from(escape_plain_text_for_markdown(&text)),
             AiRole::Assistant | AiRole::System => SharedString::from(text.clone()),
@@ -148,6 +165,7 @@ impl AiChatTurn {
             text,
             rendered_markdown,
             status_badge,
+            activity_log,
         }
     }
 }
@@ -443,6 +461,12 @@ pub struct AiChatState {
     pub show_all_history: bool,
     /// セッション内で次に割り当てる安定ターン ID（`1` 始まり）。
     pub next_turn_id: u64,
+    /// 実行中のライブステップ・思考・ストリーム進捗状態。
+    pub live_activity: AiLiveActivityState,
+    /// 完了済みターンでアクティビティ要約を展開中のターン ID 集合。
+    pub expanded_activity_turns: HashSet<u64>,
+    /// 次回 UI 描画時に履歴スクロールを最下部へ追従させる保留フラグ。
+    pub scroll_to_bottom_pending: bool,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
     credits_rx: Option<mpsc::Receiver<Result<OpenRouterCreditsSnapshot, String>>>,
@@ -515,6 +539,9 @@ impl Default for AiChatState {
             execution_state: AiExecutionState::Idle,
             show_all_history: false,
             next_turn_id: 1,
+            live_activity: AiLiveActivityState::default(),
+            expanded_activity_turns: HashSet::new(),
+            scroll_to_bottom_pending: false,
             runtime_api_key: None,
             running_job: None,
             credits_rx: None,
@@ -831,6 +858,7 @@ impl AiChatState {
                     text: t.text.clone(),
                     timestamp_unix_secs: now,
                     status_badge: t.status_badge,
+                    activity_log: t.activity_log.clone(),
                 })
                 .collect(),
             pending_question: self.pending_question.clone(),
@@ -1240,10 +1268,32 @@ impl AiChatState {
 
     /// 新規ターンを安定連番 ID 付きで履歴へ追加する。
     pub fn push_turn(&mut self, role: AiRole, text: String, status_badge: Option<AiTurnBadge>) {
+        self.push_turn_with_activity(role, text, status_badge, None);
+    }
+
+    /// アクティビティログ付きで新規ターンを履歴へ追加する。
+    pub fn push_turn_with_activity(
+        &mut self,
+        role: AiRole,
+        text: String,
+        status_badge: Option<AiTurnBadge>,
+        activity_log: Option<AiTurnActivitySummary>,
+    ) {
         let id = self.next_turn_id;
         self.next_turn_id = self.next_turn_id.saturating_add(1);
-        self.turns
-            .push(AiChatTurn::new(id, role, text, status_badge));
+        self.turns.push(AiChatTurn::new_with_activity(
+            id,
+            role,
+            text,
+            status_badge,
+            activity_log,
+        ));
+        self.scroll_to_bottom_pending = true;
+    }
+
+    /// 保留中の自動最下部スクロール要求を消費して `true`/`false` を返す。
+    pub fn take_scroll_to_bottom_pending(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_bottom_pending)
     }
 
     fn set_responding_phase(&mut self, phase: String, step: Option<(Option<u32>, Option<u32>)>) {
@@ -1281,6 +1331,9 @@ impl AiChatState {
         self.turns.clear();
         self.next_turn_id = 1;
         self.show_all_history = false;
+        self.live_activity.reset();
+        self.expanded_activity_turns.clear();
+        self.scroll_to_bottom_pending = false;
         self.execution_state = AiExecutionState::Idle;
         self.streaming_preview.clear();
         self.pending_proposal = None;
@@ -1424,6 +1477,7 @@ impl AppController {
             format!("[添付: {}]\n{trimmed}", attached_labels.join(", "))
         };
         self.ai_chat.push_turn(AiRole::User, display_turn, None);
+        self.ai_chat.live_activity.begin_turn();
         self.ai_chat.attached_clip_ids.clear();
         self.ai_chat.streaming_preview.clear();
         self.ai_chat.last_error = None;
@@ -1450,10 +1504,14 @@ impl AppController {
 
         let mut streamed_buf = String::new();
         let mut status_buf = String::new();
+        let mut live_activity = AiLiveActivityState::default();
+        live_activity.begin_turn();
         let response = provider
             .send_streaming(&req, &mut |evt| match evt {
                 AiStreamEvent::Status(msg) => status_buf = msg,
                 AiStreamEvent::DeltaText(delta) => streamed_buf.push_str(&delta),
+                AiStreamEvent::ThoughtDelta(t) => live_activity.on_thought_delta(&t),
+                AiStreamEvent::ActivityHint(l) => live_activity.on_activity_hint(&l),
                 AiStreamEvent::Completed(_) | AiStreamEvent::Failed(_) => {}
             })
             .map_err(|err| {
@@ -1462,6 +1520,8 @@ impl AppController {
                 self.ai_chat.status_banner = format!("AI 通信エラー: {msg}");
                 msg
             })?;
+
+        self.ai_chat.live_activity = live_activity;
 
         self.ai_chat.streaming_preview = streamed_buf;
         if !status_buf.is_empty() {
@@ -1709,6 +1769,7 @@ impl AppController {
             self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(trimmed);
         }
         self.ai_chat.push_turn(AiRole::User, display_turn, None);
+        self.ai_chat.live_activity.begin_turn();
         self.ai_chat.attached_clip_ids.clear();
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
@@ -1717,6 +1778,7 @@ impl AppController {
         self.ai_chat.last_error = None;
         self.ai_chat.can_one_click_undo = false;
         self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.begin_turn();
         self.ai_chat.agent_step_status = None;
         trimmed.clone_into(&mut self.ai_chat.agent_active_prompt);
         self.ai_chat.agent_active_model_label =
@@ -1899,6 +1961,8 @@ impl AppController {
         self.ai_chat.agent_step_status = None;
         self.ai_chat.execution_state = AiExecutionState::Idle;
         self.ai_chat.show_all_history = false;
+        self.ai_chat.live_activity.reset();
+        self.ai_chat.expanded_activity_turns.clear();
         self.ai_chat.streaming_preview.clear();
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
@@ -1937,7 +2001,8 @@ impl AppController {
         self.ai_chat.turns.clear();
         self.ai_chat.next_turn_id = 1;
         for t in rec.turns {
-            self.ai_chat.push_turn(t.role, t.text, t.status_badge);
+            self.ai_chat
+                .push_turn_with_activity(t.role, t.text, t.status_badge, t.activity_log);
         }
         // ResumeSession 後のプラグインはアイドル待機に入るため、未回答質問カードをそのまま復元すると永続待ちハングになる
         self.ai_chat.ask_field_values.clear();
@@ -2033,11 +2098,21 @@ impl AppController {
 
     fn record_cancelled_preview(&mut self) {
         let partial = std::mem::take(&mut self.ai_chat.streaming_preview);
-        if let Some(readable) = extract_readable_cancelled_preview(&partial) {
-            self.ai_chat.push_turn(
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.responding_elapsed_secs(), true);
+        let readable = extract_readable_cancelled_preview(&partial);
+        if readable.is_some() || activity.is_some() {
+            let body = readable.map_or_else(
+                || "[停止済み]".to_owned(),
+                |text| format!("[停止済み]\n{text}"),
+            );
+            self.ai_chat.push_turn_with_activity(
                 AiRole::Assistant,
-                format!("[停止済み]\n{readable}"),
+                body,
                 Some(AiTurnBadge::Cancelled),
+                activity,
             );
         }
     }
@@ -2086,14 +2161,19 @@ impl AppController {
 
     fn finish_running_job_error(&mut self, err_msg: &str) {
         self.ai_chat.streaming_preview.clear();
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.responding_elapsed_secs(), false);
         self.ai_chat.last_error = Some(err_msg.to_owned());
         self.ai_chat.execution_state = AiExecutionState::Failed {
             summary: err_msg.to_owned(),
         };
-        self.ai_chat.push_turn(
+        self.ai_chat.push_turn_with_activity(
             AiRole::Assistant,
             format!("エラー: {err_msg}"),
             Some(AiTurnBadge::Error),
+            activity,
         );
         self.ai_chat.persist_session();
     }
@@ -2118,6 +2198,15 @@ impl AppController {
                             }
                             AiStreamEvent::DeltaText(delta) => {
                                 self.ai_chat.streaming_preview.push_str(&delta);
+                                self.ai_chat
+                                    .live_activity
+                                    .on_stream_updated(&self.ai_chat.streaming_preview);
+                            }
+                            AiStreamEvent::ThoughtDelta(t) => {
+                                self.ai_chat.live_activity.on_thought_delta(&t);
+                            }
+                            AiStreamEvent::ActivityHint(l) => {
+                                self.ai_chat.live_activity.on_activity_hint(&l);
                             }
                             AiStreamEvent::Completed(resp) => completed = Some(resp),
                             AiStreamEvent::Failed(err) => failed = Some(err),
@@ -2203,35 +2292,50 @@ impl AppController {
             } => self.handle_agent_status_event(message, step, total_steps),
             AgentHostEvent::StreamDelta { text } => {
                 self.ai_chat.streaming_preview.push_str(&text);
+                self.ai_chat
+                    .live_activity
+                    .on_stream_updated(&self.ai_chat.streaming_preview);
+                (false, false)
+            }
+            AgentHostEvent::ThoughtDelta { text } => {
+                self.ai_chat.live_activity.on_thought_delta(&text);
+                (false, false)
+            }
+            AgentHostEvent::ToolStarted {
+                call_id,
+                verb,
+                target,
+                ..
+            } => {
+                self.ai_chat
+                    .live_activity
+                    .on_tool_started(&call_id, &verb, &target);
                 (false, false)
             }
             AgentHostEvent::ToolActivity {
+                call_id,
                 tool_name,
+                verb,
+                target,
                 ok,
                 summary,
+                duration_ms,
             } => {
-                self.ai_chat.streaming_preview.clear();
-                let banner = if ok {
-                    format!("ツール実行完了: {tool_name}")
-                } else {
-                    format!("ツール失敗 ({tool_name}): {summary}")
+                let update = ToolCompletionUpdate {
+                    call_id: &call_id,
+                    verb: &verb,
+                    target: &target,
+                    ok,
+                    summary: &summary,
+                    duration_ms,
                 };
-                self.ai_chat.status_banner.clone_from(&banner);
-                self.ai_chat
-                    .set_responding_phase(banner, self.ai_chat.agent_step_status);
-                (false, false)
+                self.handle_agent_tool_activity_event(update, &tool_name)
             }
             AgentHostEvent::MemoryUpdated { agent_memory } => {
                 self.ai_chat.agent_memory = agent_memory;
                 (false, true)
             }
-            AgentHostEvent::UsageReported { usage } => {
-                self.ai_chat.record_turn_usage(&usage);
-                if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
-                    self.ai_chat.refresh_openrouter_credits_async();
-                }
-                (false, true)
-            }
+            AgentHostEvent::UsageReported { usage } => self.handle_agent_usage_reported(&usage),
             AgentHostEvent::AskUser {
                 request_id,
                 title,
@@ -2269,10 +2373,7 @@ impl AppController {
                 plan,
                 agent_memory,
                 ..
-            } => {
-                self.handle_agent_proposal_event(summary_markdown, *plan, agent_memory);
-                (false, true)
-            }
+            } => self.handle_agent_proposal_tuple(summary_markdown, *plan, agent_memory),
             AgentHostEvent::AgentError {
                 code,
                 message,
@@ -2280,6 +2381,45 @@ impl AppController {
             } => self.handle_agent_error_event(&code, &message, recoverable),
             AgentHostEvent::Exited { reason } => self.handle_agent_exited_event(&reason),
         }
+    }
+
+    fn handle_agent_usage_reported(&mut self, usage: &AiTokenUsage) -> (bool, bool) {
+        self.ai_chat.record_turn_usage(usage);
+        if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
+            self.ai_chat.refresh_openrouter_credits_async();
+        }
+        (false, true)
+    }
+
+    fn handle_agent_proposal_tuple(
+        &mut self,
+        summary_markdown: String,
+        plan: AiEditPlan,
+        agent_memory: Value,
+    ) -> (bool, bool) {
+        self.handle_agent_proposal_event(summary_markdown, plan, agent_memory);
+        (false, true)
+    }
+
+    fn handle_agent_tool_activity_event(
+        &mut self,
+        update: ToolCompletionUpdate<'_>,
+        tool_name: &str,
+    ) -> (bool, bool) {
+        let ok = update.ok;
+        let summary_text = update.summary.to_owned();
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.clear_stream_progress();
+        self.ai_chat.live_activity.on_tool_completed(update);
+        let banner = if ok {
+            format!("ツール実行完了: {tool_name}")
+        } else {
+            format!("ツール失敗 ({tool_name}): {summary_text}")
+        };
+        self.ai_chat.status_banner.clone_from(&banner);
+        self.ai_chat
+            .set_responding_phase(banner, self.ai_chat.agent_step_status);
+        (false, false)
     }
 
     fn handle_agent_status_event(
@@ -2294,6 +2434,7 @@ impl AppController {
         }
         if step.is_some() {
             self.ai_chat.streaming_preview.clear();
+            self.ai_chat.live_activity.clear_stream_progress();
         }
         self.ai_chat
             .set_responding_phase(message, self.ai_chat.agent_step_status);
@@ -2347,6 +2488,10 @@ impl AppController {
         message: &str,
         recoverable: bool,
     ) -> (bool, bool) {
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.responding_elapsed_secs(), false);
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.clear_pending_agent_interactions();
@@ -2355,10 +2500,11 @@ impl AppController {
         self.ai_chat.execution_state = AiExecutionState::Failed {
             summary: formatted.clone(),
         };
-        self.ai_chat.push_turn(
+        self.ai_chat.push_turn_with_activity(
             AiRole::Assistant,
             format!("エラー: {formatted}"),
             Some(AiTurnBadge::Error),
+            activity,
         );
         self.ai_chat.status_banner = if recoverable {
             format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
@@ -2372,6 +2518,7 @@ impl AppController {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.clear_stream_progress();
         self.ai_chat.ask_field_values.clear();
         for field in &snap.fields {
             if let Some(def) = &field.default_value {
@@ -2389,6 +2536,7 @@ impl AppController {
             detail: snap.title.clone(),
         };
         self.ai_chat.pending_question = Some(snap);
+        self.ai_chat.scroll_to_bottom_pending = true;
         "エージェントが確認事項を送りました（カードから入力または選択してください）"
             .clone_into(&mut self.ai_chat.status_banner);
     }
@@ -2399,6 +2547,10 @@ impl AppController {
         plan: AiEditPlan,
         agent_memory: Value,
     ) {
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.responding_elapsed_secs(), false);
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.streaming_preview.clear();
@@ -2406,10 +2558,11 @@ impl AppController {
         self.ai_chat.agent_memory = agent_memory;
         if plan.is_no_op() {
             self.ai_chat.pending_proposal = None;
-            self.ai_chat.push_turn(
+            self.ai_chat.push_turn_with_activity(
                 AiRole::Assistant,
                 summary_markdown,
                 Some(AiTurnBadge::CompletedNoChange),
+                activity,
             );
             let completed_summary = tr("ai.status_completed_no_change");
             self.ai_chat.status_banner.clone_from(&completed_summary);
@@ -2419,7 +2572,12 @@ impl AppController {
             };
         } else if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
             self.ai_chat.pending_proposal = None;
-            let _ = self.apply_ai_plan_with_summary(&plan, true, Some(&summary_markdown));
+            let _ = self.apply_ai_plan_with_summary_and_activity(
+                &plan,
+                true,
+                Some(&summary_markdown),
+                activity,
+            );
         } else {
             let mut body = summary_markdown;
             if !body.contains("承認して適用") && !body.contains("準備完了") {
@@ -2427,8 +2585,12 @@ impl AppController {
                     "\n\n✅ 編集案の作成が完了しました。下の「承認して適用」でタイムラインへ反映できます。",
                 );
             }
-            self.ai_chat
-                .push_turn(AiRole::Assistant, body, Some(AiTurnBadge::ProposalReady));
+            self.ai_chat.push_turn_with_activity(
+                AiRole::Assistant,
+                body,
+                Some(AiTurnBadge::ProposalReady),
+                activity,
+            );
             self.ai_chat.pending_proposal = Some(PendingAiProposal {
                 prompt: self.ai_chat.agent_active_prompt.clone(),
                 model: self.ai_chat.agent_active_model_label.clone(),
@@ -2453,20 +2615,25 @@ impl AppController {
             .pending_proposal
             .take()
             .ok_or_else(|| "承認待ちの AI 提案はありません".to_owned())?;
-        self.apply_ai_plan_with_summary(&proposal.plan, false, None)
+        self.apply_ai_plan_with_summary_and_activity(&proposal.plan, false, None, None)
     }
 
-    fn apply_ai_plan_with_summary(
+    fn apply_ai_plan_with_summary_and_activity(
         &mut self,
         plan: &AiEditPlan,
         is_autopilot: bool,
         reply_note: Option<&str>,
+        activity: Option<AiTurnActivitySummary>,
     ) -> Result<(), String> {
         if let Err(err) = self.dispatch_command(&plan.command) {
             let msg = format!("提案の適用に失敗しました: {err}");
             self.ai_chat.last_error = Some(msg.clone());
-            self.ai_chat
-                .push_turn(AiRole::Assistant, msg.clone(), Some(AiTurnBadge::Error));
+            self.ai_chat.push_turn_with_activity(
+                AiRole::Assistant,
+                msg.clone(),
+                Some(AiTurnBadge::Error),
+                activity,
+            );
             self.ai_chat.status_banner.clone_from(&msg);
             self.ai_chat.execution_state = AiExecutionState::Failed {
                 summary: msg.clone(),
@@ -2500,8 +2667,12 @@ impl AppController {
             summary: banner,
             changed_timeline: true,
         };
-        self.ai_chat
-            .push_turn(AiRole::Assistant, turn_text, Some(AiTurnBadge::Applied));
+        self.ai_chat.push_turn_with_activity(
+            AiRole::Assistant,
+            turn_text,
+            Some(AiTurnBadge::Applied),
+            activity,
+        );
         self.ai_chat.persist_session();
         Ok(())
     }
@@ -2537,6 +2708,10 @@ impl AppController {
         raw_text: &str,
     ) -> Result<(), String> {
         self.ai_chat.streaming_preview.clear();
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.responding_elapsed_secs(), false);
         match dry_run_validate(&self.document, raw_text) {
             Ok(plan) if plan.is_no_op() => {
                 let note = plan
@@ -2550,10 +2725,11 @@ impl AppController {
                 );
                 self.ai_chat.last_error = None;
                 self.ai_chat.pending_proposal = None;
-                self.ai_chat.push_turn(
+                self.ai_chat.push_turn_with_activity(
                     AiRole::Assistant,
                     reply_text,
                     Some(AiTurnBadge::CompletedNoChange),
+                    activity,
                 );
                 let completed_summary = tr("ai.status_completed_no_change");
                 self.ai_chat.status_banner.clone_from(&completed_summary);
@@ -2567,10 +2743,11 @@ impl AppController {
                 self.ai_chat.last_error = None;
                 if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
                     self.ai_chat.pending_proposal = None;
-                    return self.apply_ai_plan_with_summary(
+                    return self.apply_ai_plan_with_summary_and_activity(
                         &plan,
                         true,
                         plan.reply_note.as_deref(),
+                        activity,
                     );
                 }
                 let summary_body = plan.summary_lines.join("\n");
@@ -2587,10 +2764,11 @@ impl AppController {
                 preview.push_str(
                     "\n\n✅ 編集案の作成が完了しました。下の「承認して適用」でタイムラインへ反映できます。",
                 );
-                self.ai_chat.push_turn(
+                self.ai_chat.push_turn_with_activity(
                     AiRole::Assistant,
                     preview,
                     Some(AiTurnBadge::ProposalReady),
+                    activity,
                 );
                 self.ai_chat.pending_proposal = Some(PendingAiProposal {
                     prompt: prompt.to_owned(),
@@ -2607,8 +2785,12 @@ impl AppController {
             Err(err) => {
                 let msg = format!("コマンド検証エラー（タイムラインは無変更）: {err}");
                 self.ai_chat.last_error = Some(msg.clone());
-                self.ai_chat
-                    .push_turn(AiRole::Assistant, msg.clone(), Some(AiTurnBadge::Error));
+                self.ai_chat.push_turn_with_activity(
+                    AiRole::Assistant,
+                    msg.clone(),
+                    Some(AiTurnBadge::Error),
+                    activity,
+                );
                 self.ai_chat.status_banner.clone_from(&msg);
                 self.ai_chat.execution_state = AiExecutionState::Failed {
                     summary: msg.clone(),
@@ -2693,6 +2875,21 @@ impl AiProvider for FailedPluginProvider {
     }
 }
 
+/// AI チャットパネル描画に必要なウィジェット参照束。
+#[derive(Clone, Copy)]
+pub struct AiChatPanelWidgets<'a> {
+    /// プロバイダ選択コンボボックス。
+    pub ai_provider_select: &'a Entity<SelectState<Vec<AiProviderSelectItem>>>,
+    /// プロンプト入力欄。
+    pub ai_chat_input: &'a Entity<TextareaState>,
+    /// 対話確認カード用の入力欄一覧。
+    pub ai_ask_inputs: &'a [(String, Entity<InputState>)],
+    /// チャット履歴コンテナ用のフォーカスハンドル。
+    pub ai_chat_history_focus: &'a FocusHandle,
+    /// チャット履歴スクロールハンドル。
+    pub ai_chat_scroll_handle: &'a ScrollHandle,
+}
+
 /// 右側 AI Chat タブの VS Code 風チャットパネルを描画する。
 ///
 /// 上部はプロバイダ切替・セッション履歴・設定のみのシンプルなヘッダとし、
@@ -2700,12 +2897,16 @@ impl AiProvider for FailedPluginProvider {
 /// モデル／エージェント／フォルダ添付を内包したコンポーザーを最下部に固定配置する。
 pub fn render_ai_chat_panel(
     controller: &AppController,
-    ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
-    ai_chat_input: &Entity<TextareaState>,
-    ai_ask_inputs: &[(String, Entity<InputState>)],
-    ai_chat_history_focus: &FocusHandle,
+    widgets: AiChatPanelWidgets<'_>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
+    let AiChatPanelWidgets {
+        ai_provider_select,
+        ai_chat_input,
+        ai_ask_inputs,
+        ai_chat_history_focus,
+        ai_chat_scroll_handle,
+    } = widgets;
     let chat = &controller.ai_chat;
     let theme = cx.theme().clone();
     let drag_theme = theme.clone();
@@ -2772,6 +2973,7 @@ pub fn render_ai_chat_panel(
             chat,
             ai_ask_inputs,
             ai_chat_history_focus,
+            ai_chat_scroll_handle,
             cx,
         ))
         .children(render_status_bar(chat, &theme))
@@ -2892,6 +3094,7 @@ fn render_chat_body(
     chat: &AiChatState,
     ai_ask_inputs: &[(String, Entity<InputState>)],
     ai_chat_history_focus: &FocusHandle,
+    ai_chat_scroll_handle: &ScrollHandle,
     cx: &mut Context<SeaEditorWindow>,
 ) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
@@ -2925,10 +3128,15 @@ fn render_chat_body(
         );
     }
     for turn in &chat.turns[collapsed_count..] {
-        thread = thread.child(render_chat_turn(turn, &theme));
+        thread = thread.child(render_chat_turn(
+            turn,
+            &chat.expanded_activity_turns,
+            &theme,
+            cx,
+        ));
     }
     if chat.is_busy() {
-        thread = thread.child(render_busy_indicator(chat, &theme));
+        thread = thread.child(render_live_activity_card(chat, &theme, cx));
     }
     if let Some(approval) = &chat.pending_tool_approval {
         thread = thread.child(render_tool_approval_card(approval, cx));
@@ -2960,13 +3168,25 @@ fn render_chat_body(
     }
 
     div()
-        .id("ai-chat-history-scroll")
-        .track_focus(ai_chat_history_focus)
+        .relative()
+        .flex()
+        .flex_col()
         .flex_1()
         .w_full()
         .min_h(px(0.))
-        .overflow_y_scrollbar()
-        .child(thread)
+        .overflow_y_hidden()
+        .child(
+            div()
+                .id("ai-chat-history-scroll")
+                .track_focus(ai_chat_history_focus)
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(ai_chat_scroll_handle)
+                .child(thread),
+        )
+        .vertical_scrollbar(ai_chat_scroll_handle)
         .into_any_element()
 }
 
@@ -3126,76 +3346,6 @@ fn render_status_bar(
     )
 }
 
-fn render_busy_indicator(
-    chat: &AiChatState,
-    theme: &gpui_kit::component::Theme,
-) -> impl IntoElement {
-    let (phase_label, step_label, elapsed_label) = match &chat.execution_state {
-        AiExecutionState::Responding {
-            started_at,
-            phase,
-            step,
-        } => {
-            let step_txt = match step {
-                Some((Some(s), Some(t))) => format!("[{s}/{t}] "),
-                Some((Some(s), None)) => format!("[ステップ {s}] "),
-                _ => String::new(),
-            };
-            let elapsed_txt = format_elapsed_duration(started_at.elapsed().as_secs());
-            (phase.clone(), step_txt, elapsed_txt)
-        }
-        _ => (chat.status_banner.clone(), String::new(), String::new()),
-    };
-
-    let preview = format_streaming_preview_for_ui(&chat.streaming_preview);
-    let mut card = v_flex()
-        .w_full()
-        .gap_1()
-        .p_2()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_1p5()
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .items_center()
-                        .gap_1p5()
-                        .child(Spinner::new().xsmall().color(theme.primary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_color(theme.foreground)
-                                .child(format!("{step_label}{phase_label}")),
-                        ),
-                )
-                .children((!elapsed_label.is_empty()).then(|| {
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.muted_foreground)
-                        .child(elapsed_label)
-                })),
-        );
-    if !preview.is_empty() {
-        card = card.child(
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .text_color(theme.muted_foreground)
-                .child(preview),
-        );
-    }
-    card
-}
-
 fn turn_badge_label(badge: AiTurnBadge) -> &'static str {
     match badge {
         AiTurnBadge::Applied => "完了・適用済み",
@@ -3206,7 +3356,12 @@ fn turn_badge_label(badge: AiTurnBadge) -> &'static str {
     }
 }
 
-fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
+fn render_chat_turn(
+    turn: &AiChatTurn,
+    expanded_activity_turns: &HashSet<u64>,
+    theme: &gpui_kit::component::Theme,
+    cx: &mut Context<SeaEditorWindow>,
+) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
 
     let copy_btn = Clipboard::new(("ai-turn-copy", turn.id))
@@ -3263,6 +3418,15 @@ fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gp
                         .child(left_meta)
                         .child(copy_btn),
                 )
+                .children(turn.activity_log.as_ref().map(|summary| {
+                    render_turn_activity_summary(
+                        turn.id,
+                        summary,
+                        expanded_activity_turns.contains(&turn.id),
+                        theme,
+                        cx,
+                    )
+                }))
                 .child(
                     div().w_full().min_w(px(0.)).child(
                         TextView::markdown(("ai-turn-md", turn.id), turn.rendered_markdown.clone())
@@ -4805,5 +4969,101 @@ mod tests {
             super::extract_readable_cancelled_preview(inline_raw).as_deref(),
             Some("確認中")
         );
+    }
+
+    #[test]
+    fn activity_events_accumulate_persist_across_sessions_and_trigger_scroll_to_bottom()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::session_store::{AiActivityStepStatus, AiSessionStore};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "sea_ai_activity_roundtrip_{}_{}",
+            std::process::id(),
+            AiSessionStore::generate_session_id()
+        ));
+        let store = AiSessionStore::new(&store_dir);
+
+        let mut controller = AppController::new();
+        controller.ai_chat.session_store = Some(store);
+        controller.ai_chat.live_activity.begin_turn();
+        controller.handle_agent_host_event(AgentHostEvent::ThoughtDelta {
+            text: "タイムライン構成を確認します".to_owned(),
+        });
+        controller.handle_agent_host_event(AgentHostEvent::ToolStarted {
+            call_id: "c1".to_owned(),
+            tool_name: "get_timeline_summary".to_owned(),
+            verb: "Analyzed".to_owned(),
+            target: "タイムライン構成".to_owned(),
+        });
+        controller.handle_agent_host_event(AgentHostEvent::ToolActivity {
+            call_id: "c1".to_owned(),
+            tool_name: "get_timeline_summary".to_owned(),
+            verb: "Analyzed".to_owned(),
+            target: "タイムライン構成".to_owned(),
+            ok: true,
+            summary: "ok".to_owned(),
+            duration_ms: Some(18),
+        });
+        assert_eq!(controller.ai_chat.live_activity.steps.len(), 1);
+        assert!(
+            controller
+                .ai_chat
+                .live_activity
+                .thought_tail_cache
+                .contains("タイムライン構成を確認します")
+        );
+
+        controller.handle_agent_host_event(AgentHostEvent::AskUser {
+            request_id: "ask_1".to_owned(),
+            title: "対象選択".to_owned(),
+            message: "番号を指定してください".to_owned(),
+            fields: Vec::new(),
+            choices: Vec::new(),
+            allow_skip: true,
+        });
+        assert!(controller.ai_chat.take_scroll_to_bottom_pending());
+        assert!(!controller.ai_chat.take_scroll_to_bottom_pending());
+
+        // 進行中ステップをキャンセル確定してターン履歴へ保存・復元できること
+        controller.handle_agent_host_event(AgentHostEvent::ToolStarted {
+            call_id: "c2".to_owned(),
+            tool_name: "apply_draft_edit_command".to_owned(),
+            verb: "Editing".to_owned(),
+            target: "タイムライン編集".to_owned(),
+        });
+        assert!(controller.cancel_ai_prompt());
+        let cancelled_turn = controller
+            .ai_chat
+            .turns
+            .last()
+            .ok_or("expected cancelled turn")?;
+        let activity = cancelled_turn
+            .activity_log
+            .as_ref()
+            .ok_or("expected activity_log on cancelled turn")?;
+        assert_eq!(activity.steps.len(), 2);
+        assert_eq!(activity.steps[0].status, AiActivityStepStatus::Done);
+        assert_eq!(activity.steps[0].duration_ms, Some(18));
+        assert_eq!(activity.steps[1].status, AiActivityStepStatus::Cancelled);
+
+        controller.ai_chat.persist_session();
+        let sid = controller.ai_chat.session_id.clone();
+        let mut controller2 = AppController::new();
+        controller2.ai_chat.session_store = controller.ai_chat.session_store.clone();
+        controller2.open_saved_ai_session_with_provider(&sid, None, None)?;
+        let restored_last = controller2
+            .ai_chat
+            .turns
+            .last()
+            .ok_or("expected restored turn")?;
+        assert_eq!(
+            restored_last.activity_log.as_ref().map(|a| a.steps.len()),
+            Some(2)
+        );
+        assert!(controller2.ai_chat.take_scroll_to_bottom_pending());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        Ok(())
     }
 }
