@@ -298,7 +298,7 @@ fn on_ruler_mouse_down(
         ));
     } else {
         this.controller.timeline_gesture = Some(TimelinePointerGesture::RulerScrub);
-        this.controller.seek_to_frame(FrameIndex::new(frame));
+        this.controller.scrub_to_frame(FrameIndex::new(frame));
         this.mark_sliders_dirty();
         this.sync_sliders_now(window, cx);
     }

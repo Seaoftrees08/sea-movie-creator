@@ -31,6 +31,8 @@ pub struct LaneToggleState {
     pub snap_enabled: bool,
     /// シーク時のクリップ選択追従。
     pub follow_selected_on_seek: bool,
+    /// タイムライン再生位置追随モード。
+    pub playhead_follow_mode: crate::ui::editor_prefs::TimelinePlayheadFollowMode,
     /// ルーラー・ヘッダ時間をフレーム番号表示にするか。
     pub show_frames: bool,
 }
@@ -98,6 +100,7 @@ pub fn evaluate_lane_menu_availability(
         toggles: LaneToggleState {
             snap_enabled: controller.snap_config.enabled,
             follow_selected_on_seek: controller.follow_selected_on_seek,
+            playhead_follow_mode: controller.playhead_follow_mode,
             show_frames: controller.time_display_unit == TimeDisplayUnit::Frames,
         },
     }
@@ -414,87 +417,132 @@ fn append_range_and_toggle_items(
     let win_follow = win.clone();
     let win_unit = win.clone();
 
-    menu.separator()
-        .item(
-            PopupMenuItem::new(tr_fmt("ctx.set_sel_start_here", &[("frame", &frame_num)]))
-                .on_click(move |_, window, cx| {
-                    win_start.update(cx, |this, cx| {
-                        let _ = this.controller.set_selection_range_start_at(frame);
-                        finish_mutation(this, window, cx);
-                    });
-                }),
-        )
-        .item(
-            PopupMenuItem::new(tr_fmt("ctx.set_sel_end_here", &[("frame", &frame_num)])).on_click(
+    let with_toggles =
+        menu.separator()
+            .item(
+                PopupMenuItem::new(tr_fmt("ctx.set_sel_start_here", &[("frame", &frame_num)]))
+                    .on_click(move |_, window, cx| {
+                        win_start.update(cx, |this, cx| {
+                            let _ = this.controller.set_selection_range_start_at(frame);
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(tr_fmt("ctx.set_sel_end_here", &[("frame", &frame_num)]))
+                    .on_click(move |_, window, cx| {
+                        win_end.update(cx, |this, cx| {
+                            let _ = this.controller.set_selection_range_end_at(frame);
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(tr("ctx.clear_sel_range"))
+                    .disabled(!avail.flags.has_selection_range)
+                    .on_click(move |_, window, cx| {
+                        win_clear.update(cx, |this, cx| {
+                            let _ = this.controller.set_selection_range(None);
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(tr("menu.settings.timeline_snap_auto")).on_click(
+                    move |_, window, cx| {
+                        win_auto.update(cx, |this, cx| {
+                            let _ = this
+                                .controller
+                                .set_timeline_length(TimelineLengthMode::AutoToLastClip);
+                            finish_mutation(this, window, cx);
+                        });
+                    },
+                ),
+            )
+            .item(PopupMenuItem::new(tr("ctx.set_timeline_length")).on_click(
                 move |_, window, cx| {
-                    win_end.update(cx, |this, cx| {
-                        let _ = this.controller.set_selection_range_end_at(frame);
-                        finish_mutation(this, window, cx);
+                    win_len.update(cx, |this, cx| {
+                        this.open_timeline_length_modal(window, cx);
                     });
                 },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(tr("ctx.clear_sel_range"))
-                .disabled(!avail.flags.has_selection_range)
-                .on_click(move |_, window, cx| {
-                    win_clear.update(cx, |this, cx| {
-                        let _ = this.controller.set_selection_range(None);
-                        finish_mutation(this, window, cx);
-                    });
-                }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(tr("menu.settings.timeline_snap_auto")).on_click(
-                move |_, window, cx| {
-                    win_auto.update(cx, |this, cx| {
-                        let _ = this
-                            .controller
-                            .set_timeline_length(TimelineLengthMode::AutoToLastClip);
-                        finish_mutation(this, window, cx);
-                    });
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(tr("ctx.set_timeline_length")).on_click(move |_, window, cx| {
-                win_len.update(cx, |this, cx| {
-                    this.open_timeline_length_modal(window, cx);
+            ))
+            .separator()
+            .item(
+                PopupMenuItem::new(tr("ctx.snap_enable"))
+                    .checked(avail.toggles.snap_enabled)
+                    .on_click(move |_, window, cx| {
+                        win_snap.update(cx, |this, cx| {
+                            this.controller.toggle_snap_enabled();
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(tr("ctx.follow_seek"))
+                    .checked(avail.toggles.follow_selected_on_seek)
+                    .on_click(move |_, window, cx| {
+                        win_follow.update(cx, |this, cx| {
+                            this.controller.toggle_follow_selected_on_seek();
+                            finish_mutation(this, window, cx);
+                        });
+                    }),
+            );
+
+    append_playhead_follow_items(with_toggles, avail.toggles.playhead_follow_mode, win).item(
+        PopupMenuItem::new(tr("ctx.frame_unit"))
+            .checked(avail.toggles.show_frames)
+            .on_click(move |_, window, cx| {
+                win_unit.update(cx, |this, cx| {
+                    this.controller.toggle_time_display_unit();
+                    finish_mutation(this, window, cx);
                 });
             }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(tr("ctx.snap_enable"))
-                .checked(avail.toggles.snap_enabled)
-                .on_click(move |_, window, cx| {
-                    win_snap.update(cx, |this, cx| {
-                        this.controller.toggle_snap_enabled();
-                        finish_mutation(this, window, cx);
-                    });
-                }),
-        )
-        .item(
-            PopupMenuItem::new(tr("ctx.follow_seek"))
-                .checked(avail.toggles.follow_selected_on_seek)
-                .on_click(move |_, window, cx| {
-                    win_follow.update(cx, |this, cx| {
-                        this.controller.toggle_follow_selected_on_seek();
-                        finish_mutation(this, window, cx);
-                    });
-                }),
-        )
-        .item(
-            PopupMenuItem::new(tr("ctx.frame_unit"))
-                .checked(avail.toggles.show_frames)
-                .on_click(move |_, window, cx| {
-                    win_unit.update(cx, |this, cx| {
-                        this.controller.toggle_time_display_unit();
-                        finish_mutation(this, window, cx);
-                    });
-                }),
-        )
+    )
+}
+
+fn append_playhead_follow_items(
+    menu: PopupMenu,
+    mode: crate::ui::editor_prefs::TimelinePlayheadFollowMode,
+    win: &Entity<SeaEditorWindow>,
+) -> PopupMenu {
+    use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
+    let win_page = win.clone();
+    let win_center = win.clone();
+    let win_off = win.clone();
+    menu.item(
+        PopupMenuItem::new(tr("ctx.playhead_follow_page"))
+            .checked(mode == TimelinePlayheadFollowMode::Page)
+            .on_click(move |_, window, cx| {
+                win_page.update(cx, |this, cx| {
+                    this.controller
+                        .set_playhead_follow_mode(TimelinePlayheadFollowMode::Page);
+                    finish_mutation(this, window, cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new(tr("ctx.playhead_follow_center"))
+            .checked(mode == TimelinePlayheadFollowMode::Center)
+            .on_click(move |_, window, cx| {
+                win_center.update(cx, |this, cx| {
+                    this.controller
+                        .set_playhead_follow_mode(TimelinePlayheadFollowMode::Center);
+                    finish_mutation(this, window, cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new(tr("ctx.playhead_follow_off"))
+            .checked(mode == TimelinePlayheadFollowMode::Off)
+            .on_click(move |_, window, cx| {
+                win_off.update(cx, |this, cx| {
+                    this.controller
+                        .set_playhead_follow_mode(TimelinePlayheadFollowMode::Off);
+                    finish_mutation(this, window, cx);
+                });
+            }),
+    )
 }
 
 /// クリップブロックへ右クリックメニューを装着する。

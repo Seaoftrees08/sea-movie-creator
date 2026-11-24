@@ -51,14 +51,15 @@ use crate::ui::menu_bar::{
     PreviewZoom50Action, PreviewZoom100Action, PreviewZoom200Action, PreviewZoomFitAction, QuitApp,
     RedoAction, ReloadLanguagePacksAction, RemoveMidpointAction, RotateLeftAction,
     RotateRightAction, SaveProject, SaveProjectAs, SeekEnd, SeekStart, SelectAllClips,
-    SelectLanguageAction, SetSelectionEndAction, SetSelectionStartAction, SetTimelineLengthAction,
-    ShowTabAiChatAction, ShowTabClipInspectorAction, ShowTabLayerListAction,
-    ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction,
-    StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction,
-    TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause,
-    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction,
-    ToggleReturnToStartOnStopAction, UndoAction, apply_key_config_bindings, setup_menus,
-    update_app_menus,
+    SelectLanguageAction, SetPlayheadFollowCenterAction, SetPlayheadFollowOffAction,
+    SetPlayheadFollowPageAction, SetSelectionEndAction, SetSelectionStartAction,
+    SetTimelineLengthAction, ShowTabAiChatAction, ShowTabClipInspectorAction,
+    ShowTabLayerListAction, ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip,
+    StepBackHalfSecAction, StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame,
+    StopPlaybackAction, TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction,
+    TogglePlayPause, TogglePreviewGridAction, TogglePreviewGuidesAction,
+    TogglePreviewWaveformAction, ToggleReturnToStartOnStopAction, UndoAction,
+    apply_key_config_bindings, setup_menus, update_app_menus,
 };
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
@@ -787,6 +788,7 @@ impl SeaEditorWindow {
                 waveform: self.controller.show_preview_waveform,
             },
             follow_selected_on_seek: self.controller.follow_selected_on_seek,
+            playhead_follow_mode: self.controller.playhead_follow_mode,
             return_to_start_on_stop: self.controller.return_playhead_to_start_on_stop,
             preview_zoom: self.controller.preview_zoom,
             right_tab: self.controller.right_tab,
@@ -1163,6 +1165,29 @@ impl SeaEditorWindow {
                     cx.notify();
                 }),
             )
+            .on_action(cx.listener(|this, _: &SetPlayheadFollowPageAction, _, cx| {
+                this.controller.set_playhead_follow_mode(
+                    crate::ui::editor_prefs::TimelinePlayheadFollowMode::Page,
+                );
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &SetPlayheadFollowCenterAction, _, cx| {
+                    this.controller.set_playhead_follow_mode(
+                        crate::ui::editor_prefs::TimelinePlayheadFollowMode::Center,
+                    );
+                    this.reload_app_menus(cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SetPlayheadFollowOffAction, _, cx| {
+                this.controller.set_playhead_follow_mode(
+                    crate::ui::editor_prefs::TimelinePlayheadFollowMode::Off,
+                );
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
             .on_action(
                 cx.listener(|this, _: &ToggleReturnToStartOnStopAction, _, cx| {
                     this.controller.toggle_return_playhead_to_start_on_stop();
