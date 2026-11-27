@@ -1,17 +1,21 @@
 //! `OpenAI` 互換 / Gemini / Anthropic 間で共有する `ureq` HTTP POST・SSE ストリーム受信ヘルパー。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::sync::{Mutex, OnceLock};
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::ai::provider::{AiError, AiStreamEvent};
+use crate::ai::provider::AiError;
+#[cfg(test)]
+use crate::ai::provider::AiStreamEvent;
 
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_COLLECTED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SSE_EVENTS: usize = 65_536;
 const MAX_CACHED_AGENTS: usize = 8;
 
 /// JSON POST 要求パラメータ。
@@ -22,8 +26,10 @@ pub struct HttpJsonRequest<'a> {
     pub headers: &'a [(&'a str, &'a str)],
     /// JSON ボディ。
     pub body: &'a Value,
-    /// 全体タイムアウト（秒）。
+    /// アイドル読み取り／接続タイムアウト基準（秒）。
     pub timeout_secs: u64,
+    /// 実行中キャンセル通知フラグ（任意）。
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// JSON GET 要求パラメータ。
@@ -80,8 +86,8 @@ pub fn get_json_sync(request: &HttpGetRequest<'_>) -> Result<Value, AiError> {
 /// 通信失敗・HTTP エラー・JSON/SSE 解析エラー時に [`AiError`] を返す。
 pub fn post_json_sse_or_sync<S, T, FSse, FFinish, FSync>(
     request: &HttpJsonRequest<'_>,
-    mut state: S,
-    mut on_sse_event: FSse,
+    state: S,
+    on_sse_event: FSse,
     finish_sse: FFinish,
     on_sync_json: FSync,
 ) -> Result<T, AiError>
@@ -90,13 +96,45 @@ where
     FFinish: FnOnce(S) -> Result<T, AiError>,
     FSync: FnOnce(S, &Value) -> Result<T, AiError>,
 {
-    let (mut resp, content_type) = send_json_post(request, "text/event-stream, application/json")?;
+    post_json_sse_or_sync_with_eof(
+        request,
+        state,
+        on_sse_event,
+        |s, _saw_done| finish_sse(s),
+        on_sync_json,
+    )
+}
 
+/// `[DONE]` 終端シグナルの有無も `finish_sse` へ渡す SSE / JSON POST ヘルパー。
+///
+/// # Errors
+///
+/// キャンセル・通信失敗・HTTP エラー・JSON/SSE 解析エラー時に [`AiError`] を返す。
+pub fn post_json_sse_or_sync_with_eof<S, T, FSse, FFinish, FSync>(
+    request: &HttpJsonRequest<'_>,
+    mut state: S,
+    mut on_sse_event: FSse,
+    finish_sse: FFinish,
+    on_sync_json: FSync,
+) -> Result<T, AiError>
+where
+    FSse: FnMut(&mut S, Option<&str>, &str) -> Result<bool, AiError>,
+    FFinish: FnOnce(S, bool) -> Result<T, AiError>,
+    FSync: FnOnce(S, &Value) -> Result<T, AiError>,
+{
+    if let Some(flag) = request.cancel_flag.as_ref() {
+        if flag.load(Ordering::Relaxed) {
+            return Err(AiError::Cancelled);
+        }
+        return run_post_cancellable(request, flag, state, on_sse_event, finish_sse, on_sync_json);
+    }
+
+    let (mut resp, content_type) = send_json_post(request, "text/event-stream, application/json")?;
     if content_type.contains("text/event-stream") {
-        read_sse_events(resp.body_mut().as_reader(), &mut |evt, payload| {
+        let saw_done = read_sse_events(resp.body_mut().as_reader(), &mut |evt, payload| {
             on_sse_event(&mut state, evt, payload)
         })?;
-        finish_sse(state)
+        finish_sse(state, saw_done)
     } else {
         let json_val: Value = resp
             .body_mut()
@@ -106,45 +144,123 @@ where
     }
 }
 
-/// 指定 URL へ JSON POST を行い、2xx 以外のステータス時に本文付き [`AiError::HttpStatus`] を返す。
-///
-/// ストリーミング応答時は `text/event-stream` 行単位パーサを呼び出し、非 SSE の JSON 応答へも自動フォールバックする。
-///
-/// # Errors
-///
-/// 通信失敗・HTTP エラー・JSON/SSE 解析エラー時に [`AiError`] を返す。
-pub fn post_json_streaming_or_sync<FChunk, FSync>(
-    request: &HttpJsonRequest<'_>,
-    mut on_sse_payload: FChunk,
-    mut on_sync_json: FSync,
-    on_event: &mut dyn FnMut(AiStreamEvent),
-) -> Result<String, AiError>
-where
-    FChunk: FnMut(&str) -> Result<Option<String>, AiError>,
-    FSync: FnMut(&Value) -> Result<String, AiError>,
-{
-    post_json_sse_or_sync(
-        request,
-        (String::new(), on_event),
-        |(collected, evt_cb), _event_name, payload| {
-            if let Some(delta) = on_sse_payload(payload)?
-                && !delta.is_empty()
-            {
-                append_collected_delta(collected, &delta, *evt_cb)?;
-            }
-            Ok(false)
-        },
-        |(collected, _)| Ok(collected),
-        |(_, evt_cb), json_val| {
-            let text = on_sync_json(json_val)?;
-            if !text.is_empty() {
-                evt_cb(AiStreamEvent::DeltaText(text.clone()));
-            }
-            Ok(text)
-        },
-    )
+enum CancellablePostMsg {
+    SseEvent(Option<String>, String),
+    SseEof { saw_done: bool },
+    SyncJson(Value),
+    Err(AiError),
 }
 
+fn run_post_cancellable<S, T, FSse, FFinish, FSync>(
+    request: &HttpJsonRequest<'_>,
+    flag: &Arc<AtomicBool>,
+    mut state: S,
+    mut on_sse_event: FSse,
+    finish_sse: FFinish,
+    on_sync_json: FSync,
+) -> Result<T, AiError>
+where
+    FSse: FnMut(&mut S, Option<&str>, &str) -> Result<bool, AiError>,
+    FFinish: FnOnce(S, bool) -> Result<T, AiError>,
+    FSync: FnOnce(S, &Value) -> Result<T, AiError>,
+{
+    validate_http_url_and_headers(request.url, request.headers)?;
+    let url = request.url.to_owned();
+    let headers: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let body = request.body.clone();
+    let timeout_secs = request.timeout_secs;
+    let cancel_worker = Arc::clone(flag);
+    let (tx, rx) = mpsc::sync_channel::<CancellablePostMsg>(64);
+
+    std::thread::spawn(move || {
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let req = HttpJsonRequest {
+            url: &url,
+            headers: &header_refs,
+            body: &body,
+            timeout_secs,
+            cancel_flag: None,
+        };
+        let (mut resp, content_type) =
+            match send_json_post(&req, "text/event-stream, application/json") {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = tx.send(CancellablePostMsg::Err(err));
+                    return;
+                }
+            };
+        if content_type.contains("text/event-stream") {
+            let sse_res = read_sse_events(resp.body_mut().as_reader(), &mut |evt, payload| {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return Err(AiError::Cancelled);
+                }
+                tx.send(CancellablePostMsg::SseEvent(
+                    evt.map(ToOwned::to_owned),
+                    payload.to_owned(),
+                ))
+                .map_err(|_| AiError::Cancelled)?;
+                Ok(false)
+            });
+            match sse_res {
+                Ok(saw_done) => {
+                    let _ = tx.send(CancellablePostMsg::SseEof { saw_done });
+                }
+                Err(err) => {
+                    let _ = tx.send(CancellablePostMsg::Err(err));
+                }
+            }
+        } else {
+            match resp.body_mut().read_json::<Value>() {
+                Ok(val) => {
+                    let _ = tx.send(CancellablePostMsg::SyncJson(val));
+                }
+                Err(err) => {
+                    let _ = tx.send(CancellablePostMsg::Err(AiError::ParseFailed(format!(
+                        "JSON response parse error: {err}"
+                    ))));
+                }
+            }
+        }
+    });
+
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return Err(AiError::Cancelled);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(CancellablePostMsg::SseEvent(evt, payload)) => {
+                if on_sse_event(&mut state, evt.as_deref(), &payload)? {
+                    return finish_sse(state, true);
+                }
+            }
+            Ok(CancellablePostMsg::SseEof { saw_done }) => {
+                return finish_sse(state, saw_done);
+            }
+            Ok(CancellablePostMsg::SyncJson(val)) => {
+                return on_sync_json(state, &val);
+            }
+            Ok(CancellablePostMsg::Err(err)) => return Err(err),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if flag.load(Ordering::Relaxed) {
+                    return Err(AiError::Cancelled);
+                }
+                return Err(AiError::Transport(
+                    "HTTP response stream worker disconnected unexpectedly".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn append_collected_delta(
     collected: &mut String,
     delta: &str,
@@ -158,20 +274,6 @@ fn append_collected_delta(
     on_event(AiStreamEvent::DeltaText(delta.to_owned()));
     collected.push_str(delta);
     Ok(())
-}
-
-/// 指定 URL へ非ストリーミングの JSON POST を行い、完全な JSON 応答オブジェクトを返す。
-///
-/// マルチモーダルや Native Tool Calling など、完全構造化応答を一括取得するエージェントターン向け。
-///
-/// # Errors
-///
-/// 通信失敗・HTTP 4xx/5xx エラー・JSON 解析エラー時に [`AiError`] を返す。
-pub fn post_json_sync(request: &HttpJsonRequest<'_>) -> Result<Value, AiError> {
-    let (mut resp, _) = send_json_post(request, "application/json")?;
-    resp.body_mut()
-        .read_json()
-        .map_err(|err| AiError::ParseFailed(format!("JSON response parse error: {err}")))
 }
 
 fn validate_http_url_and_headers(url: &str, headers: &[(&str, &str)]) -> Result<(), AiError> {
@@ -216,6 +318,38 @@ fn is_loopback_http_authority(url_after_scheme: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
+fn cached_streaming_ureq_agent(timeout_secs: u64) -> ureq::Agent {
+    static STREAM_AGENTS: OnceLock<Mutex<HashMap<u64, ureq::Agent>>> = OnceLock::new();
+    let clamped = timeout_secs.max(5);
+    let cache = STREAM_AGENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(existing) = guard.get(&clamped) {
+            return existing.clone();
+        }
+        if guard.len() >= MAX_CACHED_AGENTS {
+            guard.clear();
+        }
+        let created = build_streaming_ureq_agent(clamped);
+        guard.insert(clamped, created.clone());
+        return created;
+    }
+    build_streaming_ureq_agent(clamped)
+}
+
+fn build_streaming_ureq_agent(timeout_secs: u64) -> ureq::Agent {
+    // 長時間の Thinking や大規模生成で正常チャンク受信中に 60 秒打ち切りされないよう、
+    // 全体 timeout_global は設定せず接続・応答ヘッダ・チャンク間アイドルタイムアウトで管理する
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(timeout_secs.min(30))))
+        .timeout_send_request(Some(Duration::from_secs(timeout_secs)))
+        .timeout_send_body(Some(Duration::from_secs(timeout_secs)))
+        .timeout_recv_response(Some(Duration::from_secs(timeout_secs.max(120))))
+        .timeout_per_read(Some(Duration::from_secs(timeout_secs)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 fn cached_ureq_agent(timeout_secs: u64) -> ureq::Agent {
     static AGENTS: OnceLock<Mutex<HashMap<u64, ureq::Agent>>> = OnceLock::new();
     let clamped = timeout_secs.max(5);
@@ -247,7 +381,7 @@ fn send_json_post(
     accept_header: &str,
 ) -> Result<(ureq::http::Response<ureq::Body>, String), AiError> {
     validate_http_url_and_headers(request.url, request.headers)?;
-    let agent = cached_ureq_agent(request.timeout_secs);
+    let agent = cached_streaming_ureq_agent(request.timeout_secs);
 
     let mut req = agent
         .post(request.url)
@@ -306,37 +440,81 @@ where
     Ok(collected)
 }
 
-fn read_sse_events<R, FSse>(reader: R, on_sse_event: &mut FSse) -> Result<(), AiError>
+fn read_sse_events<R, FSse>(reader: R, on_sse_event: &mut FSse) -> Result<bool, AiError>
+where
+    R: std::io::Read,
+    FSse: FnMut(Option<&str>, &str) -> Result<bool, AiError>,
+{
+    read_sse_events_with_limits(
+        reader,
+        on_sse_event,
+        MAX_SSE_LINE_BYTES,
+        MAX_SSE_COLLECTED_BYTES,
+        MAX_SSE_EVENTS,
+    )
+}
+
+fn read_sse_events_with_limits<R, FSse>(
+    reader: R,
+    on_sse_event: &mut FSse,
+    max_line_bytes: usize,
+    max_collected_bytes: usize,
+    max_events: usize,
+) -> Result<bool, AiError>
 where
     R: std::io::Read,
     FSse: FnMut(Option<&str>, &str) -> Result<bool, AiError>,
 {
     let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut raw_bytes = Vec::new();
     let mut event_name: Option<String> = None;
     let mut event_data = String::new();
-    let line_limit = u64::try_from(MAX_SSE_LINE_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut is_first_line = true;
+    let mut limits = SseStreamLimitAcc {
+        total_collected_bytes: 0,
+        total_events: 0,
+        max_collected_bytes,
+        max_events,
+    };
+    let line_limit = u64::try_from(max_line_bytes.saturating_add(1)).unwrap_or(u64::MAX);
 
     loop {
-        line.clear();
-        let read = std::io::Read::take(&mut buf_reader, line_limit).read_line(&mut line)?;
+        raw_bytes.clear();
+        // UTF-8 デコード前にバイト長上限を判定することで、境界跨ぎマルチバイト文字でも正しく上限エラーにする
+        let read = buf_reader
+            .by_ref()
+            .take(line_limit)
+            .read_until(b'\n', &mut raw_bytes)?;
         if read == 0 {
-            if !event_data.is_empty() {
-                let _ = flush_sse_event(&mut event_name, &mut event_data, on_sse_event)?;
+            if event_name.as_deref() == Some("error") || !event_data.is_empty() {
+                let outcome =
+                    flush_sse_event(&mut event_name, &mut event_data, on_sse_event, &mut limits)?;
+                return Ok(matches!(outcome, FlushOutcome::Done));
             }
-            break;
+            return Ok(false);
         }
-        if read > MAX_SSE_LINE_BYTES && !line.ends_with('\n') {
+        if read > max_line_bytes && !raw_bytes.ends_with(b"\n") {
             return Err(AiError::ParseFailed(format!(
-                "SSE line exceeded max size ({MAX_SSE_LINE_BYTES} bytes)"
+                "SSE line exceeded max size ({max_line_bytes} bytes)"
             )));
         }
-        let raw_line = line.trim_end_matches(['\r', '\n']);
+        let line_owned = String::from_utf8(std::mem::take(&mut raw_bytes)).map_err(|err| {
+            AiError::ParseFailed(format!("SSE stream contained invalid UTF-8: {err}"))
+        })?;
+        let mut raw_line = line_owned.as_str();
+        if is_first_line {
+            is_first_line = false;
+            raw_line = raw_line.strip_prefix('\u{FEFF}').unwrap_or(raw_line);
+        }
+        // WHATWG SSE 仕様準拠で末尾の単一 \n / \r\n のみを除去する
+        let raw_line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if raw_line.is_empty() {
-            if flush_sse_event(&mut event_name, &mut event_data, on_sse_event)? {
-                break;
+            match flush_sse_event(&mut event_name, &mut event_data, on_sse_event, &mut limits)? {
+                FlushOutcome::Done => return Ok(true),
+                FlushOutcome::StopEarly => return Ok(false),
+                FlushOutcome::Continue => continue,
             }
-            continue;
         }
         if raw_line.starts_with(':') {
             continue;
@@ -358,34 +536,72 @@ where
             event_data.push_str(value);
         }
     }
-    Ok(())
+}
+
+struct SseStreamLimitAcc {
+    total_collected_bytes: usize,
+    total_events: usize,
+    max_collected_bytes: usize,
+    max_events: usize,
+}
+
+enum FlushOutcome {
+    Continue,
+    StopEarly,
+    Done,
 }
 
 fn flush_sse_event<FSse>(
     event_name: &mut Option<String>,
     event_data: &mut String,
     on_sse_event: &mut FSse,
-) -> Result<bool, AiError>
+    limits: &mut SseStreamLimitAcc,
+) -> Result<FlushOutcome, AiError>
 where
     FSse: FnMut(Option<&str>, &str) -> Result<bool, AiError>,
 {
     let name = event_name.take();
+    if name.as_deref() == Some("error") {
+        let payload_owned = std::mem::take(event_data);
+        let payload = payload_owned.trim();
+        let detail = if payload.is_empty() {
+            "empty error event"
+        } else {
+            payload
+        };
+        let snippet: String = detail.chars().take(600).collect();
+        return Err(AiError::ParseFailed(format!("SSE error event: {snippet}")));
+    }
     if event_data.is_empty() {
-        return Ok(false);
+        return Ok(FlushOutcome::Continue);
     }
     let payload_owned = std::mem::take(event_data);
     let payload = payload_owned.trim();
     if payload.is_empty() {
-        return Ok(false);
+        return Ok(FlushOutcome::Continue);
     }
     if payload == "[DONE]" {
-        return Ok(true);
+        return Ok(FlushOutcome::Done);
     }
-    if name.as_deref() == Some("error") {
-        let snippet: String = payload.chars().take(600).collect();
-        return Err(AiError::ParseFailed(format!("SSE error event: {snippet}")));
+    limits.total_events = limits.total_events.saturating_add(1);
+    if limits.total_events > limits.max_events {
+        return Err(AiError::ParseFailed(format!(
+            "SSE event count exceeded max limit ({} events)",
+            limits.max_events
+        )));
     }
-    on_sse_event(name.as_deref(), payload)
+    limits.total_collected_bytes = limits.total_collected_bytes.saturating_add(payload.len());
+    if limits.total_collected_bytes > limits.max_collected_bytes {
+        return Err(AiError::ParseFailed(format!(
+            "SSE accumulated stream exceeded max size ({} bytes)",
+            limits.max_collected_bytes
+        )));
+    }
+    if on_sse_event(name.as_deref(), payload)? {
+        Ok(FlushOutcome::StopEarly)
+    } else {
+        Ok(FlushOutcome::Continue)
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +734,7 @@ mod tests {
             headers: &[],
             body: &body,
             timeout_secs: 5,
+            cancel_flag: None,
         };
         let (sum, seen) = post_json_sse_or_sync(
             &req1,
@@ -546,6 +763,7 @@ mod tests {
             headers: &[],
             body: &body,
             timeout_secs: 5,
+            cancel_flag: None,
         };
         let fallback = post_json_sse_or_sync(
             &req2,
@@ -556,6 +774,103 @@ mod tests {
         )?;
         assert_eq!(fallback, 42);
         let _ = srv2.join().map_err(|_| "srv2 join")??;
+        Ok(())
+    }
+
+    #[test]
+    fn sse_reader_enforces_limits_utf8_bom_crlf_and_empty_error_event() -> Result<(), AiError> {
+        // 1. UTF-8 BOM と単一 CRLF・値末尾の \r 保持を確認
+        let bom_stream = "\u{FEFF}data: {\"txt\":\"hi\r\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let mut payloads = Vec::new();
+        let saw_done = read_sse_events(Cursor::new(bom_stream.as_bytes()), &mut |_, payload| {
+            payloads.push(payload.to_owned());
+            Ok(false)
+        })?;
+        assert!(saw_done);
+        assert_eq!(payloads, vec!["{\"txt\":\"hi\r\"}"]);
+
+        // 2. event: error かつ data 空でもエラー化すること
+        let empty_err_stream = "event: error\n\n";
+        assert!(matches!(
+            read_sse_events(Cursor::new(empty_err_stream.as_bytes()), &mut |_, _| Ok(
+                false
+            )),
+            Err(AiError::ParseFailed(_))
+        ));
+
+        // 3. マルチバイト文字が line 上限を跨いでも UTF-8 InvalidData でなく ParseFailed になること
+        let mut long_utf8 = b"data: ".to_vec();
+        long_utf8.extend("あ".repeat(12).as_bytes());
+        long_utf8.push(b'\n');
+        let err_line = read_sse_events_with_limits(
+            Cursor::new(long_utf8),
+            &mut |_, _| Ok(false),
+            20,
+            4096,
+            100,
+        );
+        assert!(
+            matches!(err_line, Err(AiError::ParseFailed(ref m)) if m.contains("max size")),
+            "expected ParseFailed(max size), got: {err_line:?}"
+        );
+
+        // 4. 累積ペイロード上限超過で ParseFailed になること
+        let many_chunks = "data: 1234567890\n\ndata: 1234567890\n\n";
+        let err_total = read_sse_events_with_limits(
+            Cursor::new(many_chunks.as_bytes()),
+            &mut |_, _| Ok(false),
+            1024,
+            15,
+            100,
+        );
+        assert!(matches!(err_total, Err(AiError::ParseFailed(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn post_json_sse_aborts_promptly_when_cancel_flag_is_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let srv = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"n\":1}\n\n";
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.flush();
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_setter = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            flag_setter.store(true, Ordering::Relaxed);
+        });
+
+        let url = format!("http://{addr}/v1/cancel");
+        let body = serde_json::json!({});
+        let req = HttpJsonRequest {
+            url: &url,
+            headers: &[],
+            body: &body,
+            timeout_secs: 10,
+            cancel_flag: Some(Arc::clone(&flag)),
+        };
+        let started = std::time::Instant::now();
+        let res = post_json_sse_or_sync::<_, (), _, _, _>(
+            &req,
+            (),
+            |(), _, _| Ok(false),
+            |()| Ok(()),
+            |(), _| Ok(()),
+        );
+        assert!(matches!(res, Err(AiError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = srv.join();
         Ok(())
     }
 }

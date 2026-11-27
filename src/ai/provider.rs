@@ -1,6 +1,7 @@
 //! AI チャットプロバイダの共通トレイト、設定種別、ストリーミングイベント、機密文字列型。
 
 use std::fmt;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -73,6 +74,9 @@ pub enum AiError {
     /// AI プラグイン／外部 CLI アダプタのエラー。
     #[error("AI plugin failed: {0}")]
     PluginError(String),
+    /// ユーザー操作等により AI 要求がキャンセルされた。
+    #[error("AI request cancelled")]
+    Cancelled,
     /// 入出力エラー。
     #[error("AI I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -1212,6 +1216,17 @@ pub struct AiThinkingBlock {
     /// プロバイダ発行の署名文字列。
     #[serde(default)]
     pub signature: String,
+    /// Anthropic `redacted_thinking` ブロックの生データ（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_data: Option<String>,
+}
+
+impl AiThinkingBlock {
+    /// Anthropic API へ再送可能な有効 `thinking` / `redacted_thinking` ブロックかを返す。
+    #[must_use]
+    pub fn is_valid_anthropic(&self) -> bool {
+        !self.signature.is_empty() || self.redacted_data.is_some()
+    }
 }
 
 /// LLM 応答から抽出された 1 件のツール呼び出し要求。
@@ -1403,6 +1418,23 @@ pub trait AiProvider: Send + Sync {
     ) -> Result<AiAgentTurnResponse, AiError> {
         fallback_agent_turn_via_streaming(self, request, on_event)
     }
+
+    /// キャンセルフラグ付きでマルチモーダル・ツール呼び出し対応のエージェントターンを実行する。
+    ///
+    /// # Errors
+    ///
+    /// 認証情報欠如・キャンセル・通信失敗・応答解析エラー時に [`AiError`] を返す。
+    fn send_agent_turn_cancellable(
+        &self,
+        request: &AiAgentTurnRequest,
+        cancel_flag: Option<&Arc<AtomicBool>>,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        if cancel_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(AiError::Cancelled);
+        }
+        self.send_agent_turn(request, on_event)
+    }
 }
 
 /// バイト列を標準 Base64（RFC 4648 パディング付き）文字列へエンコードする。
@@ -1507,13 +1539,14 @@ fn split_fallback_messages_and_prompt(
         let history = messages[..trailing_tool_start]
             .iter()
             .map(|msg| {
-                let (role, content, _) = render_turn_message_as_text(msg, extract_images);
+                // 履歴側メッセージからは画像を回収しないため、フォールバック注記を必ず残す
+                let (role, content, _) = render_turn_message_as_text(msg, false);
                 AiChatMessage { role, content }
             })
             .collect();
         let tool_results = messages[trailing_tool_start..]
             .iter()
-            .map(|msg| render_turn_message_as_text(msg, extract_images).1)
+            .map(|msg| render_turn_message_as_text(msg, false).1)
             .collect::<Vec<_>>()
             .join("\n\n");
         let prompt = format!(
@@ -1529,10 +1562,11 @@ fn split_fallback_messages_and_prompt(
     let mut last_user_prompt = String::new();
     for (idx, msg) in messages.iter().enumerate() {
         let is_last = idx + 1 == messages.len();
-        let (role, content, imgs) = render_turn_message_as_text(msg, extract_images);
+        let should_extract = extract_images && is_last && matches!(msg, AiTurnMessage::User { .. });
+        let (role, content, imgs) = render_turn_message_as_text(msg, should_extract);
         if is_last && role == AiRole::User {
             last_user_prompt = content;
-            if extract_images {
+            if should_extract {
                 extracted_images.extend(imgs);
             }
         } else {
@@ -1866,5 +1900,52 @@ mod tests {
         assert_eq!(parsed.vision_contact_sheet_rows, 2);
         assert_eq!(parsed.vision_contact_sheet_tile_px, 320);
         Ok(())
+    }
+
+    #[test]
+    fn split_fallback_preserves_image_note_on_history_user_turns() {
+        let msgs_with_tool_tail = vec![
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("最初の画像を見て"),
+                    AiContentPart::image_bytes("image/jpeg", b"img1"),
+                ],
+            },
+            AiTurnMessage::ToolResult {
+                tool_call_id: "c1".to_owned(),
+                name: "noop".to_owned(),
+                content_json: "{}".to_owned(),
+                is_error: false,
+            },
+        ];
+        let (hist1, _prompt1, imgs1) =
+            split_fallback_messages_and_prompt(&msgs_with_tool_tail, true);
+        assert_eq!(imgs1.len(), 0);
+        assert_eq!(hist1.len(), 1);
+        assert!(hist1[0].content.contains("provider text-fallback"));
+
+        let msgs_with_new_user = vec![
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("1枚目"),
+                    AiContentPart::image_bytes("image/jpeg", b"img1"),
+                ],
+            },
+            AiTurnMessage::Assistant {
+                text: Some("確認しました".to_owned()),
+                thinking_blocks: Vec::new(),
+                tool_calls: Vec::new(),
+            },
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("2枚目"),
+                    AiContentPart::image_bytes("image/jpeg", b"img2"),
+                ],
+            },
+        ];
+        let (hist2, prompt2, imgs2) = split_fallback_messages_and_prompt(&msgs_with_new_user, true);
+        assert_eq!(imgs2.len(), 1);
+        assert!(hist2[0].content.contains("provider text-fallback"));
+        assert!(!prompt2.contains("provider text-fallback"));
     }
 }

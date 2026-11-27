@@ -1751,6 +1751,7 @@ fn convert_wire_messages_to_turn_messages(
                         .map(|b| crate::ai::provider::AiThinkingBlock {
                             thinking: b.thinking.clone(),
                             signature: b.signature.clone(),
+                            redacted_data: None,
                         })
                         .collect(),
                     tool_calls: msg

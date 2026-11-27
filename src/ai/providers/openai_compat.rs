@@ -1,6 +1,7 @@
 //! OpenAI・OpenRouter・Ollama・LM Studio・vLLM 共通 HTTP/SSE クライアント。
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde_json::{Value, json};
 
@@ -11,8 +12,10 @@ use crate::ai::provider::{
 };
 use crate::ai::providers::credentials::require_api_key;
 use crate::ai::providers::sse::{
-    HttpGetRequest, HttpJsonRequest, get_json_sync, post_json_sse_or_sync,
+    HttpGetRequest, HttpJsonRequest, get_json_sync, post_json_sse_or_sync_with_eof,
 };
+
+const MAX_OPENAI_STREAM_TOOL_CALLS: usize = 256;
 
 /// `OpenAI` 互換チャット補完 API クライアント設定。
 #[derive(Debug, Clone)]
@@ -330,23 +333,39 @@ impl AiProvider for OpenAiCompatProvider {
             headers: &header_refs,
             body: &body,
             timeout_secs: self.config.timeout_secs,
+            cancel_flag: None,
         };
 
-        let (raw_text, sse_usage, sync_usage, on_event) = post_json_sse_or_sync(
+        let (raw_text, sse_usage, sync_usage, on_event) = post_json_sse_or_sync_with_eof(
             &http_req,
             (
                 String::new(),
+                None::<String>,
                 None::<AiTokenUsage>,
                 None::<AiTokenUsage>,
                 on_event,
             ),
-            |(collected, sse_u, _, evt_cb), _event_name, payload| {
-                process_openai_streaming_sse_payload(payload, collected, sse_u, *evt_cb)?;
+            |(collected, finish_reason, sse_u, _, evt_cb), _event_name, payload| {
+                process_openai_streaming_sse_payload(
+                    payload,
+                    collected,
+                    finish_reason,
+                    sse_u,
+                    *evt_cb,
+                )?;
                 Ok(false)
             },
-            |(collected, sse_u, sync_u, evt_cb)| Ok((collected, sse_u, sync_u, evt_cb)),
-            |(_, sse_u, mut sync_u, evt_cb), val| {
-                let text = parse_openai_sync_json(val, &mut sync_u)?;
+            |(collected, finish_reason, sse_u, sync_u, evt_cb), saw_done| {
+                if !saw_done && finish_reason.is_none() {
+                    return Err(AiError::ParseFailed(
+                        "OpenAI SSE stream terminated prematurely without [DONE] or finish_reason"
+                            .to_owned(),
+                    ));
+                }
+                Ok((collected, sse_u, sync_u, evt_cb))
+            },
+            |(_, _, sse_u, mut sync_u, evt_cb), val| {
+                let text = parse_openai_sync_json_and_thoughts(val, &mut sync_u, evt_cb)?;
                 if !text.is_empty() {
                     evt_cb(AiStreamEvent::DeltaText(text.clone()));
                 }
@@ -366,6 +385,15 @@ impl AiProvider for OpenAiCompatProvider {
     fn send_agent_turn(
         &self,
         request: &AiAgentTurnRequest,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        self.send_agent_turn_cancellable(request, None, on_event)
+    }
+
+    fn send_agent_turn_cancellable(
+        &self,
+        request: &AiAgentTurnRequest,
+        cancel_flag: Option<&Arc<AtomicBool>>,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiAgentTurnResponse, AiError> {
         let maybe_key = require_api_key(&self.config.kind, self.config.api_key.as_ref())?;
@@ -389,28 +417,26 @@ impl AiProvider for OpenAiCompatProvider {
             headers: &header_refs,
             body: &body,
             timeout_secs: self.config.timeout_secs,
+            cancel_flag: cancel_flag.cloned(),
         };
         let native_tools = self.supports_native_tools();
-        post_json_sse_or_sync(
+        post_json_sse_or_sync_with_eof(
             &http_req,
             (OpenAiAgentStreamAcc::default(), on_event),
             |(acc, evt_cb), _event_name, payload| {
                 process_openai_agent_sse_chunk(acc, payload, *evt_cb)?;
                 Ok(false)
             },
-            |(acc, _)| {
-                Ok(finalize_openai_agent_stream(
-                    acc,
-                    native_tools,
-                    &self.config.model,
-                ))
+            |(acc, _), saw_done| {
+                finalize_openai_agent_stream(acc, saw_done, native_tools, &self.config.model)
             },
             |(_, evt_cb), val| {
                 let parsed = if native_tools {
-                    parse_openai_agent_response(val, &self.config.model)?
+                    parse_openai_agent_response_with_events(val, &self.config.model, Some(evt_cb))?
                 } else {
                     let mut captured_usage: Option<AiTokenUsage> = None;
-                    let text = parse_openai_sync_json(val, &mut captured_usage)?;
+                    let text =
+                        parse_openai_sync_json_and_thoughts(val, &mut captured_usage, evt_cb)?;
                     let mut p = parse_fallback_agent_response(&text, &self.config.model);
                     p.usage = captured_usage;
                     p
@@ -507,7 +533,22 @@ fn openai_turn_message_to_json(msg: &AiTurnMessage, native_tools: bool) -> Value
     }
 }
 
-fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnResponse, AiError> {
+fn check_openai_payload_error(val: &Value) -> Result<(), AiError> {
+    if let Some(err_obj) = val.get("error").filter(|v| !v.is_null()) {
+        let msg = err_obj["message"]
+            .as_str()
+            .unwrap_or("OpenAI compatible API returned error payload");
+        return Err(AiError::ParseFailed(format!("OpenAI error: {msg}")));
+    }
+    Ok(())
+}
+
+fn parse_openai_agent_response_with_events(
+    val: &Value,
+    model: &str,
+    on_event: Option<&mut dyn FnMut(AiStreamEvent)>,
+) -> Result<AiAgentTurnResponse, AiError> {
+    check_openai_payload_error(val)?;
     let choice = &val["choices"][0];
     let message = choice
         .get("message")
@@ -515,6 +556,14 @@ fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
         .ok_or_else(|| {
             AiError::ParseFailed("OpenAI response missing choices[0].message".to_owned())
         })?;
+    if let Some(reasoning) = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+        .filter(|s| !s.is_empty())
+        && let Some(cb) = on_event
+    {
+        cb(AiStreamEvent::ThoughtDelta(reasoning.to_owned()));
+    }
     let text = message["content"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -528,8 +577,11 @@ fn parse_openai_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
                     .as_str()
                     .map_or_else(|| format!("oai_call_{idx}"), ToOwned::to_owned);
                 let args = match &call["function"]["arguments"] {
-                    Value::String(raw) => serde_json::from_str::<Value>(raw)
-                        .unwrap_or_else(|_| Value::String(raw.clone())),
+                    Value::String(raw) => serde_json::from_str::<Value>(raw).map_err(|err| {
+                        AiError::ParseFailed(format!(
+                            "OpenAI tool_calls arguments JSON parse failed for `{name}`: {err}"
+                        ))
+                    })?,
                     other if !other.is_null() => other.clone(),
                     _ => json!({}),
                 };
@@ -568,18 +620,43 @@ struct OpenAiAgentStreamAcc {
     usage: Option<AiTokenUsage>,
 }
 
+fn merge_openai_usage(acc: &mut Option<AiTokenUsage>, incoming: &AiTokenUsage) {
+    let target = acc.get_or_insert_with(AiTokenUsage::default);
+    if incoming.input_tokens > 0 {
+        target.input_tokens = incoming.input_tokens;
+    }
+    if incoming.output_tokens > 0 {
+        target.output_tokens = incoming.output_tokens;
+    }
+    target.total_tokens = if incoming.total_tokens > 0 {
+        incoming.total_tokens
+    } else {
+        target.input_tokens.saturating_add(target.output_tokens)
+    };
+    if incoming.cost_usd.is_some() {
+        target.cost_usd = incoming.cost_usd;
+    }
+    target.is_estimated = false;
+}
+
 fn process_openai_streaming_sse_payload(
     payload: &str,
     collected: &mut String,
+    finish_reason: &mut Option<String>,
     captured_usage: &mut Option<AiTokenUsage>,
     on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<(), AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("OpenAI SSE JSON parse failed: {err}")))?;
+    check_openai_payload_error(&val)?;
     if let Some(usage) = extract_openai_usage(&val) {
-        *captured_usage = Some(usage);
+        merge_openai_usage(captured_usage, &usage);
     }
-    let delta = &val["choices"][0]["delta"];
+    let choice = &val["choices"][0];
+    if let Some(reason) = choice["finish_reason"].as_str().filter(|s| !s.is_empty()) {
+        *finish_reason = Some(reason.to_owned());
+    }
+    let delta = &choice["delta"];
     if let Some(reasoning) = delta["reasoning_content"]
         .as_str()
         .or_else(|| delta["reasoning"].as_str())
@@ -601,8 +678,9 @@ fn process_openai_agent_sse_chunk(
 ) -> Result<(), AiError> {
     let val: Value = serde_json::from_str(payload)
         .map_err(|err| AiError::ParseFailed(format!("OpenAI agent SSE parse failed: {err}")))?;
+    check_openai_payload_error(&val)?;
     if let Some(usage) = extract_openai_usage(&val) {
-        acc.usage = Some(usage);
+        merge_openai_usage(&mut acc.usage, &usage);
     }
     let choice = &val["choices"][0];
     if let Some(reason) = choice["finish_reason"].as_str().filter(|s| !s.is_empty()) {
@@ -622,11 +700,28 @@ fn process_openai_agent_sse_chunk(
     }
     if let Some(arr) = delta["tool_calls"].as_array() {
         for tc in arr {
-            let fallback_idx = acc.tool_calls.len();
-            let idx = tc["index"]
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(fallback_idx);
+            let idx = if let Some(explicit) =
+                tc["index"].as_u64().and_then(|n| usize::try_from(n).ok())
+            {
+                explicit
+            } else {
+                let has_identity = tc["id"].as_str().is_some_and(|s| !s.is_empty())
+                    || tc["function"]["name"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty());
+                if has_identity {
+                    acc.tool_calls.keys().next_back().map_or(0, |last| last + 1)
+                } else {
+                    acc.tool_calls.keys().next_back().copied().unwrap_or(0)
+                }
+            };
+            if !acc.tool_calls.contains_key(&idx)
+                && acc.tool_calls.len() >= MAX_OPENAI_STREAM_TOOL_CALLS
+            {
+                return Err(AiError::ParseFailed(format!(
+                    "OpenAI SSE stream exceeded max tool calls ({MAX_OPENAI_STREAM_TOOL_CALLS})"
+                )));
+            }
             let entry = acc.tool_calls.entry(idx).or_default();
             if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
                 id.clone_into(&mut entry.id);
@@ -634,8 +729,10 @@ fn process_openai_agent_sse_chunk(
             if let Some(name) = tc["function"]["name"].as_str() {
                 entry.name.push_str(name);
             }
-            if let Some(args) = tc["function"]["arguments"].as_str() {
-                entry.arguments_raw.push_str(args);
+            match &tc["function"]["arguments"] {
+                Value::String(args) => entry.arguments_raw.push_str(args),
+                other if !other.is_null() => entry.arguments_raw.push_str(&other.to_string()),
+                _ => {}
             }
         }
     }
@@ -644,9 +741,15 @@ fn process_openai_agent_sse_chunk(
 
 fn finalize_openai_agent_stream(
     acc: OpenAiAgentStreamAcc,
+    saw_done: bool,
     native_tools: bool,
     model: &str,
-) -> AiAgentTurnResponse {
+) -> Result<AiAgentTurnResponse, AiError> {
+    if !saw_done && acc.finish_reason.is_none() {
+        return Err(AiError::ParseFailed(
+            "OpenAI SSE stream terminated prematurely without [DONE] or finish_reason".to_owned(),
+        ));
+    }
     let mut tool_calls = Vec::new();
     for (idx, partial) in acc.tool_calls {
         if partial.name.trim().is_empty() {
@@ -661,7 +764,12 @@ fn finalize_openai_agent_stream(
         let arguments = if trimmed.is_empty() {
             json!({})
         } else {
-            serde_json::from_str::<Value>(trimmed).unwrap_or_else(|_| json!({}))
+            serde_json::from_str::<Value>(trimmed).map_err(|err| {
+                AiError::ParseFailed(format!(
+                    "OpenAI streaming tool_calls arguments JSON parse failed for `{}`: {err}",
+                    partial.name
+                ))
+            })?
         };
         tool_calls.push(AiToolCall {
             id,
@@ -673,29 +781,39 @@ fn finalize_openai_agent_stream(
     if !native_tools && tool_calls.is_empty() && !acc.text_buf.trim().is_empty() {
         let mut parsed = parse_fallback_agent_response(&acc.text_buf, model);
         parsed.usage = acc.usage;
-        if parsed.finish_reason.is_none() {
+        if parsed.tool_calls.is_empty() && acc.finish_reason.is_some() {
             parsed.finish_reason = acc.finish_reason;
         }
-        return parsed;
+        return Ok(parsed);
     }
-    AiAgentTurnResponse {
+    Ok(AiAgentTurnResponse {
         text: (!acc.text_buf.is_empty()).then_some(acc.text_buf),
         thinking_blocks: Vec::new(),
         tool_calls,
         model: model.to_owned(),
         finish_reason: acc.finish_reason,
         usage: acc.usage,
-    }
+    })
 }
 
-fn parse_openai_sync_json(
+fn parse_openai_sync_json_and_thoughts(
     val: &Value,
     captured_usage: &mut Option<AiTokenUsage>,
+    on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<String, AiError> {
+    check_openai_payload_error(val)?;
     if let Some(usage) = extract_openai_usage(val) {
-        *captured_usage = Some(usage);
+        merge_openai_usage(captured_usage, &usage);
     }
-    val["choices"][0]["message"]["content"]
+    let msg = &val["choices"][0]["message"];
+    if let Some(reasoning) = msg["reasoning_content"]
+        .as_str()
+        .or_else(|| msg["reasoning"].as_str())
+        .filter(|s| !s.is_empty())
+    {
+        on_event(AiStreamEvent::ThoughtDelta(reasoning.to_owned()));
+    }
+    msg["content"]
         .as_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
@@ -1032,6 +1150,100 @@ mod tests {
         let parsed_body: Value = serde_json::from_str(json_body)?;
         assert_eq!(parsed_body["stream"], json!(true));
         assert_eq!(parsed_body["stream_options"]["include_usage"], json!(true));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_stream_preserves_length_finish_rejects_broken_json_and_handles_no_index_and_sync_thoughts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. native_tools = false のフォールバックでツール無し時は Acc の finish_reason("length") を保持
+        let acc_len = OpenAiAgentStreamAcc {
+            text_buf: "途中の応答テキスト".to_owned(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: Some("length".to_owned()),
+            usage: None,
+        };
+        let res_len = finalize_openai_agent_stream(acc_len, true, false, "ollama:qwen3")?;
+        assert_eq!(res_len.finish_reason.as_deref(), Some("length"));
+
+        // 2. streaming tool_calls の不正 JSON は空 {} に握り潰さず ParseFailed にすること
+        let mut bad_calls = BTreeMap::new();
+        bad_calls.insert(
+            0,
+            PartialOpenAiToolCall {
+                id: "c1".to_owned(),
+                name: "apply_draft_edit_command".to_owned(),
+                arguments_raw: "{\"broken\":".to_owned(),
+            },
+        );
+        let acc_bad_json = OpenAiAgentStreamAcc {
+            text_buf: String::new(),
+            tool_calls: bad_calls,
+            finish_reason: Some("tool_calls".to_owned()),
+            usage: None,
+        };
+        assert!(finalize_openai_agent_stream(acc_bad_json, true, true, "gpt-4o").is_err());
+
+        // 3. index 欠損＋オブジェクト arguments でも継続結合できること
+        let mut acc_no_idx = OpenAiAgentStreamAcc::default();
+        process_openai_agent_sse_chunk(
+            &mut acc_no_idx,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"no_idx_1","function":{"name":"apply_","arguments":"{\"a\":"}}]}}]}"#,
+            &mut |_| {},
+        )?;
+        process_openai_agent_sse_chunk(
+            &mut acc_no_idx,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut |_| {},
+        )?;
+        process_openai_agent_sse_chunk(
+            &mut acc_no_idx,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"no_idx_2","function":{"name":"noop","arguments":{"ok":true}}}]}}]}"#,
+            &mut |_| {},
+        )?;
+        let merged = finalize_openai_agent_stream(acc_no_idx, true, true, "gpt-4o")?;
+        assert_eq!(merged.tool_calls.len(), 2);
+        assert_eq!(merged.tool_calls[0].id, "no_idx_1");
+        assert_eq!(merged.tool_calls[0].arguments["a"], json!(1));
+        assert_eq!(merged.tool_calls[1].arguments["ok"], json!(true));
+
+        // 4. ストリーム内 {"error": ...} と premature EOF を拒否すること
+        let mut err_acc = OpenAiAgentStreamAcc::default();
+        assert!(
+            process_openai_agent_sse_chunk(
+                &mut err_acc,
+                r#"{"error":{"message":"upstream overloaded"}}"#,
+                &mut |_| {},
+            )
+            .is_err()
+        );
+        assert!(
+            finalize_openai_agent_stream(OpenAiAgentStreamAcc::default(), false, true, "gpt-4o")
+                .is_err()
+        );
+
+        // 5. sync JSON 応答でも reasoning_content から ThoughtDelta を送出すること
+        let sync_val = json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "sync推論",
+                    "content": "完了"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let mut thoughts = Vec::new();
+        let parsed = parse_openai_agent_response_with_events(
+            &sync_val,
+            "deepseek-r1",
+            Some(&mut |evt| {
+                if let AiStreamEvent::ThoughtDelta(t) = evt {
+                    thoughts.push(t);
+                }
+            }),
+        )?;
+        assert_eq!(thoughts, vec!["sync推論"]);
+        assert_eq!(parsed.text.as_deref(), Some("完了"));
         Ok(())
     }
 
