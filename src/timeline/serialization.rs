@@ -90,6 +90,8 @@ pub fn resolve_document_assets(document: &mut ProjectDocument, project_dir: Opti
                 // 旧仕様等で EXIF 回転前の寸法が保存されたままの .seaproj を読込時に正立寸法へ同期する
                 if let AssetKind::Image { width, height } = &mut asset.kind
                     && let Ok(info) = crate::media::image_loader::inspect_image_file(&resolved_path)
+                    && info.width > 0
+                    && info.height > 0
                     && (*width != info.width || *height != info.height)
                 {
                     *width = info.width;

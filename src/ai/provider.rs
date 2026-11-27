@@ -1060,6 +1060,103 @@ impl Default for AgentRuntimeSettings {
     }
 }
 
+/// Vision 1 バッチあたり最小画像枚数 (`Individual` モード用)。
+pub const MIN_VISION_BATCH_SIZE: usize = 1;
+/// Vision 1 バッチあたり最大画像枚数 (`Individual` モード用)。
+pub const MAX_VISION_BATCH_SIZE: usize = 12;
+/// Vision 個別サムネイル長辺の最小ピクセル数。
+pub const MIN_VISION_MAX_EDGE_PX: u32 = 128;
+/// Vision 個別サムネイル長辺の最大ピクセル数。
+pub const MAX_VISION_MAX_EDGE_PX: u32 = 2048;
+/// Vision JPEG エンコード品質の最小値。
+pub const MIN_VISION_JPEG_QUALITY: u8 = 40;
+/// Vision JPEG エンコード品質の最大値。
+pub const MAX_VISION_JPEG_QUALITY: u8 = 90;
+/// コンタクトシート列・行数の最小値。
+pub const MIN_CONTACT_SHEET_DIM: u8 = 1;
+/// コンタクトシート列・行数の最大値。
+pub const MAX_CONTACT_SHEET_DIM: u8 = 4;
+/// コンタクトシート 1 タイルの最小長辺ピクセル数。
+pub const MIN_CONTACT_SHEET_TILE_PX: u32 = 128;
+/// コンタクトシート 1 タイルの最大長辺ピクセル数。
+pub const MAX_CONTACT_SHEET_TILE_PX: u32 = 1024;
+
+impl AgentRuntimeSettings {
+    /// すべての Vision / コンタクトシート設定を有効許容範囲へ丸めたコピーを返す。
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        Self {
+            max_steps_per_turn: self.max_steps_per_turn,
+            min_llm_interval_ms: self.min_llm_interval_ms,
+            vision_batch_size: self
+                .vision_batch_size
+                .clamp(MIN_VISION_BATCH_SIZE, MAX_VISION_BATCH_SIZE),
+            vision_max_edge_px: self
+                .vision_max_edge_px
+                .clamp(MIN_VISION_MAX_EDGE_PX, MAX_VISION_MAX_EDGE_PX),
+            vision_packing_mode: self.vision_packing_mode,
+            vision_jpeg_quality: self
+                .vision_jpeg_quality
+                .clamp(MIN_VISION_JPEG_QUALITY, MAX_VISION_JPEG_QUALITY),
+            vision_contact_sheet_cols: self
+                .vision_contact_sheet_cols
+                .clamp(MIN_CONTACT_SHEET_DIM, MAX_CONTACT_SHEET_DIM),
+            vision_contact_sheet_rows: self
+                .vision_contact_sheet_rows
+                .clamp(MIN_CONTACT_SHEET_DIM, MAX_CONTACT_SHEET_DIM),
+            vision_contact_sheet_tile_px: self
+                .vision_contact_sheet_tile_px
+                .clamp(MIN_CONTACT_SHEET_TILE_PX, MAX_CONTACT_SHEET_TILE_PX),
+        }
+    }
+
+    /// 明示保存や JSON 直接編集時に各設定値が許容範囲内か検証する。
+    ///
+    /// # Errors
+    ///
+    /// いずれかのフィールドが許可範囲外の場合。
+    pub fn validate(&self) -> Result<(), String> {
+        if !(MIN_VISION_BATCH_SIZE..=MAX_VISION_BATCH_SIZE).contains(&self.vision_batch_size) {
+            return Err(format!(
+                "runtime.vision_batch_size は {MIN_VISION_BATCH_SIZE}..={MAX_VISION_BATCH_SIZE} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_VISION_MAX_EDGE_PX..=MAX_VISION_MAX_EDGE_PX).contains(&self.vision_max_edge_px) {
+            return Err(format!(
+                "runtime.vision_max_edge_px は {MIN_VISION_MAX_EDGE_PX}..={MAX_VISION_MAX_EDGE_PX} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_VISION_JPEG_QUALITY..=MAX_VISION_JPEG_QUALITY).contains(&self.vision_jpeg_quality)
+        {
+            return Err(format!(
+                "runtime.vision_jpeg_quality は {MIN_VISION_JPEG_QUALITY}..={MAX_VISION_JPEG_QUALITY} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_DIM..=MAX_CONTACT_SHEET_DIM)
+            .contains(&self.vision_contact_sheet_cols)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_cols は {MIN_CONTACT_SHEET_DIM}..={MAX_CONTACT_SHEET_DIM} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_DIM..=MAX_CONTACT_SHEET_DIM)
+            .contains(&self.vision_contact_sheet_rows)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_rows は {MIN_CONTACT_SHEET_DIM}..={MAX_CONTACT_SHEET_DIM} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_TILE_PX..=MAX_CONTACT_SHEET_TILE_PX)
+            .contains(&self.vision_contact_sheet_tile_px)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_tile_px は {MIN_CONTACT_SHEET_TILE_PX}..={MAX_CONTACT_SHEET_TILE_PX} の範囲で指定してください"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// マルチモーダル会話メッセージ内の 1 コンテンツパート。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

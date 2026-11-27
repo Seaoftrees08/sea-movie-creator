@@ -500,6 +500,7 @@ impl AiUserSettings {
                 validate_optional_price(model.output_price_per_1m_usd, "output_price_per_1m_usd")?;
             }
         }
+        self.runtime.validate()?;
         Ok(())
     }
 

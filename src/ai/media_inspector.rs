@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::UNIX_EPOCH;
 
 use image::codecs::jpeg::JpegEncoder;
@@ -113,6 +113,25 @@ impl AllowedFolderScope {
     ///
     /// 対象が存在しない場合、または許可されたいずれのルート・ファイルにも含まれない場合。
     pub fn validate_path(&self, target: &Path) -> Result<PathBuf, MediaInspectorError> {
+        if self.roots.is_empty() && self.allowed_files.is_empty() {
+            return Err(MediaInspectorError::AccessDenied(
+                target.display().to_string(),
+            ));
+        }
+        // Windows 環境で許可外 UNC パスへ fs::canonicalize 前に SMB 接続するのを防ぐ
+        if let Some(target_unc) = unc_server_share(target) {
+            let same_unc_allowed = self
+                .roots
+                .iter()
+                .chain(self.allowed_files.iter())
+                .filter_map(|allowed| unc_server_share(allowed))
+                .any(|allowed_unc| allowed_unc == target_unc);
+            if !same_unc_allowed {
+                return Err(MediaInspectorError::AccessDenied(
+                    target.display().to_string(),
+                ));
+            }
+        }
         let canon = fs::canonicalize(target)
             .map_err(|_| MediaInspectorError::NotFound(target.display().to_string()))?;
         if self.roots.iter().any(|root| canon.starts_with(root))
@@ -123,6 +142,19 @@ impl AllowedFolderScope {
         Err(MediaInspectorError::AccessDenied(
             target.display().to_string(),
         ))
+    }
+}
+
+fn unc_server_share(path: &Path) -> Option<(String, String)> {
+    match path.components().next() {
+        Some(Component::Prefix(prefix_comp)) => match prefix_comp.kind() {
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some((
+                server.to_string_lossy().to_ascii_lowercase(),
+                share.to_string_lossy().to_ascii_lowercase(),
+            )),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -498,8 +530,9 @@ pub fn build_contact_sheet_jpeg_base64(
     }
     let tile_px = options.tile_max_edge_px.clamp(128, 1024);
     let quality = options.jpeg_quality.clamp(40, 90);
-    let active_rows = u32::try_from(inputs.len().div_ceil(cols as usize)).unwrap_or(1);
-    let sheet_w = cols.saturating_mul(tile_px);
+    let active_cols = cols.min(u32::try_from(inputs.len()).unwrap_or(1).max(1));
+    let active_rows = u32::try_from(inputs.len().div_ceil(active_cols as usize)).unwrap_or(1);
+    let sheet_w = active_cols.saturating_mul(tile_px);
     let sheet_h = active_rows.saturating_mul(tile_px);
 
     let mut sheet = RgbImage::from_pixel(sheet_w, sheet_h, Rgb([24, 28, 36]));
@@ -516,8 +549,8 @@ pub fn build_contact_sheet_jpeg_base64(
         let rgb_tile = dynamic_image_to_rgb8_white_bg(thumb)?;
 
         let slot_u32 = u32::try_from(slot_idx).unwrap_or(0);
-        let tile_origin_x = (slot_u32 % cols).saturating_mul(tile_px);
-        let tile_origin_y = (slot_u32 / cols).saturating_mul(tile_px);
+        let tile_origin_x = (slot_u32 % active_cols).saturating_mul(tile_px);
+        let tile_origin_y = (slot_u32 / active_cols).saturating_mul(tile_px);
         blit_centered_tile(&mut sheet, &rgb_tile, tile_origin_x, tile_origin_y, tile_px);
 
         let label = format!("#{}", item.badge_index);
@@ -1310,6 +1343,51 @@ mod tests {
         assert_eq!(sheet.tile_count, 3);
         assert_eq!(sheet.mime_type, "image/jpeg");
         assert_ne!(sheet.base64_data, "");
+
+        // 端数枚（例: cols=3 で 2 枚）時はシート幅が 2 列分へ縮小されること
+        let shrunk = build_contact_sheet_jpeg_base64(
+            &scope,
+            &[
+                ContactSheetInput {
+                    path: dir.join("a.png"),
+                    badge_index: 1,
+                    extra_rotation_deg: 0,
+                },
+                ContactSheetInput {
+                    path: dir.join("b.png"),
+                    badge_index: 2,
+                    extra_rotation_deg: 0,
+                },
+            ],
+            ContactSheetOptions {
+                cols: 3,
+                rows: 2,
+                tile_max_edge_px: 256,
+                jpeg_quality: 68,
+            },
+        )?;
+        assert_eq!(shrunk.width, 256 * 2);
+        assert_eq!(shrunk.height, 256);
         Ok(())
+    }
+
+    #[test]
+    fn empty_scope_and_unallowed_unc_paths_return_access_denied_before_fs_probe() {
+        let empty = AllowedFolderScope::default();
+        assert!(matches!(
+            empty.validate_path(Path::new("/definitely/missing/secret.jpg")),
+            Err(MediaInspectorError::AccessDenied(_))
+        ));
+
+        let guard_res = TempDirGuard::new("unc_scope");
+        if let Ok(guard) = guard_res {
+            let scope = AllowedFolderScope::from_folders([&guard.0]);
+            if cfg!(windows) {
+                assert!(matches!(
+                    scope.validate_path(Path::new(r"\\attacker.invalid\share\probe.jpg")),
+                    Err(MediaInspectorError::AccessDenied(_))
+                ));
+            }
+        }
     }
 }

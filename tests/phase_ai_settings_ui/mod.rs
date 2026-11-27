@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sea_movie_creator::ai::provider::{
     AgentRuntimeSettings, AiApprovalMode, AiProviderKind, AiThinkingLevel, AiTokenUsage,
+    VisionPackingMode,
 };
 use sea_movie_creator::ai::providers::openai_compat::OpenRouterCreditsSnapshot;
 use sea_movie_creator::ai::settings::{
@@ -62,7 +63,11 @@ fn startup_restores_last_selection_custom_models_and_runtime_settings()
             min_llm_interval_ms: 1500,
             vision_batch_size: 4,
             vision_max_edge_px: 512,
-            ..AgentRuntimeSettings::default()
+            vision_packing_mode: VisionPackingMode::Individual,
+            vision_jpeg_quality: 80,
+            vision_contact_sheet_cols: 4,
+            vision_contact_sheet_rows: 2,
+            vision_contact_sheet_tile_px: 448,
         });
     }
 
@@ -83,6 +88,16 @@ fn startup_restores_last_selection_custom_models_and_runtime_settings()
     );
     assert_eq!(restarted.runtime_settings.max_steps_per_turn, 25);
     assert_eq!(restarted.runtime_settings.min_llm_interval_ms, 1500);
+    assert_eq!(restarted.runtime_settings.vision_batch_size, 4);
+    assert_eq!(restarted.runtime_settings.vision_max_edge_px, 512);
+    assert_eq!(
+        restarted.runtime_settings.vision_packing_mode,
+        VisionPackingMode::Individual
+    );
+    assert_eq!(restarted.runtime_settings.vision_jpeg_quality, 80);
+    assert_eq!(restarted.runtime_settings.vision_contact_sheet_cols, 4);
+    assert_eq!(restarted.runtime_settings.vision_contact_sheet_rows, 2);
+    assert_eq!(restarted.runtime_settings.vision_contact_sheet_tile_px, 448);
     assert_eq!(restarted.user_settings.budget_usd, Some(15.0));
     assert_eq!(
         restarted.user_settings.usage_display_mode,

@@ -1,6 +1,6 @@
 //! AI 設定モーダル: 「エージェント・予算」タブ描画。
 
-use gpui_kit::base::StyledExt as _;
+use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
@@ -140,6 +140,8 @@ fn render_vision_compression_controls(
     let quality_row = render_vision_quality_row(cur, cx);
 
     v_flex()
+        .w_full()
+        .min_w(px(0.))
         .gap_1p5()
         .child(packing_row)
         .child(grid_row)
@@ -152,12 +154,18 @@ fn render_vision_packing_row(
     cur: &AgentRuntimeSettings,
     cx: &mut Context<SeaEditorWindow>,
 ) -> AnyElement {
-    let mut packing_row = h_flex().items_center().gap_1p5().flex_wrap().child(
-        div()
-            .text_xs()
-            .text_color(rgba(0xcbd5_e1ff))
-            .child(tr("ai.settings_vision_packing_label")),
-    );
+    let mut packing_row = h_flex()
+        .w_full()
+        .min_w(px(0.))
+        .items_center()
+        .gap_1p5()
+        .flex_wrap()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgba(0xcbd5_e1ff))
+                .child(tr("ai.settings_vision_packing_label")),
+        );
     for (idx, (mode, label_key)) in [
         (
             VisionPackingMode::ContactSheet,
@@ -194,15 +202,24 @@ fn render_vision_grid_row(
     cur: &AgentRuntimeSettings,
     cx: &mut Context<SeaEditorWindow>,
 ) -> AnyElement {
-    let mut grid_row = h_flex().items_center().gap_1p5().flex_wrap().child(
-        div()
-            .text_xs()
-            .text_color(rgba(0xcbd5_e1ff))
-            .child(tr("ai.settings_vision_sheet_grid_label")),
-    );
-    for (idx, &(cols, rows)) in [(2_u8, 2_u8), (3, 2), (4, 2)].iter().enumerate() {
+    let is_sheet = cur.vision_packing_mode == VisionPackingMode::ContactSheet;
+    let mut grid_row = h_flex()
+        .w_full()
+        .min_w(px(0.))
+        .items_center()
+        .gap_1p5()
+        .flex_wrap()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgba(0xcbd5_e1ff))
+                .child(tr("ai.settings_vision_sheet_grid_label")),
+        );
+    let presets = [(2_u8, 2_u8), (3, 2), (4, 2)];
+    for (idx, &(cols, rows)) in presets.iter().enumerate() {
         let mut btn = Button::new(("ai-modal-vision-grid", idx))
             .xsmall()
+            .disabled(!is_sheet)
             .label(format!(
                 "{cols}x{rows} ({})",
                 u16::from(cols) * u16::from(rows)
@@ -220,6 +237,23 @@ fn render_vision_grid_row(
             cx.notify();
         })));
     }
+    if !presets
+        .iter()
+        .any(|&(c, r)| c == cur.vision_contact_sheet_cols && r == cur.vision_contact_sheet_rows)
+    {
+        let total =
+            u16::from(cur.vision_contact_sheet_cols) * u16::from(cur.vision_contact_sheet_rows);
+        grid_row = grid_row.child(
+            Button::new("ai-modal-vision-grid-custom")
+                .xsmall()
+                .primary()
+                .disabled(!is_sheet)
+                .label(format!(
+                    "{}x{} ({total})",
+                    cur.vision_contact_sheet_cols, cur.vision_contact_sheet_rows
+                )),
+        );
+    }
     grid_row.into_any_element()
 }
 
@@ -227,15 +261,24 @@ fn render_vision_tile_row(
     cur: &AgentRuntimeSettings,
     cx: &mut Context<SeaEditorWindow>,
 ) -> AnyElement {
-    let mut tile_row = h_flex().items_center().gap_1p5().flex_wrap().child(
-        div()
-            .text_xs()
-            .text_color(rgba(0xcbd5_e1ff))
-            .child(tr("ai.settings_vision_tile_px_label")),
-    );
-    for (idx, &tile_px) in [256_u32, 320, 448].iter().enumerate() {
+    let is_sheet = cur.vision_packing_mode == VisionPackingMode::ContactSheet;
+    let mut tile_row = h_flex()
+        .w_full()
+        .min_w(px(0.))
+        .items_center()
+        .gap_1p5()
+        .flex_wrap()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgba(0xcbd5_e1ff))
+                .child(tr("ai.settings_vision_tile_px_label")),
+        );
+    let presets = [256_u32, 320, 448];
+    for (idx, &tile_px) in presets.iter().enumerate() {
         let mut btn = Button::new(("ai-modal-vision-tile", idx))
             .xsmall()
+            .disabled(!is_sheet)
             .label(format!("{tile_px}px"));
         btn = if cur.vision_contact_sheet_tile_px == tile_px {
             btn.primary()
@@ -249,6 +292,15 @@ fn render_vision_tile_row(
             cx.notify();
         })));
     }
+    if !presets.contains(&cur.vision_contact_sheet_tile_px) {
+        tile_row = tile_row.child(
+            Button::new("ai-modal-vision-tile-custom")
+                .xsmall()
+                .primary()
+                .disabled(!is_sheet)
+                .label(format!("{}px", cur.vision_contact_sheet_tile_px)),
+        );
+    }
     tile_row.into_any_element()
 }
 
@@ -256,13 +308,20 @@ fn render_vision_quality_row(
     cur: &AgentRuntimeSettings,
     cx: &mut Context<SeaEditorWindow>,
 ) -> AnyElement {
-    let mut quality_row = h_flex().items_center().gap_1p5().flex_wrap().child(
-        div()
-            .text_xs()
-            .text_color(rgba(0xcbd5_e1ff))
-            .child(tr("ai.settings_vision_quality_label")),
-    );
-    for (idx, &q) in [55_u8, 68, 80].iter().enumerate() {
+    let mut quality_row = h_flex()
+        .w_full()
+        .min_w(px(0.))
+        .items_center()
+        .gap_1p5()
+        .flex_wrap()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgba(0xcbd5_e1ff))
+                .child(tr("ai.settings_vision_quality_label")),
+        );
+    let presets = [55_u8, 68, 80];
+    for (idx, &q) in presets.iter().enumerate() {
         let mut btn = Button::new(("ai-modal-vision-quality", idx))
             .xsmall()
             .label(format!("Q{q}"));
@@ -277,6 +336,14 @@ fn render_vision_quality_row(
             this.controller.ai_chat.apply_runtime_settings(next);
             cx.notify();
         })));
+    }
+    if !presets.contains(&cur.vision_jpeg_quality) {
+        quality_row = quality_row.child(
+            Button::new("ai-modal-vision-quality-custom")
+                .xsmall()
+                .primary()
+                .label(format!("Q{}", cur.vision_jpeg_quality)),
+        );
     }
     quality_row.into_any_element()
 }

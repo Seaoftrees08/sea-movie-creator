@@ -1,5 +1,6 @@
 //! 動的自己記述ツールレジストリ (`HostToolRegistry`) および軽量 `DraftSandbox` 実行環境。
 
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -178,6 +179,8 @@ pub struct ToolExecutionContext<'a> {
     pub on_usage: Option<&'a mut dyn FnMut(AiTokenUsage)>,
     /// 登録済み外部拡張を自己申告一覧に含めるための追加リスト（任意）。
     pub extra_extensions: Vec<InstalledExtensionSummary>,
+    /// 現在開いているプロジェクトファイルのあるディレクトリ（相対アセット解決用）。
+    pub project_dir: Option<&'a Path>,
 }
 
 impl ToolExecutionContext<'_> {
@@ -668,7 +671,7 @@ enum VisionBatchOutcome {
 
 fn is_vision_unsupported_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    [
+    if [
         "vision_unsupported",
         "does not support vision",
         "vision not supported",
@@ -677,12 +680,26 @@ fn is_vision_unsupported_text(text: &str) -> bool {
         "image input not supported",
         "multimodal not supported",
         "not a vision",
-        "does not support",
-        "not supported",
-        "unknown variant",
     ]
     .iter()
     .any(|kw| lower.contains(kw))
+    {
+        return true;
+    }
+    let mentions_vision_media = [
+        "image",
+        "vision",
+        "multimodal",
+        "image_url",
+        "inline_data",
+        "media_type",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    mentions_vision_media
+        && ["does not support", "not supported", "unknown variant"]
+            .iter()
+            .any(|kw| lower.contains(kw))
 }
 
 pub(crate) fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
@@ -713,6 +730,32 @@ fn describe_target_language(code: &str) -> String {
     }
 }
 
+fn merge_failed_vision_items(
+    outcome: VisionBatchOutcome,
+    failed_items: Vec<Value>,
+) -> VisionBatchOutcome {
+    if failed_items.is_empty() {
+        return outcome;
+    }
+    match outcome {
+        VisionBatchOutcome::Parsed(mut items) => {
+            items.extend(failed_items);
+            VisionBatchOutcome::Parsed(items)
+        }
+        VisionBatchOutcome::ParseFallback(mut items) => {
+            items.extend(failed_items);
+            VisionBatchOutcome::ParseFallback(items)
+        }
+        other => other,
+    }
+}
+
+fn build_failed_vision_item(path: &str, err: &dyn std::fmt::Display) -> Value {
+    let mut item = build_filename_fallback_analysis(path);
+    item["media_error"] = json!(err.to_string());
+    item
+}
+
 fn run_single_contact_sheet_vision_batch(
     provider: &dyn AiProvider,
     scope: &AllowedFolderScope,
@@ -721,9 +764,25 @@ fn run_single_contact_sheet_vision_batch(
 ) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let mut inputs = Vec::with_capacity(paths.len());
     let mut manifest_lines = Vec::with_capacity(paths.len());
-    for (idx, p) in paths.iter().enumerate() {
-        let badge = idx + 1;
+    let mut failed_items = Vec::new();
+    let mut first_err: Option<String> = None;
+    let probe_opts = ThumbnailEncodeOptions {
+        max_edge_px: cfg.sheet_opts.tile_max_edge_px,
+        jpeg_quality: cfg.sheet_opts.jpeg_quality,
+        extra_rotation_deg: 0,
+    };
+
+    for p in paths {
         let path_buf = std::path::PathBuf::from(p);
+        if let Err(err) = encode_thumbnail_jpeg_base64_with_options(scope, &path_buf, probe_opts) {
+            if first_err.is_none() {
+                first_err = Some(err.to_string());
+            }
+            failed_items.push(build_failed_vision_item(p, &err));
+            continue;
+        }
+        let idx = inputs.len();
+        let badge = idx + 1;
         let fname = path_buf
             .file_name()
             .and_then(|n| n.to_str())
@@ -734,6 +793,15 @@ fn run_single_contact_sheet_vision_batch(
             badge_index: badge,
             extra_rotation_deg: 0,
         });
+    }
+    if inputs.is_empty() {
+        return (
+            VisionBatchOutcome::Failed {
+                code: "media_error",
+                message: first_err.unwrap_or_else(|| "no readable images in batch".to_owned()),
+            },
+            None,
+        );
     }
     let sheet = match build_contact_sheet_jpeg_base64(scope, &inputs, cfg.sheet_opts) {
         Ok(s) => s,
@@ -765,7 +833,8 @@ fn run_single_contact_sheet_vision_batch(
             base64_data: sheet.base64_data,
         },
     ];
-    execute_vision_analysis_turn(provider, parts, &sheet.paths)
+    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &sheet.paths);
+    (merge_failed_vision_items(outcome, failed_items), usage)
 }
 
 fn run_single_vision_batch(
@@ -777,8 +846,10 @@ fn run_single_vision_batch(
     let mut parts = Vec::new();
     let mut manifest_lines = Vec::new();
     let mut valid_paths = Vec::new();
+    let mut failed_items = Vec::new();
+    let mut first_err: Option<String> = None;
 
-    for (idx, p) in paths.iter().enumerate() {
+    for p in paths {
         let thumb = match encode_thumbnail_jpeg_base64_with_options(
             scope,
             std::path::Path::new(p),
@@ -790,15 +861,14 @@ fn run_single_vision_batch(
         ) {
             Ok(t) => t,
             Err(err) => {
-                return (
-                    VisionBatchOutcome::Failed {
-                        code: "media_error",
-                        message: err.to_string(),
-                    },
-                    None,
-                );
+                if first_err.is_none() {
+                    first_err = Some(err.to_string());
+                }
+                failed_items.push(build_failed_vision_item(p, &err));
+                continue;
             }
         };
+        let idx = valid_paths.len();
         let fname = std::path::Path::new(&thumb.path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -810,6 +880,15 @@ fn run_single_vision_batch(
             base64_data: thumb.base64_data,
         });
         valid_paths.push(thumb.path);
+    }
+    if valid_paths.is_empty() {
+        return (
+            VisionBatchOutcome::Failed {
+                code: "media_error",
+                message: first_err.unwrap_or_else(|| "no readable images in batch".to_owned()),
+            },
+            None,
+        );
     }
 
     let lang_desc = describe_target_language(cfg.language);
@@ -823,7 +902,8 @@ fn run_single_vision_batch(
         manifest_lines.join("\n")
     );
     parts.insert(0, AiContentPart::text(prompt_head));
-    execute_vision_analysis_turn(provider, parts, &valid_paths)
+    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &valid_paths);
+    (merge_failed_vision_items(outcome, failed_items), usage)
 }
 
 fn execute_vision_analysis_turn(
@@ -881,19 +961,40 @@ fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<V
     if arr.is_empty() {
         return None;
     }
+    // コンタクトシートの黄色バッジ `#1..#N` につられて LLM が 1-based で返した場合を自動吸収する
+    let has_zero_index = arr.iter().any(|item| item["index"].as_u64() == Some(0));
+    let one_based_hint =
+        !has_zero_index && arr.iter().any(|item| item["index"].as_u64() == Some(1));
+    let mut used = vec![false; arr.len()];
     let mut out = Vec::with_capacity(valid_paths.len());
     let mut matched_count = 0_usize;
+
     for (idx, default_path) in valid_paths.iter().enumerate() {
-        let matched = arr
-            .iter()
-            .find(|item| item["index"].as_u64() == Some(idx as u64))
-            .or_else(|| arr.get(idx))
-            .and_then(Value::as_object);
-        if let Some(item_map) = matched {
+        let expected_index = if one_based_hint {
+            u64::try_from(idx + 1).ok()
+        } else {
+            u64::try_from(idx).ok()
+        };
+        let pos = expected_index
+            .and_then(|target| {
+                arr.iter()
+                    .enumerate()
+                    .position(|(i, item)| !used[i] && item["index"].as_u64() == Some(target))
+            })
+            .or_else(|| (!used.get(idx).copied().unwrap_or(true)).then_some(idx));
+
+        if let Some(arr_idx) = pos
+            && let Some(item_map) = arr.get(arr_idx).and_then(Value::as_object)
+        {
+            used[arr_idx] = true;
             matched_count += 1;
             let mut obj_map = item_map.clone();
             // LLM がハルシネーションやインジェクションで別パスを返しても正規実パスで上書きする
             obj_map.insert("path".to_owned(), Value::String(default_path.clone()));
+            obj_map.insert(
+                "index".to_owned(),
+                Value::Number(serde_json::Number::from(idx)),
+            );
             out.push(Value::Object(obj_map));
         } else {
             out.push(build_filename_fallback_analysis(default_path));
@@ -1199,6 +1300,7 @@ mod tests {
             on_progress: &mut progress,
             on_usage: Some(&mut on_usage),
             extra_extensions: Vec::new(),
+            project_dir: None,
         };
 
         let folder_res = registry.execute(
@@ -1353,6 +1455,7 @@ mod tests {
             on_progress: &mut progress,
             on_usage: None,
             extra_extensions: Vec::new(),
+            project_dir: None,
         };
 
         let res = registry.execute(
@@ -1362,6 +1465,32 @@ mod tests {
         )?;
         assert_eq!(res["used_vision"], false);
         assert_eq!(res["warning"], VISION_UNSUPPORTED_WARNING);
+
+        // 1-based バッジ応答でも重複や 1 枚ズレが起きず 0-based index と実パスへ整合すること
+        let paths_3 = vec![
+            "D:/p/01.jpg".to_owned(),
+            "D:/p/02.jpg".to_owned(),
+            "D:/p/03.jpg".to_owned(),
+        ];
+        let one_based = r#"{"analyses":[
+            {"index":1,"suggested_subtitle":"桜の並木道"},
+            {"index":2,"suggested_subtitle":"海辺の夕暮れ"},
+            {"index":3,"suggested_subtitle":"笑顔の記念写真"}
+        ]}"#;
+        let parsed_3 = parse_vision_analyses_json(one_based, &paths_3)
+            .ok_or("1-based analyses parse failed")?;
+        assert_eq!(parsed_3[0]["suggested_subtitle"], "桜の並木道");
+        assert_eq!(parsed_3[1]["suggested_subtitle"], "海辺の夕暮れ");
+        assert_eq!(parsed_3[2]["suggested_subtitle"], "笑顔の記念写真");
+        assert_eq!(parsed_3[1]["path"], "D:/p/02.jpg");
+
+        // 無関係なパラメータエラーを vision_unsupported へ誤分類しないこと
+        assert!(!is_vision_unsupported_text(
+            "Model does not support temperature parameter"
+        ));
+        assert!(is_vision_unsupported_text(
+            "This model does not support image input"
+        ));
         Ok(())
     }
 }

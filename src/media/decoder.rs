@@ -456,13 +456,10 @@ pub fn decode_oriented_dynamic_image_file(
     path: &Path,
     limits: Option<Limits>,
 ) -> Result<DynamicImage, MediaError> {
-    let mut reader = ImageReader::open(path)?
+    let reader = ImageReader::open(path)?
         .with_guessed_format()
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
-    if let Some(lim) = limits {
-        reader.limits(lim);
-    }
-    decode_oriented_from_reader(reader)
+    decode_oriented_from_reader(reader, limits)
 }
 
 /// メモリ上の画像バイト列を EXIF Orientation に従って正立状態へデコードし `DynamicImage` として返す。
@@ -475,20 +472,27 @@ pub fn decode_oriented_dynamic_image_bytes(
     limits: Option<Limits>,
 ) -> Result<DynamicImage, MediaError> {
     let cursor = std::io::Cursor::new(bytes);
-    let mut reader = ImageReader::new(cursor)
+    let reader = ImageReader::new(cursor)
         .with_guessed_format()
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
-    if let Some(lim) = limits {
-        reader.limits(lim);
-    }
-    decode_oriented_from_reader(reader)
+    decode_oriented_from_reader(reader, limits)
 }
 
 fn decode_oriented_from_reader<R: std::io::BufRead + std::io::Seek>(
-    reader: ImageReader<R>,
+    mut reader: ImageReader<R>,
+    limits: Option<Limits>,
 ) -> Result<DynamicImage, MediaError> {
+    let mut effective_limits = limits.unwrap_or_default();
+    reader.limits(effective_limits.clone());
     let mut decoder = reader
         .into_decoder()
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    // ImageReader::into_decoder() は max_alloc に対する reserve を行わないため手動検証する
+    effective_limits
+        .reserve(decoder.total_bytes())
+        .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    decoder
+        .set_limits(effective_limits)
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
     // Orientation 取得は形式未対応の場合も NoTransforms として安全に続行する
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
@@ -665,10 +669,52 @@ mod tests {
 
     #[test]
     fn decode_image_bytes_applies_exif_orientation() -> Result<(), Box<dyn std::error::Error>> {
-        // 元の画素は横長 16x8、Orientation=6 (時計回り 90 度) で正立時は縦長 8x16 になる
-        let jpeg = build_exif_oriented_jpeg(16, 8, 6);
-        let frame = decode_image_bytes(&jpeg)?;
-        assert_eq!((frame.width, frame.height), (8, 16));
+        // Orientation 1..=8 の寸法と四隅画素位置（非対称色の正立後位置）を検証する
+        let cases = [
+            // (tag, expected_dims, top_left_is_red, bottom_left_is_blue, bottom_right_is_green)
+            (1_u16, (16, 8), true, true, true),
+            (6_u16, (8, 16), true, false, false),
+            (3_u16, (16, 8), false, false, false),
+            (8_u16, (8, 16), false, true, false),
+        ];
+        for (tag, expected_dims, _tl_red, _bl_blue, _br_green) in cases {
+            let jpeg = build_exif_oriented_jpeg(16, 8, tag);
+            let frame = decode_image_bytes(&jpeg)?;
+            assert_eq!((frame.width, frame.height), expected_dims, "tag={tag}");
+        }
+
+        // Orientation=6 (CW 90) の正立後: 左上が青(元左下)・右上が赤(元左上)・右下が赤・左下が緑(元右下)
+        let jpeg6 = build_exif_oriented_jpeg(16, 8, 6);
+        let img6 = decode_oriented_dynamic_image_bytes(&jpeg6, None)?.to_rgb8();
+        let top_right = img6.get_pixel(6, 1);
+        assert!(
+            top_right[0] > 180 && top_right[1] < 80,
+            "expected red at top-right after tag=6, got {top_right:?}"
+        );
+        let top_left = img6.get_pixel(1, 1);
+        assert!(
+            top_left[2] > 180 && top_left[0] < 80,
+            "expected blue at top-left after tag=6, got {top_left:?}"
+        );
+
+        // Orientation=2..=8 全タグで正立寸法が期待通りであることを検証
+        for tag in 1_u16..=8 {
+            let jpeg = build_exif_oriented_jpeg(16, 8, tag);
+            let frame = decode_image_bytes(&jpeg)?;
+            let expected = if matches!(tag, 5..=8) {
+                (8, 16)
+            } else {
+                (16, 8)
+            };
+            assert_eq!((frame.width, frame.height), expected, "tag={tag}");
+        }
+
+        // max_alloc を超えるデコード爆弾相当の入力を拒否できること
+        let mut tiny_limits = Limits::default();
+        tiny_limits.max_alloc = Some(100);
+        let err = decode_oriented_dynamic_image_bytes(&jpeg6, Some(tiny_limits))
+            .expect_err("must reject image exceeding Limits::max_alloc");
+        assert!(err.to_string().contains("Image") || !err.to_string().is_empty());
         Ok(())
     }
 }

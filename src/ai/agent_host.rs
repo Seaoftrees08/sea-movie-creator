@@ -1016,6 +1016,7 @@ impl CoordinatorState {
                 },
                 on_usage: Some(&mut on_usage),
                 extra_extensions: self.extra_extensions.clone(),
+                project_dir: None,
             };
             self.tool_registry.execute(tool_name, arguments, &mut ctx)
         };
