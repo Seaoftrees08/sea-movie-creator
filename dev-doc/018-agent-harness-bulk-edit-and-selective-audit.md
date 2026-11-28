@@ -154,6 +154,11 @@
    }
    ```
    - 実際に値が変化したプロパティだけ `EditCommand::SetParameter` を生成し、変更ゼロ時は `DraftSandbox::apply_command` への無駄な空バッチ投入を行わない。
+   - **`post_check` における `AnimatedParameter` の評価基準**（`query_timeline_clips` と共通）:
+     - `Constant { value }` → `min = max = value`
+     - `Easing { start_value, end_value, .. }` → `min = start_value.min(end_value)`、`max = start_value.max(end_value)`
+     - `Keyframes { keyframes, .. }` → 全キーフレーム値の最小・最大（空配列は評価対象外）
+     - `Expression { .. }` → 静的数値集計から除外して別途 `expression_font_size_count`（クエリ詳細行では `font_size: null`, `font_size_is_expression: true`）として計上し、`below_requested_min_font_size_count` や `font_size_lt` 判定は全非数式字幕の `min < threshold`（区間のどこかで基準未満になるか）で厳密判定する。
 
 #### 提供ツール 2: `batch_update_clips`（`ToolSafetyClass::DraftMutation`）
 - 字幕以外のクリップ（画像・動画・音声・字幕の共通パラメータ）を一括変更したい場合用。
@@ -163,6 +168,7 @@
     - `rotation_deg` と `rotation_delta_deg` の同時指定は不可（`Err(...)`）。
     - `rotation_delta_deg` は `Constant` / `Easing` / `Keyframes` の各値へ加算後に `normalize_signed_deg` で `(-180.0, 180.0]` へ正規化し、`Expression` は `"animated_expression_preserved"` として `skipped` に記録する。
     - `layer.locked == true` 上のクリップは `"locked_layer"` として `skipped` に記録し変更しない。
+    - **異種クリップ混在時の非対応パラメータ処理**: `kind: "all"` 等で異なる種別のクリップが混在し、対象外パラメータ（例：`Image` / `Subtitle` に対する音声用 `gain_db` / `pan` / `audio_muted`、`Audio` に対する映像用 `x` / `y` / `scale_*` / `rotation_*` / `opacity` / 色調）が含まれる場合、全体エラーにはせず非対応クリップ（または非対応フィールド適用不可クリップ）を `skipped` へ `{ clip_id, reason: "unsupported_parameter_for_clip_kind" }` として隔離し、対応クリップのみ安全に適用する（適用可能クリップが 0 件の場合は `updated_count: 0` と `skipped` 内訳を返却）。
   - 全対象を 1 つの `EditCommand::Batch` として `DraftSandbox::apply_command` へ適用し、変更件数・スキップ詳細を返却する。
 
 ---
@@ -181,11 +187,11 @@
     - ※ `text_regex` には `bulk_edit.rs` と共通の `RegexBuilder` サイズ／DFA 上限を適用し、不正・上限超過パターンは `Err(...)` を返す。
   - **集計サマリ (`summary`)**:
     - `total_clips_in_timeline`, `matched_count`, `returned_count`
-    - 字幕統計（該当字幕が 1 件以上ある場合）: `min_font_size`, `max_font_size`, `outline_widths_distinct`（代表値一覧）, `outline_zero_count`
+    - 字幕統計（該当字幕が 1 件以上ある場合）: `min_font_size`, `max_font_size`, `outline_widths_distinct`（代表値一覧）, `outline_zero_count`, `expression_font_size_count`（静的集計には上記 `AnimatedParameter` 最小/最大評価ルールを適用）
     - スライド統計: `total_image_slides`
   - **詳細行 (`clips`)**:
     - 共通: `clip_id`, `name`, `kind`, `layer_id`, `layer_name`, `start_frame`, `end_frame`, `slide_index`（画像スライド番号 `1..N`、該当しない場合は `null`）
-    - 字幕時: `text`, `font_family`, `font_size`, `outline_width`, `outline_color_hex`, `text_color_hex`, `y`
+    - 字幕時: `text`, `font_family`, `font_size`（`Expression` 時は `null`＋`font_size_is_expression: true`、動的イージング／キーフレーム時は最小・最大または評価代表値）, `outline_width`, `outline_color_hex`, `text_color_hex`, `y`
     - 画像・動画時: `asset_name`, `asset_width`, `asset_height`, `rotation_deg`, `scale_x`, `scale_y`
 
 ---
@@ -202,11 +208,14 @@
 - `force_refresh: bool`（既定 `false`）— キャッシュを無視して Vision 再実行しキャッシュを上書き更新
 - **フラグ優先順位**: `force_refresh: true` は `use_cache` および `only_changed` より優先され常に全対象を再監査する。また `use_cache: false` 指定時はキャッシュ参照（および `only_changed` によるスキップ）を無効化する。
 
-#### `VisionAuditCache` 設計（[`src/ai/vision_audit.rs`](../src/ai/vision_audit.rs)・[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)）
-- **保持場所**: `CoordinatorState::vision_audit_cache: VisionAuditCache`（常駐セッション単位で保持・最大 256 エントリ FIFO/LRU 上限）。`ToolExecutionContext` に `pub vision_audit_cache: Option<&'a mut VisionAuditCache>` を追加して受け渡す。
+#### `VisionAuditCache` 設計（[`src/ai/vision_audit.rs`](../src/ai/vision_audit.rs)・[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)・[`src/ai/toolbox.rs`](../src/ai/toolbox.rs)）
+- **保持場所と受け渡し経路**:
+  - `CoordinatorState::vision_audit_cache: VisionAuditCache`（常駐セッション単位で保持・最大 256 エントリ FIFO/LRU 上限）として保持する。
+  - `AiProvider` トレイト自体は現在アクティブなモデル名を保持しないため、`ToolExecutionContext` に `pub llm_model_name: Option<&'a str>` および `pub vision_audit_cache: Option<&'a mut VisionAuditCache>` を追加し、`CoordinatorState::execute_registered_tool` から `llm_model_name: Some(self.model_name.as_str())` を明示的に引き渡す。
+  - `CoordinatorMsg::UpdateRuntime` でプロバイダ／モデルが変更された場合は、キャッシュキーの `provider_id + model_name` が変わることで自動的にミスする設計とし（既存エントリは 256 件上限で順次 eviction され、旧モデルへ戻した際の再キャッシュヒットも維持）、明示的な `clear()` 併用も許容する。
 - **キャッシュ対象（生 LLM 判定のみ保持）**: 最終出力 JSON ではなく生 LLM 判定である `ParsedAuditItem` のみをキャッシュする。出力構築時の `recommended_rotation_deg`・`recommended_scale_x_param` / `recommended_scale_y_param`・`companion_backdrop_updates` は毎回最新の `DraftSandbox::draft_document()` から決定論的に再計算するため、他クリップ変更後の出力値陳腐化が起きない。
 - **キャッシュキー（決定論スナップショット）**:
-  - `provider_id: String` + `model_name: String`（セッション途中のプロバイダ／モデル切替による誤再利用を防止）
+  - `provider_id: String` + `model_name: String`（`ctx.llm_model_name.unwrap_or(provider.id())` を用いてセッション途中のモデル切替による誤再利用を防止）
   - `canonical_asset_path: String`
   - `file_len_bytes: u64` + `file_modified_epoch_nanos: Option<u128>`
   - `pre_rotation_deg: Option<i32>`（現在タイムライン上の回転角）
@@ -254,6 +263,10 @@ flowchart TD
      pub max_steps_per_turn: Option<u32>,
      ```
    - `CoordinatorState` は `StartTask` / `ResumeSession` に加えて毎回の `FollowUp` でも最新の `runtime_settings.max_steps_per_turn` を送出し、セッション途中の `UpdateRuntime` 設定変更が次ターンから即時反映されるようにする。
+   - **ホスト側・プラグイン側のステップ定義整合（案 1 採用）**:
+     - `CoordinatorState::check_step_budget()`（[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)）の `turn_step_count` は **LLM 呼び出し（`handle_llm_chat`）単位のみ** をカウントする定義へ見直し、`director.rs` 側の `run_dynamic_tool_loop` 反復上限と 1:1 で一致させる。
+     - これにより、1 反復内で `handle_llm_chat` と複数回の `handle_call_tool` を実行してもホスト側が先に `max_steps_exceeded` で強制終了せず、プラグイン側の最終ステップ（`step + 1 == max_steps` で `ask_user` 除外）による安全収束へ確実に到達できる。
+     - `handle_call_tool` の暴走防止用には別カウンタ `turn_tool_call_count`（上限 `max(effective_steps * 4, 160)` 程度）を設けて安全側の上限も維持する。
    - `director.rs` の `effective_dynamic_tool_steps(configured: Option<u32>) -> u32`:
      - `Some(0)`（「無制限」選択時）→ 安全側サーキットブレーカ付き上限 `40`
      - `Some(n)` → `n.clamp(4, 100)`
@@ -280,10 +293,12 @@ flowchart TD
   - `execute_audit_timeline_slides` は `clip_ids`, `time_range_frames`, `subtitle_query`, `use_cache`, `only_changed`, `force_refresh` を追加受理。
 - `plugins_src/sea-agent-protocol/src/lib.rs`:
   - `HostToAgentMessage::{StartTask, ResumeSession, FollowUp}` に任意フィールド `max_steps_per_turn: Option<u32>` を追加。
-- 登録ツール名（[`src/ai/toolbox.rs`](../src/ai/toolbox.rs)）：
-  - `query_timeline_clips`（`ReadOnly`）
-  - `batch_update_subtitles`（`DraftMutation`）
-  - `batch_update_clips`（`DraftMutation`）
+- `src/ai/toolbox.rs`:
+  - `ToolExecutionContext<'a>` に `pub llm_model_name: Option<&'a str>` および `pub vision_audit_cache: Option<&'a mut VisionAuditCache>` を追加（`CoordinatorState::execute_registered_tool` から渡す）。
+  - 登録ツール名：
+    - `query_timeline_clips`（`ReadOnly`）
+    - `batch_update_subtitles`（`DraftMutation`）
+    - `batch_update_clips`（`DraftMutation`）
 
 ---
 
@@ -324,7 +339,7 @@ flowchart TD
 - **`director.rs` / `agent_host.rs` / `ai_chat_panel.rs` テスト**:
   - 案 A：`Proposal` 確定で送信時 `attached_folders` がクリアされ、エラー時は残ることを検証。
   - 既読フォルダ保護：同フォルダ付き FollowUp で `ingest_folders_and_vision` がスキップされること、明示的再スキャン指示時は再走査することを検証。
-  - `HostToAgentMessage` の `max_steps_per_turn` 後方互換シリアライズおよび連続同一エラー 3 回打ち切りを検証。
+  - `HostToAgentMessage` の `max_steps_per_turn` 後方互換シリアライズ、`CoordinatorState::check_step_budget()` の LLM 呼出単位カウント＋ツール別枠上限、および連続同一エラー 3 回打ち切りを検証。
 
 ### 完了条件（Definition of Done）
 - `scripts/pre-pr.ps1`（`fmt` / `clippy -D warnings` / `doc -D warnings` / `build` / `test`）および `cargo deny check`（`regex` 追加分含む）がすべて警告・エラーゼロで通過すること。
