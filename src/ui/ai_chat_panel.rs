@@ -1735,6 +1735,11 @@ impl AppController {
             runtime_settings: self.ai_chat.runtime_settings.clone(),
             tool_registry: None,
             extra_extensions: Vec::new(),
+            project_dir: self
+                .project_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
         };
         let runner = AgentSessionRunner::start(cfg).map_err(|err| err.to_string())?;
         self.ai_chat.active_agent = Some(runner);
@@ -2057,6 +2062,11 @@ impl AppController {
             runtime_settings: self.ai_chat.runtime_settings.clone(),
             tool_registry: None,
             extra_extensions: Vec::new(),
+            project_dir: self
+                .project_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
         };
         if let Ok(runner) = AgentSessionRunner::start(cfg) {
             self.ai_chat.active_agent = Some(runner);
@@ -2301,6 +2311,10 @@ impl AppController {
                 self.ai_chat.live_activity.on_thought_delta(&text);
                 (false, false)
             }
+            AgentHostEvent::ActivityHint { label } => {
+                self.ai_chat.live_activity.on_activity_hint(&label);
+                (false, false)
+            }
             AgentHostEvent::ToolStarted {
                 call_id,
                 verb,
@@ -2336,37 +2350,9 @@ impl AppController {
                 (false, true)
             }
             AgentHostEvent::UsageReported { usage } => self.handle_agent_usage_reported(&usage),
-            AgentHostEvent::AskUser {
-                request_id,
-                title,
-                message,
-                fields,
-                choices,
-                allow_skip,
-            } => {
-                self.handle_agent_ask_user_event(PendingAgentQuestionSnapshot {
-                    request_id,
-                    title,
-                    message,
-                    fields,
-                    choices,
-                    allow_skip,
-                });
-                (false, true)
-            }
-            AgentHostEvent::ToolApprovalRequired {
-                request_id,
-                tool_name,
-                arguments,
-                description,
-            } => {
-                self.handle_agent_tool_approval_event(
-                    request_id,
-                    &tool_name,
-                    arguments,
-                    description,
-                );
-                (false, false)
+            evt @ AgentHostEvent::AskUser { .. } => self.handle_agent_ask_user_variant(evt),
+            evt @ AgentHostEvent::ToolApprovalRequired { .. } => {
+                self.handle_agent_tool_approval_variant(evt)
             }
             AgentHostEvent::Proposal {
                 summary_markdown,
@@ -2381,6 +2367,42 @@ impl AppController {
             } => self.handle_agent_error_event(&code, &message, recoverable),
             AgentHostEvent::Exited { reason } => self.handle_agent_exited_event(&reason),
         }
+    }
+
+    fn handle_agent_ask_user_variant(&mut self, evt: AgentHostEvent) -> (bool, bool) {
+        if let AgentHostEvent::AskUser {
+            request_id,
+            title,
+            message,
+            fields,
+            choices,
+            allow_skip,
+        } = evt
+        {
+            self.handle_agent_ask_user_event(PendingAgentQuestionSnapshot {
+                request_id,
+                title,
+                message,
+                fields,
+                choices,
+                allow_skip,
+            });
+            return (false, true);
+        }
+        (false, false)
+    }
+
+    fn handle_agent_tool_approval_variant(&mut self, evt: AgentHostEvent) -> (bool, bool) {
+        if let AgentHostEvent::ToolApprovalRequired {
+            request_id,
+            tool_name,
+            arguments,
+            description,
+        } = evt
+        {
+            self.handle_agent_tool_approval_event(request_id, &tool_name, arguments, description);
+        }
+        (false, false)
     }
 
     fn handle_agent_usage_reported(&mut self, usage: &AiTokenUsage) -> (bool, bool) {

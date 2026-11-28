@@ -23,14 +23,16 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::ai::capabilities::{InstalledExtensionSummary, collect_host_capabilities};
-use crate::ai::media_inspector::{AllowedFolderScope, encode_thumbnail_jpeg_base64};
+use crate::ai::media_inspector::{
+    AllowedFolderScope, ThumbnailEncodeOptions, encode_thumbnail_jpeg_base64_with_options,
+};
 use crate::ai::planner::{AiEditPlan, dry_run_validate};
 use crate::ai::provider::{
     AgentRuntimeSettings, AiAgentTurnRequest, AiApprovalMode, AiContentPart, AiError, AiProvider,
     AiProviderKind, AiThinkingLevel, AiTokenUsage, AiToolCall, AiToolDefinition, AiTurnMessage,
 };
 
-const MAX_CHAT_IMAGE_PATHS: usize = 16;
+const MAX_CHAT_IMAGE_PATHS: usize = sea_ai_protocol::MAX_PLUGIN_VISION_IMAGES;
 const MAX_STDERR_LINE_BYTES: usize = 4096;
 use crate::ai::toolbox::{
     AgentToolDescriptor, DraftSandbox, HostToolRegistry, ToolExecutionContext, ToolSafetyClass,
@@ -346,6 +348,11 @@ pub enum AgentHostEvent {
         /// 追記思考テキスト。
         text: String,
     },
+    /// 外部 ACP/CLI プラグイン等からの実行ヒント。
+    ActivityHint {
+        /// アクティビティラベル。
+        label: String,
+    },
     /// ホストツール（または対話確認）実行開始のアクティビティログ。
     ToolStarted {
         /// 呼び出し単位の識別子。
@@ -475,6 +482,8 @@ pub struct AgentSessionStartConfig {
     pub tool_registry: Option<HostToolRegistry>,
     /// 能力スナップショットへ含める追加拡張情報。
     pub extra_extensions: Vec<InstalledExtensionSummary>,
+    /// 開いている `.seaproj` の親ディレクトリ（相対パスアセット解決用）。
+    pub project_dir: Option<PathBuf>,
 }
 
 enum CoordinatorMsg {
@@ -673,6 +682,7 @@ impl AgentSessionRunner {
             folder_scope: rebuild_project_folder_scope(
                 &config.attached_folders,
                 &config.base_document,
+                config.project_dir.as_deref(),
             ),
             attached_folders_raw: config.attached_folders,
             sandbox: DraftSandbox::new(config.base_document),
@@ -684,6 +694,7 @@ impl AgentSessionRunner {
             approval_mode: config.approval_mode,
             runtime_settings: config.runtime_settings,
             extra_extensions: config.extra_extensions,
+            project_dir: config.project_dir,
             last_llm_call_at: None,
             turn_step_count: 0,
             pending_approvals: HashMap::new(),
@@ -891,6 +902,7 @@ struct CoordinatorState {
     approval_mode: AiApprovalMode,
     runtime_settings: AgentRuntimeSettings,
     extra_extensions: Vec<InstalledExtensionSummary>,
+    project_dir: Option<PathBuf>,
     last_llm_call_at: Option<Instant>,
     turn_step_count: u32,
     pending_approvals: HashMap<String, PendingApprovalCall>,
@@ -1016,7 +1028,7 @@ impl CoordinatorState {
                 },
                 on_usage: Some(&mut on_usage),
                 extra_extensions: self.extra_extensions.clone(),
-                project_dir: None,
+                project_dir: self.project_dir.as_deref(),
             };
             self.tool_registry.execute(tool_name, arguments, &mut ctx)
         };
@@ -1129,11 +1141,14 @@ fn run_coordinator_loop(
                 timeline_summary,
             } => handle_follow_up_msg(
                 &mut state,
-                prompt,
-                &attached_folders,
-                attached_clips,
-                base_document,
-                timeline_summary,
+                FollowUpPayload {
+                    prompt,
+                    attached_folders,
+                    attached_clips,
+                    base_document,
+                    timeline_summary,
+                },
+                event_tx,
             ),
             CoordinatorMsg::UserAnswer { request_id, answer } => {
                 handle_user_answer_msg(&mut state, request_id, answer, event_tx);
@@ -1169,10 +1184,9 @@ fn handle_user_answer_msg(
     answer: AgentUserAnswerPayload,
     event_tx: &mpsc::Sender<AgentHostEvent>,
 ) {
-    let ask_title = state
-        .active_ask_targets
-        .remove(&request_id)
-        .unwrap_or_else(|| "ユーザーへの確認".to_owned());
+    let Some(ask_title) = state.active_ask_targets.remove(&request_id) else {
+        return;
+    };
     let summary = if answer.skipped {
         "skipped".to_owned()
     } else {
@@ -1183,71 +1197,80 @@ fn handle_user_answer_msg(
         tool_name: "ask_user".to_owned(),
         verb: "Asking".to_owned(),
         target: ask_title,
-        ok: !answer.skipped,
+        // スキップはキャンセル／おまかせ続行の正常応答でありツール失敗ではない
+        ok: true,
         summary,
         duration_ms: None,
     });
     let _ = state.send_to_child(&HostToAgentMessage::UserAnswer { request_id, answer });
 }
 
-fn collect_project_asset_files(doc: &ProjectDocument) -> Vec<PathBuf> {
+fn collect_project_asset_files(doc: &ProjectDocument, project_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for asset in &doc.assets {
-        if let Some(abs) = asset.path.absolute.as_deref()
-            && !abs.trim().is_empty()
+        if let Some(resolved) =
+            crate::timeline::serialization::resolve_existing_asset_path(&asset.path, project_dir)
         {
-            let p = PathBuf::from(abs);
-            if p.is_file() {
-                files.push(p);
-                continue;
-            }
-        }
-        if let Some(rel) = asset.path.relative.as_deref()
-            && !rel.trim().is_empty()
-        {
-            let p = PathBuf::from(rel);
-            if p.is_file() {
-                files.push(p);
-            }
+            files.push(resolved);
         }
     }
     files
 }
 
-fn rebuild_project_folder_scope(folders: &[PathBuf], doc: &ProjectDocument) -> AllowedFolderScope {
-    let asset_files = collect_project_asset_files(doc);
+fn rebuild_project_folder_scope(
+    folders: &[PathBuf],
+    doc: &ProjectDocument,
+    project_dir: Option<&Path>,
+) -> AllowedFolderScope {
+    let asset_files = collect_project_asset_files(doc, project_dir);
     AllowedFolderScope::from_folders_and_files(folders, asset_files)
+}
+
+struct FollowUpPayload {
+    prompt: String,
+    attached_folders: Vec<PathBuf>,
+    attached_clips: Vec<String>,
+    base_document: ProjectDocument,
+    timeline_summary: String,
 }
 
 fn handle_follow_up_msg(
     state: &mut CoordinatorState,
-    prompt: String,
-    attached_folders: &[PathBuf],
-    attached_clips: Vec<String>,
-    base_document: ProjectDocument,
-    timeline_summary: String,
+    payload: FollowUpPayload,
+    event_tx: &mpsc::Sender<AgentHostEvent>,
 ) {
+    if !state.active_ask_targets.is_empty() || !state.pending_approvals.is_empty() {
+        let _ = event_tx.send(AgentHostEvent::AgentError {
+            code: "pending_interaction".to_owned(),
+            message: "確認カードまたはツール承認の応答待ち中は新しいフォローアップを送信できません"
+                .to_owned(),
+            recoverable: true,
+        });
+        return;
+    }
     state.turn_step_count = 0;
-    state.pending_approvals.clear();
-    state.active_ask_targets.clear();
-    state.sandbox = DraftSandbox::new(base_document);
-    if !attached_folders.is_empty() {
+    state.sandbox = DraftSandbox::new(payload.base_document);
+    if !payload.attached_folders.is_empty() {
         let mut combined = state.attached_folders_raw.clone();
-        combined.extend(attached_folders.iter().cloned());
-        state.attached_folders_raw.clone_from(&combined);
+        combined.extend(payload.attached_folders.iter().cloned());
+        state.attached_folders_raw = dedup_paths(combined);
     }
     // 追加編集時に添付フォルダが空でも、プロジェクト登録済みアセットを読み取れるよう毎回再構築する
-    state.folder_scope =
-        rebuild_project_folder_scope(&state.attached_folders_raw, state.sandbox.base_document());
-    let folder_strings: Vec<String> = attached_folders
+    state.folder_scope = rebuild_project_folder_scope(
+        &state.attached_folders_raw,
+        state.sandbox.base_document(),
+        state.project_dir.as_deref(),
+    );
+    let folder_strings: Vec<String> = payload
+        .attached_folders
         .iter()
         .map(|p| p.display().to_string())
         .collect();
     let _ = state.send_to_child(&HostToAgentMessage::FollowUp {
-        prompt,
+        prompt: payload.prompt,
         attached_folders: folder_strings,
-        attached_clips,
-        timeline_summary,
+        attached_clips: payload.attached_clips,
+        timeline_summary: payload.timeline_summary,
     });
 }
 
@@ -1454,7 +1477,7 @@ fn handle_llm_chat(
     let converted_msgs = match convert_wire_messages_to_turn_messages(
         &payload.messages,
         &state.folder_scope,
-        state.runtime_settings.vision_max_edge_px,
+        &state.runtime_settings,
     ) {
         Ok(m) => m,
         Err(err) => {
@@ -1521,6 +1544,18 @@ pub fn describe_tool_activity(tool_name: &str, arguments: &Value) -> (String, St
                 format!("画像内容の解析 ({count}枚)")
             } else {
                 "画像内容の解析".to_owned()
+            };
+            ("Analyzed".to_owned(), target)
+        }
+        "audit_timeline_slides" => {
+            let count = arguments
+                .get("slide_indices")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let target = if count > 0 {
+                format!("写真・字幕クロス監査 ({count}件)")
+            } else {
+                "写真・字幕クロス監査".to_owned()
             };
             ("Analyzed".to_owned(), target)
         }
@@ -1616,11 +1651,7 @@ fn forward_agent_stream_event(
             }
         }
         crate::ai::provider::AiStreamEvent::ActivityHint(label) => {
-            let _ = tx.send(AgentHostEvent::Status {
-                message: label,
-                step: None,
-                total_steps: None,
-            });
+            let _ = tx.send(AgentHostEvent::ActivityHint { label });
         }
         crate::ai::provider::AiStreamEvent::Completed(_)
         | crate::ai::provider::AiStreamEvent::Failed(_) => {}
@@ -1651,7 +1682,11 @@ fn send_agent_llm_turn_and_reply(
         );
     };
 
-    match state.provider.send_agent_turn(req, &mut on_stream_event) {
+    match state.provider.send_agent_turn_cancellable(
+        req,
+        Some(&state.cancelled),
+        &mut on_stream_event,
+    ) {
         Ok(resp) => {
             let reported_usage = resp.usage.clone().unwrap_or_else(|| {
                 AiTokenUsage::estimate_from_chars(
@@ -1675,9 +1710,11 @@ fn send_agent_llm_turn_and_reply(
             let thinking_blocks = resp
                 .thinking_blocks
                 .into_iter()
+                .filter(crate::ai::provider::AiThinkingBlock::is_valid_anthropic)
                 .map(|b| sea_agent_protocol::AgentThinkingBlock {
                     thinking: b.thinking,
                     signature: b.signature,
+                    redacted_data: b.redacted_data,
                 })
                 .collect();
             let _ = state.send_to_child(&HostToAgentMessage::LlmResponse {
@@ -1689,6 +1726,9 @@ fn send_agent_llm_turn_and_reply(
                 finish_reason: resp.finish_reason,
                 error: None,
             });
+        }
+        Err(AiError::Cancelled) => {
+            send_llm_error(state, request_id, "cancelled by host".to_owned());
         }
         Err(err) => {
             if let AiError::HttpStatus { status, .. } = &err {
@@ -1726,9 +1766,9 @@ fn send_llm_error(state: &mut CoordinatorState, request_id: String, error: Strin
 fn convert_wire_messages_to_turn_messages(
     messages: &[AgentLlmMessage],
     folder_scope: &AllowedFolderScope,
-    max_edge_px: u32,
+    runtime_settings: &AgentRuntimeSettings,
 ) -> Result<Vec<AiTurnMessage>, String> {
-    let clamped_edge = max_edge_px.clamp(128, 1024);
+    let sanitized = runtime_settings.sanitized();
     let mut call_id_to_name: HashMap<String, String> = HashMap::new();
     let mut remaining_images = MAX_CHAT_IMAGE_PATHS;
     let mut out = Vec::with_capacity(messages.len());
@@ -1751,8 +1791,9 @@ fn convert_wire_messages_to_turn_messages(
                         .map(|b| crate::ai::provider::AiThinkingBlock {
                             thinking: b.thinking.clone(),
                             signature: b.signature.clone(),
-                            redacted_data: None,
+                            redacted_data: b.redacted_data.clone(),
                         })
+                        .filter(crate::ai::provider::AiThinkingBlock::is_valid_anthropic)
                         .collect(),
                     tool_calls: msg
                         .tool_calls
@@ -1794,10 +1835,14 @@ fn convert_wire_messages_to_turn_messages(
                 }
                 for img_path in &msg.image_paths {
                     remaining_images = remaining_images.saturating_sub(1);
-                    let thumb = encode_thumbnail_jpeg_base64(
+                    let thumb = encode_thumbnail_jpeg_base64_with_options(
                         folder_scope,
                         Path::new(img_path),
-                        clamped_edge,
+                        ThumbnailEncodeOptions {
+                            max_edge_px: sanitized.vision_max_edge_px,
+                            jpeg_quality: sanitized.vision_jpeg_quality,
+                            extra_rotation_deg: 0,
+                        },
                     )
                     .map_err(|err| format!("thumbnail encoding failed `{img_path}`: {err}"))?;
                     parts.push(AiContentPart::ImageData {
@@ -2120,7 +2165,12 @@ mod tests {
             },
         ];
         let scope = AllowedFolderScope::default();
-        let converted = convert_wire_messages_to_turn_messages(&wire_msgs, &scope, 512)?;
+        let runtime_settings = AgentRuntimeSettings {
+            vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
+        };
+        let converted =
+            convert_wire_messages_to_turn_messages(&wire_msgs, &scope, &runtime_settings)?;
         assert!(matches!(
             &converted[1],
             AiTurnMessage::ToolResult { name, .. } if name == "inspect_media_folder"
@@ -2136,7 +2186,10 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
         }];
-        assert!(convert_wire_messages_to_turn_messages(&too_many_imgs, &scope, 512).is_err());
+        assert!(
+            convert_wire_messages_to_turn_messages(&too_many_imgs, &scope, &runtime_settings)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -2220,6 +2273,13 @@ mod tests {
             ("Asking".to_owned(), "対象選択".to_owned())
         );
         assert_eq!(
+            describe_tool_activity("audit_timeline_slides", &json!({ "slide_indices": [1, 2] })),
+            (
+                "Analyzed".to_owned(),
+                "写真・字幕クロス監査 (2件)".to_owned()
+            )
+        );
+        assert_eq!(
             describe_tool_activity("custom_plugin_tool", &json!({})),
             ("Ran".to_owned(), "custom_plugin_tool".to_owned())
         );
@@ -2247,7 +2307,10 @@ mod tests {
         doc.assets.push(Asset {
             id: AssetId::new("a1")?,
             name: "registered.jpg".to_owned(),
-            path: AssetPath::new(None, Some(registered.to_string_lossy().into_owned())),
+            path: AssetPath::new(
+                Some("registered.jpg".to_owned()),
+                Some(registered.to_string_lossy().into_owned()),
+            ),
             kind: AssetKind::Image {
                 width: 100,
                 height: 100,
@@ -2255,7 +2318,7 @@ mod tests {
             status: AssetStatus::Available,
         });
 
-        let scope = rebuild_project_folder_scope(&[], &doc);
+        let scope = rebuild_project_folder_scope(&[], &doc, Some(&base));
         assert!(scope.validate_path(&registered).is_ok());
         assert!(scope.validate_path(&unregistered).is_err());
         Ok(())

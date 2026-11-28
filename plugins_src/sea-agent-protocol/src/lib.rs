@@ -85,6 +85,9 @@ pub struct AgentThinkingBlock {
     /// プロバイダ発行の署名文字列。
     #[serde(default)]
     pub signature: String,
+    /// Anthropic `redacted_thinking` ブロックの生データ（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_data: Option<String>,
 }
 
 /// `llm_chat` / `llm_response` で扱うツール呼び出し記述。
@@ -582,6 +585,7 @@ mod tests {
             thinking_blocks: vec![AgentThinkingBlock {
                 thinking: "step 1".to_owned(),
                 signature: "sig_abc".to_owned(),
+                redacted_data: Some("redacted_payload".to_owned()),
             }],
             tool_calls: vec![AgentLlmToolCall {
                 id: "call_1".to_owned(),

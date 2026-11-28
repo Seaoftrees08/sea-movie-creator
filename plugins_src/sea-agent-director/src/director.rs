@@ -296,7 +296,7 @@ fn run_folder_story_workflow(
 
     // ステップ 3: ユーザー希望を統合したヒントを使って Vision 解析バッチを実行
     let vision_hint = build_vision_theme_hint(goal, session.memory.user_preferences.as_ref());
-    run_vision_analysis_batches(session, transport, &vision_hint)?;
+    let vision_warning = run_vision_analysis_batches(session, transport, &vision_hint, true)?;
 
     // ステップ 4: MovieBlueprint 生成＋最大 3 回自律修正＋Proposal 送出
     transport.status("4/4 タイムライン構成案を設計・検証中...", Some(4), Some(4));
@@ -308,6 +308,7 @@ fn run_folder_story_workflow(
         &blueprint_val,
         &compile_summary,
         model_summary.as_deref(),
+        vision_warning.as_deref(),
         &session.memory,
     );
     let memory_patch = serde_json::to_value(&session.memory).unwrap_or(Value::Null);
@@ -334,7 +335,8 @@ fn ingest_folders_and_vision(
         return Ok(());
     }
     let vision_hint = build_vision_theme_hint(goal_hint, session.memory.user_preferences.as_ref());
-    run_vision_analysis_batches(session, transport, &vision_hint)
+    let _ = run_vision_analysis_batches(session, transport, &vision_hint, false)?;
+    Ok(())
 }
 
 fn scan_attached_folders(
@@ -391,7 +393,9 @@ pub fn build_vision_theme_hint(goal: &str, user_preferences: Option<&Value>) -> 
     if !trimmed_goal.is_empty() {
         parts.push(trimmed_goal.to_owned());
     }
-    if let Some(pref) = user_preferences {
+    if let Some(pref) = user_preferences
+        && pref.get("skipped").and_then(Value::as_bool) != Some(true)
+    {
         if let Some(title) = pref
             .get("field_values")
             .and_then(|fv| fv.get("title"))
@@ -426,7 +430,8 @@ fn run_vision_analysis_batches(
     session: &mut DirectorSession,
     transport: &mut AgentTransport<'_>,
     goal_hint: &str,
-) -> Result<(), RpcError> {
+    is_initial_flow: bool,
+) -> Result<Option<String>, RpcError> {
     // 未 Vision 解析画像のみをバッチ解析してセッション記憶へ蓄積
     let pending_indices: Vec<usize> = session
         .memory
@@ -437,6 +442,12 @@ fn run_vision_analysis_batches(
         .map(|(idx, _)| idx)
         .collect();
 
+    let (step_num, step_total) = if is_initial_flow {
+        (Some(3), Some(4))
+    } else {
+        (None, None)
+    };
+    let mut vision_warning: Option<String> = None;
     let total_pending = pending_indices.len();
     // ホスト側の inspect_images_vision 上限（100 枚）単位で委譲し、コンタクトシート／バッチ分割はホスト側設定へ任せる
     let chunk_size = 100_usize;
@@ -444,8 +455,8 @@ fn run_vision_analysis_batches(
         let done_count = (chunk_idx * chunk_size).min(total_pending);
         transport.status(
             format!("3/4 写真を解析して情景・字幕案を作成中 ({done_count}/{total_pending})..."),
-            Some(3),
-            Some(4),
+            step_num,
+            step_total,
         );
         let paths: Vec<String> = idx_chunk
             .iter()
@@ -463,7 +474,9 @@ fn run_vision_analysis_batches(
                 if let Some(warning) = res.get("warning").and_then(Value::as_str)
                     && !warning.trim().is_empty()
                 {
-                    transport.status(warning, Some(2), Some(4));
+                    let owned = warning.trim().to_owned();
+                    transport.status(&owned, step_num, step_total);
+                    vision_warning = Some(owned);
                 }
                 apply_vision_results_to_memory(
                     &mut session.memory.analyzed_images,
@@ -487,6 +500,9 @@ fn run_vision_analysis_batches(
             }
             Err(RpcError::Remote(msg)) if is_vision_unsupported_error(&msg) => {
                 // Vision 非対応エラー時は残りの画像をすべて EXIF/フォルダ/ファイル名メタデータで補完して続行
+                let warn = "現在の AI モデル／プラグインは画像入力に非対応のため、ファイル名・EXIF に基づく仮字幕で続行します（設定で Vision 対応モデルへ切替後に再解析できます）。".to_owned();
+                transport.status(&warn, step_num, step_total);
+                vision_warning = Some(warn);
                 populate_exif_fallback_for_indices(
                     &mut session.memory.analyzed_images,
                     &pending_indices[done_count..],
@@ -496,12 +512,13 @@ fn run_vision_analysis_batches(
             Err(other) => return Err(other),
         }
     }
-    Ok(())
+    Ok(vision_warning)
 }
 
 fn is_vision_unsupported_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     [
+        "vision_unsupported",
         "does not support vision",
         "vision not supported",
         "vision is not supported",
@@ -538,7 +555,8 @@ fn populate_exif_fallback_for_indices(images: &mut [AnalyzedImageMeta], indices:
         slot.suggested_subtitle = format!("大切なひととき ({stem}{date_suffix})");
         "warm".clone_into(&mut slot.mood);
         "zoom_in".clone_into(&mut slot.recommended_motion);
-        slot.vision_analyzed = true;
+        // フォールバック仮字幕は Vision 解析完了扱いとせず、プロバイダ切替後の再解析を可能にする
+        slot.vision_analyzed = false;
     }
 }
 
@@ -667,8 +685,12 @@ fn apply_vision_results_to_memory(
     tool_res: &Value,
 ) {
     let is_partial = tool_res.get("partial").and_then(Value::as_bool) == Some(true);
+    let used_vision = tool_res
+        .get("used_vision")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let Some(arr) = tool_res.get("analyses").and_then(Value::as_array) else {
-        if !is_partial {
+        if !is_partial && used_vision {
             for &idx in target_indices {
                 if let Some(slot) = images.get_mut(idx) {
                     slot.vision_analyzed = true;
@@ -701,7 +723,9 @@ fn apply_vision_results_to_memory(
             if let Some(s) = item.get("recommended_motion").and_then(Value::as_str) {
                 s.clone_into(&mut slot.recommended_motion);
             }
-            slot.vision_analyzed = true;
+            if used_vision {
+                slot.vision_analyzed = true;
+            }
         }
     }
 }
@@ -1126,6 +1150,7 @@ fn format_blueprint_proposal_markdown(
     blueprint: &Value,
     compile_res: &Value,
     model_notes: Option<&str>,
+    vision_warning: Option<&str>,
     memory: &DirectorMemory,
 ) -> String {
     let summary = compile_res.get("summary").unwrap_or(&Value::Null);
@@ -1158,13 +1183,22 @@ fn format_blueprint_proposal_markdown(
         .and_then(Value::as_str)
         .unwrap_or("ムービー構成案");
 
-    let mut md = format!(
-        "### {title}\n\
-         - **総尺**: {secs:.2} 秒（{frames} フレーム）\n\
-         - **写真スライド**: {slides} 枚（A/B クロスフェード＋縦長背面額縁 {backdrops} 枚）\n\
-         - **字幕・タイトル**: {subtitles} 件 / **BGM セグメント**: {bgm_segments} 件\n\
-         - **解析キャッシュ済み画像**: {} 枚",
-        memory.analyzed_images.len()
+    let mut md = String::new();
+    if let Some(warn) = vision_warning.map(str::trim).filter(|s| !s.is_empty()) {
+        md.push_str("> ⚠ ");
+        md.push_str(warn);
+        md.push_str("\n\n");
+    }
+    let _ = std::fmt::Write::write_fmt(
+        &mut md,
+        format_args!(
+            "### {title}\n\
+             - **総尺**: {secs:.2} 秒（{frames} フレーム）\n\
+             - **写真スライド**: {slides} 枚（A/B クロスフェード＋縦長背面額縁 {backdrops} 枚）\n\
+             - **字幕・タイトル**: {subtitles} 件 / **BGM セグメント**: {bgm_segments} 件\n\
+             - **解析キャッシュ済み画像**: {} 枚",
+            memory.analyzed_images.len()
+        ),
     );
     if let Some(notes) = model_notes.map(str::trim).filter(|s| !s.is_empty()) {
         md.push_str("\n\n");
@@ -1343,12 +1377,18 @@ fn run_dynamic_tool_loop(
         messages: build_initial_dynamic_messages(session, prompt, attached_clips),
         self_repair_attempted: false,
         user_declined_or_cancelled_edit: false,
+        blocked_by_vision_unsupported: false,
     };
     let mut final_text = String::new();
     let mut completed_by_model = false;
 
     for step in 0..MAX_DYNAMIC_TOOL_STEPS {
-        let tools_for_llm = build_dynamic_tools_with_ask_user(&state.tools_snapshot);
+        // 最終ステップで ask_user を許すと回答を受領しても次の LLM ターンが回らないため除外する
+        let tools_for_llm = if step + 1 < MAX_DYNAMIC_TOOL_STEPS {
+            build_dynamic_tools_with_ask_user(&state.tools_snapshot)
+        } else {
+            state.tools_snapshot.clone()
+        };
         let reply: AgentLlmReply = match transport.llm_chat(
             Some(&system_prompt),
             &state.messages,
@@ -1372,7 +1412,7 @@ fn run_dynamic_tool_loop(
         } = reply;
 
         if tool_calls.is_empty() {
-            if try_queue_self_repair(transport, prompt, &text, step, &mut state)? {
+            if try_queue_self_repair(transport, prompt, &text, thinking_blocks, step, &mut state)? {
                 continue;
             }
             final_text = text;
@@ -1424,6 +1464,7 @@ fn run_dynamic_tool_loop(
 
     // DraftSandbox に変更が蓄積されているか検証し Proposal として送出
     let expect_timeline_edit = !state.user_declined_or_cancelled_edit
+        && !state.blocked_by_vision_unsupported
         && (state.self_repair_attempted || has_edit_intent(prompt));
     finalize_dynamic_proposal(
         session,
@@ -1440,10 +1481,11 @@ fn try_queue_self_repair(
     transport: &mut AgentTransport<'_>,
     prompt: &str,
     text: &str,
+    thinking_blocks: Vec<sea_agent_protocol::AgentThinkingBlock>,
     step: u32,
     state: &mut DynamicToolLoopState,
 ) -> Result<bool, RpcError> {
-    if state.user_declined_or_cancelled_edit {
+    if state.user_declined_or_cancelled_edit || state.blocked_by_vision_unsupported {
         return Ok(false);
     }
     let has_remaining_steps = step + 1 < MAX_DYNAMIC_TOOL_STEPS;
@@ -1468,7 +1510,7 @@ fn try_queue_self_repair(
         role: "assistant".to_owned(),
         text: text.to_owned(),
         image_paths: Vec::new(),
-        thinking_blocks: Vec::new(),
+        thinking_blocks,
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1493,6 +1535,7 @@ struct DynamicToolLoopState {
     messages: Vec<AgentLlmMessage>,
     self_repair_attempted: bool,
     user_declined_or_cancelled_edit: bool,
+    blocked_by_vision_unsupported: bool,
 }
 
 fn push_skipped_tool_result(messages: &mut Vec<AgentLlmMessage>, tool_call_id: String) {
@@ -1632,15 +1675,31 @@ pub fn parse_ask_user_tool_args(
 /// `ask_user` 回答がユーザーによる編集中止・見送り・変更不要を示しているか判定する。
 #[must_use]
 pub fn is_user_declined_or_cancelled_answer(answer: &AgentUserAnswerPayload) -> bool {
-    if answer.skipped {
-        return true;
-    }
+    let cancel_keywords = [
+        "cancel",
+        "abort",
+        "decline",
+        "no_change",
+        "stop",
+        "中止",
+        "キャンセル",
+        "やめる",
+        "変更しない",
+        "変更不要",
+    ];
     if let Some(choice_id) = answer.choice_id.as_deref() {
         let lower = choice_id.trim().to_ascii_lowercase();
         if matches!(
             lower.as_str(),
             "cancel" | "skip" | "no_change" | "abort" | "none" | "decline" | "stop"
-        ) {
+        ) || cancel_keywords.iter().any(|kw| lower.contains(kw))
+        {
+            return true;
+        }
+    }
+    if let Some(free) = answer.free_text.as_deref() {
+        let lower = free.trim().to_ascii_lowercase();
+        if cancel_keywords.iter().any(|kw| lower.contains(kw)) {
             return true;
         }
     }
@@ -1660,9 +1719,8 @@ fn execute_builtin_ask_user_tool(
         Some(MAX_DYNAMIC_TOOL_STEPS),
     );
     let answer = transport.ask_user(title, message, fields, choices, allow_skip)?;
-    if is_user_declined_or_cancelled_answer(&answer) {
-        state.user_declined_or_cancelled_edit = true;
-    }
+    // 最新回答に基づいて編集中止フラグを更新する（再確認で承諾された場合にも解除できるよう上書き）
+    state.user_declined_or_cancelled_edit = is_user_declined_or_cancelled_answer(&answer);
     let reply_json = json!({
         "skipped": answer.skipped,
         "choice_id": answer.choice_id,
@@ -1715,12 +1773,23 @@ fn execute_single_dynamic_tool_call(
 
     let raw_tool_reply = match transport.call_tool(&name, arguments) {
         Ok(val) => {
+            if name == "audit_timeline_slides"
+                && val.get("partial").and_then(Value::as_bool) == Some(true)
+                && val.get("error_code").and_then(Value::as_str) == Some("vision_unsupported")
+            {
+                state.blocked_by_vision_unsupported = true;
+            }
             if let Some(bp) = normalized_bp {
                 state.updated_blueprint = Some(bp);
             }
             serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_owned())
         }
-        Err(RpcError::Remote(err)) => json!({ "error": err }).to_string(),
+        Err(RpcError::Remote(err)) => {
+            if name == "audit_timeline_slides" && is_vision_unsupported_error(&err) {
+                state.blocked_by_vision_unsupported = true;
+            }
+            json!({ "error": err }).to_string()
+        }
         Err(other) => return Err(other),
     };
     if transport.available_tools != state.tools_snapshot {
@@ -1953,7 +2022,8 @@ fn build_followup_system_prompt(session: &DirectorSession) -> String {
          When asked to verify/fix mismatches between photos and subtitles OR to fix sideways/rotated photos, \
          you MUST call `audit_timeline_slides` FIRST to inspect the actual images and all overlapping subtitles (never guess from filenames alone).\n\
          When `audit_timeline_slides` returns `recommended_rotation_deg` and `recommended_scale_x_param` / `recommended_scale_y_param`, \
-         apply `RotationDeg` together with `ScaleX` and `ScaleY` `SetParameter` updates in the same `EditCommand::Batch`.\n\
+         apply `RotationDeg` together with `ScaleX` and `ScaleY` `SetParameter` updates in the same `EditCommand::Batch` \
+         (when `rotation_is_animated == true` or `orientation_audit_skipped == \"animated_rotation\"`, do NOT overwrite animated `RotationDeg` with a constant).\n\
          When you need exact JSON parameter shapes for `SetParameter` (such as subtitle outline color/width or clip rotation), \
          call `get_capabilities` with `{{\"include_schemas\": true}}` to inspect the full `EditCommand` JSON Schema.\n\
          Keep exact target duration constraints when adjusting individual slides/endings.\n\

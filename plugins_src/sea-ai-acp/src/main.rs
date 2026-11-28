@@ -23,12 +23,41 @@ use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
 #[cfg(test)]
 use sea_ai_protocol::extract_acp_update_message_delta;
 use sea_ai_protocol::{
-    AcpImageInput, AcpSessionUpdateEvent, HistoryMessage, MAX_HISTORY_PROMPT_BYTES,
-    acp_supports_image_prompt, build_acp_prompt_content_blocks, extract_acp_update_event,
-    format_conversation_history_section, is_empty_json_value, validate_acp_images,
+    AcpImageInput, AcpSessionUpdateEvent, ChildKillGuard, HistoryMessage, MAX_AI_NDJSON_LINE_BYTES,
+    MAX_HISTORY_PROMPT_BYTES, acp_supports_image_prompt, build_acp_prompt_content_blocks,
+    build_acp_server_request_deny_response, extract_acp_update_event,
+    format_conversation_history_section, is_empty_json_value, read_ndjson_line_limited,
+    spawn_stderr_drain, truncate_utf8_chars, validate_acp_images,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+const STDERR_DRAIN_CAP_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct PluginRunError {
+    code: &'static str,
+    message: String,
+}
+
+impl PluginRunError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn exec(message: impl Into<String>) -> Self {
+        Self::new("execution_failed", message)
+    }
+}
+
+impl From<String> for PluginRunError {
+    fn from(message: String) -> Self {
+        Self::exec(message)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct RequestEnvelope {
@@ -156,7 +185,7 @@ fn build_acp_prompt_text(params: &CallParams) -> String {
     let mut sections = vec![params.system_prompt.clone()];
     if !is_empty_json_value(&params.command_schema_json) {
         sections.push(format!(
-            "# EditCommand JSON Schema\n{}",
+            "# Required Output JSON Schema\n{}",
             params.command_schema_json
         ));
     }
@@ -238,30 +267,43 @@ fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), Str
         .map_err(|err| format!("ACP stdin 書き込み失敗: {err}"))
 }
 
+fn handle_server_request(stdin: &mut ChildStdin, msg: &Value) -> Result<bool, String> {
+    let Some(reply) = build_acp_server_request_deny_response(msg) else {
+        return Ok(false);
+    };
+    write_jsonrpc_line(stdin, &reply)?;
+    Ok(true)
+}
+
 fn read_until_response<R: BufRead>(
     reader: &mut R,
+    stdin: &mut ChildStdin,
     expected_id: u64,
     streamed: &mut String,
 ) -> Result<Value, String> {
-    let mut line = String::new();
     let mut phase = AcpStreamPhase::Waiting;
     loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|err| format!("ACP stdout 読取エラー: {err}"))?;
-        if read == 0 {
+        let Some(line) = read_ndjson_line_limited(reader, MAX_AI_NDJSON_LINE_BYTES)
+            .map_err(|err| format!("ACP stdout 読取エラー: {err}"))?
+        else {
             return Err(format!(
                 "ACP エージェントが id={expected_id} 応答前に終了しました"
             ));
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let msg: Value = serde_json::from_str(trimmed)
-            .map_err(|err| format!("ACP JSON 解析エラー: {err} (line: {trimmed})"))?;
+        let msg: Value = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "ACP JSON 解析エラー: {err} (line: {})",
+                truncate_utf8_chars(trimmed, 200)
+            )
+        })?;
 
+        if handle_server_request(stdin, &msg)? {
+            continue;
+        }
         if process_acp_update_msg(&msg, &mut phase, streamed, &mut |ev| emit_event(&ev)) {
             continue;
         }
@@ -357,12 +399,15 @@ fn run_list_models(params: &CallParams) {
     }));
 }
 
-fn ensure_acp_vision_supported(init_resp: &Value, images: &[AcpImageInput]) -> Result<(), String> {
+fn ensure_acp_vision_supported(
+    init_resp: &Value,
+    images: &[AcpImageInput],
+) -> Result<(), PluginRunError> {
     if !images.is_empty() && acp_supports_image_prompt(init_resp) == Some(false) {
-        return Err(
-            "vision_unsupported: 接続先の ACP エージェントは画像入力 (promptCapabilities.image) に非対応です"
-                .to_owned(),
-        );
+        return Err(PluginRunError::new(
+            "vision_unsupported",
+            "接続先の ACP エージェントは画像入力 (promptCapabilities.image) に非対応です",
+        ));
     }
     Ok(())
 }
@@ -381,52 +426,19 @@ fn build_acp_prompt_request(id: u64, session_id: &str, params: &CallParams) -> V
     })
 }
 
-fn run_acp_session(params: &CallParams) -> Result<(), String> {
-    if !params.images.is_empty() {
-        validate_acp_images(&params.images)?;
-    }
-    let (agent_bin, agent_args, profile) = resolve_agent_command(params).map_err(|msg| {
-        emit_event(&json!({
-            "event": "error",
-            "code": "missing_external_cli",
-            "message": msg,
-        }));
-        msg
-    })?;
-
-    emit_event(&json!({
-        "event": "status",
-        "message": format!("ACP エージェント ({}) に接続中...", agent_bin.display()),
-    }));
-
-    let mut cmd = Command::new(&agent_bin);
-    apply_background_process_flags(&mut cmd);
-    let mut child = cmd
-        .args(&agent_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("ACP エージェント起動失敗: {err}"))?;
-
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ACP stdin パイプ取得失敗".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ACP stdout パイプ取得失敗".to_owned())?;
-    let mut reader = BufReader::new(stdout);
-    let mut streamed = String::new();
-
-    write_jsonrpc_line(&mut child_stdin, &build_initialize_request(1))?;
-    let init_resp = read_until_response(&mut reader, 1, &mut streamed)?;
+fn execute_acp_session_io(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    child_stdin: &mut ChildStdin,
+    params: &CallParams,
+    streamed: &mut String,
+) -> Result<Value, PluginRunError> {
+    write_jsonrpc_line(child_stdin, &build_initialize_request(1))?;
+    let init_resp = read_until_response(reader, child_stdin, 1, streamed)?;
     ensure_acp_vision_supported(&init_resp, &params.images)?;
 
     let cwd = env::current_dir().map_or_else(|_| ".".to_owned(), |p| p.display().to_string());
     write_jsonrpc_line(
-        &mut child_stdin,
+        child_stdin,
         &json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -434,7 +446,7 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
             "params": { "cwd": cwd, "mcpServers": [] }
         }),
     )?;
-    let session_resp = read_until_response(&mut reader, 2, &mut streamed)?;
+    let session_resp = read_until_response(reader, child_stdin, 2, streamed)?;
     let session_id = session_resp["result"]["sessionId"]
         .as_str()
         .unwrap_or("default-session")
@@ -445,21 +457,80 @@ fn run_acp_session(params: &CallParams) -> Result<(), String> {
         "message": "プロンプトを送信して応答待機中...",
     }));
     write_jsonrpc_line(
-        &mut child_stdin,
+        child_stdin,
         &build_acp_prompt_request(3, &session_id, params),
     )?;
+    read_until_response(reader, child_stdin, 3, streamed).map_err(PluginRunError::from)
+}
+
+fn run_acp_session(params: &CallParams) -> Result<(), PluginRunError> {
+    if !params.images.is_empty() {
+        validate_acp_images(&params.images)?;
+    }
+    let (agent_bin, agent_args, profile) = resolve_agent_command(params)
+        .map_err(|msg| PluginRunError::new("missing_external_cli", msg))?;
+
+    emit_event(&json!({
+        "event": "status",
+        "message": format!("ACP エージェント ({}) に接続中...", agent_bin.display()),
+    }));
+
+    let mut cmd = Command::new(&agent_bin);
+    apply_background_process_flags(&mut cmd);
+    let child = cmd
+        .args(&agent_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| PluginRunError::exec(format!("ACP エージェント起動失敗: {err}")))?;
+    let mut guard = ChildKillGuard::new(child);
+    let stderr_handle = guard
+        .take_stderr()
+        .map(|stderr| spawn_stderr_drain(stderr, STDERR_DRAIN_CAP_BYTES));
+
+    let mut child_stdin = guard
+        .take_stdin()
+        .ok_or_else(|| PluginRunError::exec("ACP stdin パイプ取得失敗"))?;
+    let stdout = guard
+        .take_stdout()
+        .ok_or_else(|| PluginRunError::exec("ACP stdout パイプ取得失敗"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut streamed = String::new();
+
+    let conv_res = execute_acp_session_io(&mut reader, &mut child_stdin, params, &mut streamed);
     drop(child_stdin);
 
-    let prompt_resp = read_until_response(&mut reader, 3, &mut streamed)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("ACP プロセス終了待機エラー: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!(
-            "ACP エージェントが {} で終了しました: {stderr}",
-            output.status
-        ));
+    if conv_res.is_err() {
+        guard.kill_and_wait();
+    }
+    let status =
+        if conv_res.is_ok() {
+            Some(guard.wait_status().map_err(|err| {
+                PluginRunError::exec(format!("ACP プロセス終了待機エラー: {err}"))
+            })?)
+        } else {
+            None
+        };
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    let prompt_resp = match conv_res {
+        Ok(resp) => resp,
+        Err(mut err) => {
+            if !stderr.is_empty() {
+                err.message = format!("{} ({stderr})", err.message);
+            }
+            return Err(err);
+        }
+    };
+    if let Some(st) = status
+        && !st.success()
+    {
+        return Err(PluginRunError::exec(format!(
+            "ACP エージェントが {st} で終了しました: {stderr}"
+        )));
     }
 
     let raw_text = if streamed.is_empty() {
@@ -505,12 +576,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if let Err(err) = run_acp_session(&req.params) {
-        let code = if err.starts_with("vision_unsupported:") {
-            "vision_unsupported"
-        } else {
-            "execution_failed"
-        };
-        emit_event(&json!({ "event": "error", "code": code, "message": err }));
+        emit_event(&json!({ "event": "error", "code": err.code, "message": err.message }));
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -754,8 +820,10 @@ mod tests {
         let unsupported = json!({
             "result": { "agentCapabilities": { "promptCapabilities": { "image": false } } }
         });
-        let err = ensure_acp_vision_supported(&unsupported, &params.images)
-            .expect_err("must reject when promptCapabilities.image is false");
-        assert!(err.starts_with("vision_unsupported:"));
+        let err = match ensure_acp_vision_supported(&unsupported, &params.images) {
+            Ok(()) => return,
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "vision_unsupported");
     }
 }

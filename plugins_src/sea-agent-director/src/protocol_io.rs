@@ -243,7 +243,15 @@ impl<'a> AgentTransport<'a> {
                         error.unwrap_or_else(|| "llm_chat returned failure".to_owned()),
                     ));
                 }
-                Some(_) => {}
+                Some(other) => {
+                    let _ = io::Write::write_all(
+                        &mut io::stderr(),
+                        format!(
+                            "[sea-agent-director] ignored unexpected message during llm wait: {other:?}\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
             }
         }
     }
@@ -285,7 +293,15 @@ impl<'a> AgentTransport<'a> {
                 {
                     return Ok(answer);
                 }
-                Some(_) => {}
+                Some(other) => {
+                    let _ = io::Write::write_all(
+                        &mut io::stderr(),
+                        format!(
+                            "[sea-agent-director] ignored unexpected message during ask_user wait: {other:?}\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
             }
         }
     }
