@@ -439,6 +439,13 @@ impl AiProvider for OpenAiCompatProvider {
                         parse_openai_sync_json_and_thoughts(val, &mut captured_usage, evt_cb)?;
                     let mut p = parse_fallback_agent_response(&text, &self.config.model);
                     p.usage = captured_usage;
+                    if p.tool_calls.is_empty()
+                        && let Some(reason) = val["choices"][0]["finish_reason"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                    {
+                        p.finish_reason = Some(reason.to_owned());
+                    }
                     p
                 };
                 if let Some(txt) = parsed.text.as_ref().filter(|s| !s.is_empty()) {
@@ -577,6 +584,7 @@ fn parse_openai_agent_response_with_events(
                     .as_str()
                     .map_or_else(|| format!("oai_call_{idx}"), ToOwned::to_owned);
                 let args = match &call["function"]["arguments"] {
+                    Value::String(raw) if raw.trim().is_empty() => json!({}),
                     Value::String(raw) => serde_json::from_str::<Value>(raw).map_err(|err| {
                         AiError::ParseFailed(format!(
                             "OpenAI tool_calls arguments JSON parse failed for `{name}`: {err}"
@@ -628,11 +636,8 @@ fn merge_openai_usage(acc: &mut Option<AiTokenUsage>, incoming: &AiTokenUsage) {
     if incoming.output_tokens > 0 {
         target.output_tokens = incoming.output_tokens;
     }
-    target.total_tokens = if incoming.total_tokens > 0 {
-        incoming.total_tokens
-    } else {
-        target.input_tokens.saturating_add(target.output_tokens)
-    };
+    let summed = target.input_tokens.saturating_add(target.output_tokens);
+    target.total_tokens = incoming.total_tokens.max(summed);
     if incoming.cost_usd.is_some() {
         target.cost_usd = incoming.cost_usd;
     }
@@ -700,21 +705,9 @@ fn process_openai_agent_sse_chunk(
     }
     if let Some(arr) = delta["tool_calls"].as_array() {
         for tc in arr {
-            let idx = if let Some(explicit) =
-                tc["index"].as_u64().and_then(|n| usize::try_from(n).ok())
-            {
-                explicit
-            } else {
-                let has_identity = tc["id"].as_str().is_some_and(|s| !s.is_empty())
-                    || tc["function"]["name"]
-                        .as_str()
-                        .is_some_and(|s| !s.is_empty());
-                if has_identity {
-                    acc.tool_calls.keys().next_back().map_or(0, |last| last + 1)
-                } else {
-                    acc.tool_calls.keys().next_back().copied().unwrap_or(0)
-                }
-            };
+            let incoming_id = tc["id"].as_str().filter(|s| !s.is_empty());
+            let incoming_name = tc["function"]["name"].as_str().filter(|s| !s.is_empty());
+            let idx = resolve_openai_stream_tool_index(acc, tc, incoming_id, incoming_name)?;
             if !acc.tool_calls.contains_key(&idx)
                 && acc.tool_calls.len() >= MAX_OPENAI_STREAM_TOOL_CALLS
             {
@@ -723,10 +716,14 @@ fn process_openai_agent_sse_chunk(
                 )));
             }
             let entry = acc.tool_calls.entry(idx).or_default();
-            if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
+            let same_id_repeat =
+                incoming_id.is_some_and(|id| !entry.id.is_empty() && entry.id == id);
+            if let Some(id) = incoming_id {
                 id.clone_into(&mut entry.id);
             }
-            if let Some(name) = tc["function"]["name"].as_str() {
+            if let Some(name) = incoming_name
+                && !(same_id_repeat && entry.name == name)
+            {
                 entry.name.push_str(name);
             }
             match &tc["function"]["arguments"] {
@@ -737,6 +734,34 @@ fn process_openai_agent_sse_chunk(
         }
     }
     Ok(())
+}
+
+fn resolve_openai_stream_tool_index(
+    acc: &OpenAiAgentStreamAcc,
+    tc: &Value,
+    incoming_id: Option<&str>,
+    incoming_name: Option<&str>,
+) -> Result<usize, AiError> {
+    if let Some(explicit) = tc["index"].as_u64().and_then(|n| usize::try_from(n).ok()) {
+        return Ok(explicit);
+    }
+    if let Some(existing_idx) = incoming_id.and_then(|id| {
+        acc.tool_calls
+            .iter()
+            .rev()
+            .find_map(|(&k, e)| (e.id == id).then_some(k))
+    }) {
+        return Ok(existing_idx);
+    }
+    if incoming_id.is_some() || incoming_name.is_some() {
+        return match acc.tool_calls.keys().next_back() {
+            Some(&last) => last.checked_add(1).ok_or_else(|| {
+                AiError::ParseFailed("OpenAI SSE tool_calls index overflow".to_owned())
+            }),
+            None => Ok(0),
+        };
+    }
+    Ok(acc.tool_calls.keys().next_back().copied().unwrap_or(0))
 }
 
 fn finalize_openai_agent_stream(
@@ -1244,6 +1269,66 @@ mod tests {
         )?;
         assert_eq!(thoughts, vec!["sync推論"]);
         assert_eq!(parsed.text.as_deref(), Some("完了"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_empty_args_usage_merge_and_repeated_id_no_index_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 空引数 `"arguments": ""` の sync tool_calls、usage マージ、index 欠損 + 同一 id 再送を正しく処理すること
+        let empty_arg_sync = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": { "name": "get_timeline_summary", "arguments": "" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let empty_parsed =
+            parse_openai_agent_response_with_events(&empty_arg_sync, "gpt-4o", None)?;
+        assert_eq!(empty_parsed.tool_calls[0].arguments, json!({}));
+
+        let mut usage_acc = None;
+        merge_openai_usage(
+            &mut usage_acc,
+            &AiTokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                total_tokens: 100,
+                ..AiTokenUsage::default()
+            },
+        );
+        merge_openai_usage(
+            &mut usage_acc,
+            &AiTokenUsage {
+                input_tokens: 0,
+                output_tokens: 40,
+                total_tokens: 40,
+                ..AiTokenUsage::default()
+            },
+        );
+        assert_eq!(usage_acc.as_ref().map(|u| u.total_tokens), Some(140));
+
+        let mut same_id_acc = OpenAiAgentStreamAcc::default();
+        process_openai_agent_sse_chunk(
+            &mut same_id_acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"rep_1","function":{"name":"noop","arguments":"{\"x\":"}}]}}]}"#,
+            &mut |_| {},
+        )?;
+        process_openai_agent_sse_chunk(
+            &mut same_id_acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"rep_1","function":{"name":"noop","arguments":"1}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut |_| {},
+        )?;
+        let same_id_merged = finalize_openai_agent_stream(same_id_acc, true, true, "gpt-4o")?;
+        assert_eq!(same_id_merged.tool_calls.len(), 1);
+        assert_eq!(same_id_merged.tool_calls[0].name, "noop");
+        assert_eq!(same_id_merged.tool_calls[0].arguments["x"], json!(1));
         Ok(())
     }
 

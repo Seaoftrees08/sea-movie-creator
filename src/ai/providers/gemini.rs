@@ -296,7 +296,7 @@ impl AiProvider for GeminiProvider {
                 Ok(false)
             },
             |(collected, finish_reason, sse_u, sync_u, evt_cb)| {
-                if finish_reason.is_none() && collected.is_empty() {
+                if finish_reason.is_none() {
                     return Err(AiError::ParseFailed(
                         "Gemini SSE stream terminated prematurely without finishReason".to_owned(),
                     ));
@@ -402,6 +402,10 @@ impl AiProvider for GeminiProvider {
     }
 }
 
+fn is_api_function_call_id(id: &str) -> bool {
+    !id.is_empty() && !id.starts_with("gem_call_") && !id.starts_with("fallback_call_")
+}
+
 fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value>) {
     match msg {
         AiTurnMessage::System { text } => ("user", vec![json!({ "text": text })]),
@@ -429,39 +433,41 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
             tool_calls,
         } => {
             let mut gem_parts = Vec::new();
-            let mut sig_iter = thinking_blocks
-                .iter()
-                .filter(|b| !b.signature.is_empty())
-                .peekable();
+            let mut non_thought_sigs = Vec::new();
+            for tb in thinking_blocks.iter().filter(|b| !b.signature.is_empty()) {
+                if tb.thinking.is_empty() {
+                    non_thought_sigs.push(tb.signature.as_str());
+                } else {
+                    gem_parts.push(json!({
+                        "text": tb.thinking,
+                        "thought": true,
+                        "thoughtSignature": tb.signature,
+                    }));
+                }
+            }
+            let mut non_thought_iter = non_thought_sigs.into_iter();
             if let Some(txt) = text
                 && !txt.is_empty()
             {
                 let mut text_part = json!({ "text": txt });
-                // functionCall が無いテキストパートに付いた thoughtSignature を優先復元する
-                if tool_calls.is_empty()
-                    && sig_iter.peek().is_some_and(|b| b.thinking.is_empty())
-                    && let Some(tb) = sig_iter.next()
-                {
-                    text_part["thoughtSignature"] = json!(tb.signature);
+                // functionCall の有無に関わらず非 thought のテキストパート署名を本体 text パートへ復元する
+                if let Some(sig) = non_thought_iter.next() {
+                    text_part["thoughtSignature"] = json!(sig);
                 }
                 gem_parts.push(text_part);
             }
-            for tb in sig_iter {
-                let mut sig_part = json!({
-                    "text": tb.thinking,
-                    "thoughtSignature": tb.signature,
-                });
-                if !tb.thinking.is_empty() {
-                    sig_part["thought"] = json!(true);
-                }
-                gem_parts.push(sig_part);
+            for sig in non_thought_iter {
+                gem_parts.push(json!({
+                    "text": "",
+                    "thoughtSignature": sig,
+                }));
             }
             for call in tool_calls {
                 let mut fc = json!({
                     "name": call.name,
                     "args": call.arguments,
                 });
-                if !call.id.is_empty() {
+                if is_api_function_call_id(&call.id) {
                     fc["id"] = json!(call.id);
                 }
                 let mut part = json!({ "functionCall": fc });
@@ -492,7 +498,7 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
                 "name": name,
                 "response": payload,
             });
-            if !tool_call_id.is_empty() {
+            if is_api_function_call_id(tool_call_id) {
                 fr["id"] = json!(tool_call_id);
             }
             ("user", vec![json!({ "functionResponse": fr })])
@@ -1121,6 +1127,46 @@ mod tests {
             )
             .is_err()
         );
+
+        // #02 & #03: thought パート先頭配置・非 thought 署名 text_part 優先配置・自前 ID (gem_call_*/fallback_call_*) 非送信
+        let (_role, mixed_parts) = gemini_turn_message_to_parts(&AiTurnMessage::Assistant {
+            text: Some("呼び出します".to_owned()),
+            thinking_blocks: vec![
+                AiThinkingBlock {
+                    thinking: String::new(),
+                    signature: "sig_text_mixed".to_owned(),
+                    redacted_data: None,
+                },
+                AiThinkingBlock {
+                    thinking: "まず考える".to_owned(),
+                    signature: "sig_thought_first".to_owned(),
+                    redacted_data: None,
+                },
+            ],
+            tool_calls: vec![AiToolCall {
+                id: "gem_call_0".to_owned(),
+                name: "get_timeline_summary".to_owned(),
+                arguments: json!({}),
+                thought_signature: Some("sig_fc_0".to_owned()),
+            }],
+        });
+        assert_eq!(mixed_parts.len(), 3);
+        assert_eq!(mixed_parts[0]["thought"], json!(true));
+        assert_eq!(
+            mixed_parts[0]["thoughtSignature"],
+            json!("sig_thought_first")
+        );
+        assert_eq!(mixed_parts[1]["text"], json!("呼び出します"));
+        assert_eq!(mixed_parts[1]["thoughtSignature"], json!("sig_text_mixed"));
+        assert!(mixed_parts[2]["functionCall"].get("id").is_none());
+
+        let (_role_fr, fr_parts) = gemini_turn_message_to_parts(&AiTurnMessage::ToolResult {
+            tool_call_id: "gem_call_0".to_owned(),
+            name: "get_timeline_summary".to_owned(),
+            content_json: "{}".to_owned(),
+            is_error: false,
+        });
+        assert!(fr_parts[0]["functionResponse"].get("id").is_none());
         Ok(())
     }
 

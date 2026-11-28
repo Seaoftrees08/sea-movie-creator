@@ -237,7 +237,7 @@ where
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(CancellablePostMsg::SseEvent(evt, payload)) => {
                 if on_sse_event(&mut state, evt.as_deref(), &payload)? {
-                    return finish_sse(state, true);
+                    return finish_sse(state, false);
                 }
             }
             Ok(CancellablePostMsg::SseEof { saw_done }) => {
@@ -339,12 +339,13 @@ fn cached_streaming_ureq_agent(timeout_secs: u64) -> ureq::Agent {
 fn build_streaming_ureq_agent(timeout_secs: u64) -> ureq::Agent {
     // 長時間の Thinking や大規模生成で正常チャンク受信中に 60 秒打ち切りされないよう、
     // 全体 timeout_global は設定せず接続・応答ヘッダ・チャンク間アイドルタイムアウトで管理する
+    let read_timeout = Duration::from_secs(timeout_secs.max(120));
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(timeout_secs.min(30))))
         .timeout_send_request(Some(Duration::from_secs(timeout_secs)))
         .timeout_send_body(Some(Duration::from_secs(timeout_secs)))
-        .timeout_recv_response(Some(Duration::from_secs(timeout_secs.max(120))))
-        .timeout_per_read(Some(Duration::from_secs(timeout_secs)))
+        .timeout_recv_response(Some(read_timeout))
+        .timeout_per_read(Some(read_timeout))
         .http_status_as_error(false)
         .build()
         .into()

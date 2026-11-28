@@ -377,9 +377,6 @@ fn messages_satisfy_anthropic_thinking_rules(messages: &[Value]) -> bool {
         let has_tool_use = blocks
             .iter()
             .any(|b| b["type"].as_str() == Some("tool_use"));
-        if !has_tool_use {
-            continue;
-        }
         let mut seen_non_thinking = false;
         let mut has_leading_thinking = false;
         for b in blocks {
@@ -393,7 +390,7 @@ fn messages_satisfy_anthropic_thinking_rules(messages: &[Value]) -> bool {
                 seen_non_thinking = true;
             }
         }
-        if !has_leading_thinking {
+        if has_tool_use && !has_leading_thinking {
             return false;
         }
     }
@@ -430,7 +427,7 @@ fn anthropic_turn_message_to_blocks(msg: &AiTurnMessage) -> (&'static str, Vec<V
         } => {
             let mut content = Vec::new();
             for tb in thinking_blocks {
-                if let Some(data) = &tb.redacted_data {
+                if let Some(data) = tb.redacted_data.as_deref().filter(|d| !d.is_empty()) {
                     content.push(json!({
                         "type": "redacted_thinking",
                         "data": data,
@@ -1411,6 +1408,24 @@ mod tests {
             })?;
         assert_eq!(sync_thoughts, vec!["sync思考"]);
         assert_eq!(sync_txt, "本文");
+
+        // empty redacted_data は無効ブロック扱いし、tool_use 無しでも [text, thinking] 順序違反なら false を返すこと
+        let empty_redacted = AiThinkingBlock {
+            thinking: String::new(),
+            signature: String::new(),
+            redacted_data: Some(String::new()),
+        };
+        assert!(!empty_redacted.is_valid_anthropic());
+        let invalid_order_msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "先" },
+                { "type": "thinking", "thinking": "後", "signature": "sig" }
+            ]
+        })];
+        assert!(!messages_satisfy_anthropic_thinking_rules(
+            &invalid_order_msgs
+        ));
         Ok(())
     }
 

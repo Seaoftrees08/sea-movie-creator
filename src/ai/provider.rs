@@ -1019,7 +1019,7 @@ pub struct AgentRuntimeSettings {
     /// コンタクトシートの縦行数 (`1..=4`、既定 `2`)。
     #[serde(default = "default_vision_contact_sheet_rows")]
     pub vision_contact_sheet_rows: u8,
-    /// コンタクトシート各タイルの長辺上限ピクセル数 (`192..=512`、既定 `320`)。
+    /// コンタクトシート各タイルの長辺上限ピクセル数 (`128..=1024`、既定 `320`)。
     #[serde(default = "default_vision_contact_sheet_tile_px")]
     pub vision_contact_sheet_tile_px: u32,
 }
@@ -1225,7 +1225,7 @@ impl AiThinkingBlock {
     /// Anthropic API へ再送可能な有効 `thinking` / `redacted_thinking` ブロックかを返す。
     #[must_use]
     pub fn is_valid_anthropic(&self) -> bool {
-        !self.signature.is_empty() || self.redacted_data.is_some()
+        !self.signature.is_empty() || self.redacted_data.as_deref().is_some_and(|d| !d.is_empty())
     }
 }
 
