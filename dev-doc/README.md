@@ -50,3 +50,4 @@
 | 015 | AI 実行中アクティビティ・思考ストリーム可視化＆質問早期表示設計書 | Implemented | [`completed/015-ai-activity-ui-and-early-ask.md`](completed/015-ai-activity-ui-and-early-ask.md) |
 | 016 | 追加編集時の写真・字幕クロス監査、EXIF 向き自動補正、CLI Vision 対応＆画像トークン圧縮設計書 | Implemented | [`completed/016-ai-vision-audit-exif-and-token-compression.md`](completed/016-ai-vision-audit-exif-and-token-compression.md) |
 | 017 | エディタ UX 改善設計書（タイムライン再生位置追随・プレビュー画面外カラー＆境界・JSON 設定ハイライト） | Implemented | [`completed/017-editor-ux-timeline-follow-preview-backdrop-json-hl.md`](completed/017-editor-ux-timeline-follow-backdrop-json-hl.md) |
+| 018 | エージェントハーネス高度化設計書（決定論バルク編集・軽量クエリ・選別＆キャッシュ監査・既読フォルダ保護） | Draft | [`018-agent-harness-bulk-edit-and-selective-audit.md`](018-agent-harness-bulk-edit-and-selective-audit.md) |
