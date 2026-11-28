@@ -196,11 +196,13 @@ pub struct PreviewViewportTransform {
 
 impl PreviewViewportTransform {
     /// 自動フィット時の表示スケール (`画面 px / プロジェクト px`) を算出する。
+    ///
+    /// 既定 `Fit` 時にも外周 1px 枠線と画面外グレーが `ContentMask` でクリップされないよう最小 2px の内側余白を確保する。
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn fit_scale(&self) -> f32 {
-        let bw = self.bounds.2.max(16.0);
-        let bh = self.bounds.3.max(16.0);
+        let bw = (self.bounds.2 - 4.0).max(16.0);
+        let bh = (self.bounds.3 - 4.0).max(16.0);
         let pw = self.proj_size.0.max(1) as f32;
         let ph = self.proj_size.1.max(1) as f32;
         (bw / pw).min(bh / ph).max(0.01)
@@ -1608,5 +1610,21 @@ mod tests {
         .ok_or("expected move hover")?;
         assert_eq!(move_hover.kind, PreviewHoverKind::MoveClip);
         Ok(())
+    }
+
+    #[test]
+    fn fit_zoom_preserves_room_for_outer_canvas_border() {
+        let vp = PreviewViewportTransform {
+            bounds: (10.0, 20.0, 800.0, 450.0),
+            proj_size: (1920, 1080),
+            zoom: PreviewZoomMode::Fit,
+            pan_px: (0.0, 0.0),
+        };
+        let (rx, ry, rw, rh) = vp.rendered_rect();
+        // 外周 1px 枠線（各辺 -1..+1）がビューポート範囲内に完全に収まること
+        assert!(rx - 1.0 >= vp.bounds.0);
+        assert!(ry - 1.0 >= vp.bounds.1);
+        assert!(rx + rw + 1.0 <= vp.bounds.0 + vp.bounds.2 + 0.01);
+        assert!(ry + rh + 1.0 <= vp.bounds.1 + vp.bounds.3 + 0.01);
     }
 }

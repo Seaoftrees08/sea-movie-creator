@@ -121,6 +121,8 @@ pub fn render_preview_panel(
         Vec::new()
     };
 
+    let is_dark = matches!(cx.theme().mode, ThemeMode::Dark);
+    let palette = preview_palette(is_dark);
     let header = render_preview_header(controller, cx);
     let viewport = render_preview_viewport(controller, playhead, space_pan_held, cx);
     let transport = render_transport_bar(controller, scrub_slider, cx);
@@ -128,7 +130,7 @@ pub fn render_preview_panel(
     let mut root = v_flex()
         .size_full()
         .min_h(px(160.0))
-        .bg(rgba(0x0b0e_14ff))
+        .bg(palette.backdrop_bg)
         .child(header)
         .child(viewport);
 

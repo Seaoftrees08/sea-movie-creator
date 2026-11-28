@@ -54,11 +54,15 @@ pub struct AiLiveActivityState {
     pub streaming_raw_chars: usize,
     /// ストリーミング JSON から抽出した構造化進捗ヒント。
     pub streaming_progress: Option<StreamingJsonProgress>,
+    /// 本文ストリームの前置き自然文プレビュー末尾キャッシュ（`on_stream_updated` 時のみ再計算）。
+    pub readable_prefix_tail_cache: Option<String>,
     /// ライブ表示内の全ステップ一覧を展開しているか。
     pub steps_expanded: bool,
     /// ライブ思考プレビューの全文を展開しているか。
     pub thought_expanded: bool,
     next_hint_seq: u64,
+    accumulated_active_duration: std::time::Duration,
+    active_segment_started_at: Option<Instant>,
 }
 
 /// ツール実行完了時に [`AiLiveActivityState::on_tool_completed`] へ渡す更新情報。
@@ -87,27 +91,59 @@ impl AiLiveActivityState {
         self.thought_tail_cache.clear();
         self.streaming_raw_chars = 0;
         self.streaming_progress = None;
+        self.readable_prefix_tail_cache = None;
         self.steps_expanded = false;
         self.thought_expanded = false;
         self.next_hint_seq = 0;
+        self.accumulated_active_duration = std::time::Duration::ZERO;
+        self.active_segment_started_at = None;
     }
 
     /// 新しいターン開始時にタイマーのみ起動し直してバッファを空にする。
     pub fn begin_turn(&mut self) {
         self.reset();
-        self.started_at = Some(Instant::now());
+        let now = Instant::now();
+        self.started_at = Some(now);
+        self.active_segment_started_at = Some(now);
     }
 
-    /// 開始からの経過秒数を返す。
+    /// `AskUser` や承認待ちに入った際、待機時間を作業時間から除外するためタイマーを一時停止する。
+    pub fn pause_active_timer(&mut self) {
+        if let Some(started) = self.active_segment_started_at.take() {
+            self.accumulated_active_duration += started.elapsed();
+        }
+    }
+
+    /// ユーザー応答や承認後に AI 作業が再開された際、アクティブ作業タイマーを再開する。
+    pub fn resume_active_timer(&mut self) {
+        let now = Instant::now();
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+        }
+        if self.active_segment_started_at.is_none() {
+            self.active_segment_started_at = Some(now);
+        }
+    }
+
+    /// 待機時間を除いた正味の AI 作業経過秒数を返す。
+    #[must_use]
+    pub fn active_elapsed_secs(&self) -> u64 {
+        let live = self
+            .active_segment_started_at
+            .map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        (self.accumulated_active_duration + live).as_secs()
+    }
+
+    /// 待機時間を除いた正味の経過秒数を返す（互換エイリアス）。
     #[must_use]
     pub fn elapsed_secs(&self) -> u64 {
-        self.started_at.map_or(0, |t| t.elapsed().as_secs())
+        self.active_elapsed_secs()
     }
 
     /// ツールまたは対話確認の開始イベントを記録する。
     pub fn on_tool_started(&mut self, call_id: &str, verb: &str, target: &str) {
         if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
+            self.resume_active_timer();
         }
         if let Some(existing) = self.steps.iter_mut().find(|s| s.id == call_id) {
             verb.clone_into(&mut existing.verb);
@@ -163,7 +199,7 @@ impl AiLiveActivityState {
             return;
         }
         if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
+            self.resume_active_timer();
         }
         if let Some(last) = self.steps.last()
             && last.target == trimmed
@@ -193,23 +229,25 @@ impl AiLiveActivityState {
             return;
         }
         if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
+            self.resume_active_timer();
         }
         self.thought_buffer.push_str(delta);
         trim_leading_to_max_chars(&mut self.thought_buffer, MAX_THOUGHT_BUFFER_CHARS);
         self.thought_tail_cache = extract_tail_lines(&self.thought_buffer, LIVE_PREVIEW_LINES);
     }
 
-    /// 本文ストリーム更新時に JSON 構築ヒントを再計算する。
+    /// 本文ストリーム更新時に JSON 構築ヒントと前置き自然文キャッシュを再計算する。
     pub fn on_stream_updated(&mut self, full_raw_preview: &str) {
         self.streaming_raw_chars = full_raw_preview.chars().count();
         self.streaming_progress = inspect_streaming_json_progress(full_raw_preview);
+        self.readable_prefix_tail_cache = extract_readable_prefix_tail(full_raw_preview);
     }
 
-    /// 本文バッファクリア時にストリームヒントを消去する。
+    /// 本文バッファクリア時にストリームヒントと前置きキャッシュを消去する。
     pub fn clear_stream_progress(&mut self) {
         self.streaming_raw_chars = 0;
         self.streaming_progress = None;
+        self.readable_prefix_tail_cache = None;
     }
 
     /// ターン完了またはキャンセル時に永続化用の [`AiTurnActivitySummary`] を確定してリセットする。
@@ -231,7 +269,7 @@ impl AiLiveActivityState {
                 };
             }
         }
-        let worked_secs = worked_secs_override.unwrap_or_else(|| self.elapsed_secs());
+        let worked_secs = worked_secs_override.unwrap_or_else(|| self.active_elapsed_secs());
         let thought_excerpt = (!self.thought_buffer.trim().is_empty())
             .then(|| extract_tail_lines(&self.thought_buffer, LIVE_PREVIEW_LINES));
         let steps = std::mem::take(&mut self.steps);
@@ -259,6 +297,48 @@ impl AiLiveActivityState {
     }
 }
 
+const KNOWN_STREAM_TOOLS: &[&str] = &[
+    "apply_draft_edit_command",
+    "compile_movie_blueprint",
+    "get_timeline_summary",
+    "inspect_media_folder",
+    "inspect_images_vision",
+    "audit_timeline_slides",
+    "validate_draft_plan",
+    "ask_user",
+    "get_capabilities",
+];
+
+fn extract_streaming_tool_name(raw: &str) -> Option<String> {
+    let search_slice = raw.rfind("\"tool_calls\"").map_or(raw, |idx| &raw[idx..]);
+    let args_pos = search_slice.find("\"arguments\"");
+
+    let key_pattern = "\"name\"";
+    let mut latest_known: Option<String> = None;
+    let mut first_before_args: Option<String> = None;
+    let mut search_from = 0_usize;
+    while let Some(rel) = search_slice[search_from..].find(key_pattern) {
+        let name_pos = search_from + rel;
+        let after_key_idx = name_pos + key_pattern.len();
+        let after_colon = search_slice[after_key_idx..].trim_start();
+        if let Some(after_c) = after_colon.strip_prefix(':')
+            && let Some(val) = parse_json_string_prefix(after_c.trim_start())
+            && !val.trim().is_empty()
+        {
+            if KNOWN_STREAM_TOOLS.contains(&val.as_str()) {
+                latest_known = Some(val);
+            } else if first_before_args.is_none()
+                && raw.contains("\"tool_calls\"")
+                && args_pos.is_none_or(|ap| name_pos < ap)
+            {
+                first_before_args = Some(val);
+            }
+        }
+        search_from = after_key_idx;
+    }
+    latest_known.or(first_before_args)
+}
+
 /// 受信中の生ストリームテキスト（JSON やツール引数構築中を含む）から構造化ヒントを抽出する。
 #[must_use]
 pub fn inspect_streaming_json_progress(raw: &str) -> Option<StreamingJsonProgress> {
@@ -270,22 +350,36 @@ pub fn inspect_streaming_json_progress(raw: &str) -> Option<StreamingJsonProgres
         || raw.contains("```json")
         || raw.contains("\"tool_calls\"")
         || raw.contains("\"apply_draft_edit_command\"")
-        || raw.contains("\"compile_movie_blueprint\"");
+        || raw.contains("\"compile_movie_blueprint\"")
+        || raw.contains("\"audit_timeline_slides\"");
     if !looks_like_json {
         return None;
     }
 
-    let tool_name = extract_last_json_string_field(raw, "name");
+    let tool_name = extract_streaming_tool_name(raw);
     let (verb, target) = match tool_name.as_deref() {
-        Some("apply_draft_edit_command") => ("Editing".to_owned(), "タイムライン編集".to_owned()),
-        Some("compile_movie_blueprint") => ("Editing".to_owned(), "ムービー構成".to_owned()),
-        Some("get_timeline_summary") => ("Analyzed".to_owned(), "タイムライン構成".to_owned()),
-        Some("inspect_media_folder") => ("Analyzed".to_owned(), "メディア素材".to_owned()),
-        Some("inspect_images_vision") => ("Analyzed".to_owned(), "画像解析".to_owned()),
-        Some("validate_draft_plan") => ("Verified".to_owned(), "編集計画の検証".to_owned()),
-        Some("ask_user") => ("Asking".to_owned(), "ユーザー確認カード".to_owned()),
+        Some("apply_draft_edit_command") => {
+            ("Editing".to_owned(), tr("ai.activity_target_timeline_edit"))
+        }
+        Some("compile_movie_blueprint") => {
+            ("Editing".to_owned(), tr("ai.activity_target_blueprint"))
+        }
+        Some("get_timeline_summary") => (
+            "Analyzed".to_owned(),
+            tr("ai.activity_target_timeline_summary"),
+        ),
+        Some("inspect_media_folder") => {
+            ("Analyzed".to_owned(), tr("ai.activity_target_media_folder"))
+        }
+        Some("inspect_images_vision") => ("Analyzed".to_owned(), tr("ai.activity_target_vision")),
+        Some("audit_timeline_slides") => {
+            ("Analyzed".to_owned(), tr("ai.activity_target_slide_audit"))
+        }
+        Some("validate_draft_plan") => ("Verified".to_owned(), tr("ai.activity_target_validate")),
+        Some("ask_user") => ("Asking".to_owned(), tr("ai.activity_target_ask_user")),
+        Some("get_capabilities") => ("Checked".to_owned(), "Capabilities".to_owned()),
         Some(other) => ("Building".to_owned(), other.to_owned()),
-        None => ("Editing".to_owned(), "編集コマンド".to_owned()),
+        None => ("Editing".to_owned(), tr("ai.activity_target_edit_command")),
     };
 
     let command_count = count_inner_command_types(raw);
@@ -344,13 +438,19 @@ fn parse_json_string_prefix(s: &str) -> Option<String> {
     while let Some(ch) = chars.next() {
         match ch {
             '"' => return Some(out),
-            '\\' => match chars.next()? {
-                'n' => out.push(' '),
-                'r' | 't' => {}
-                '\\' => out.push('\\'),
-                '"' => out.push('"'),
-                other => out.push(other),
-            },
+            '\\' => {
+                // チャンク境界で末尾が `\` のまま途切れた場合も確定済み文字列を返して表示点滅を防ぐ
+                let Some(esc) = chars.next() else {
+                    break;
+                };
+                match esc {
+                    'n' => out.push(' '),
+                    'r' | 't' => {}
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => out.push(other),
+                }
+            }
             other => out.push(other),
         }
     }
@@ -363,15 +463,21 @@ pub fn extract_tail_lines(text: &str, max_lines: usize) -> String {
     if max_lines == 0 {
         return String::new();
     }
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = normalized.trim();
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    let lines: Vec<&str> = trimmed.lines().collect();
-    let total = lines.len();
-    let start = total.saturating_sub(max_lines);
-    let mut joined = lines[start..].join("\n");
+    let mut rev_lines: Vec<&str> = Vec::with_capacity(max_lines);
+    let mut has_more = false;
+    for raw_line in trimmed.rsplit('\n') {
+        if rev_lines.len() == max_lines {
+            has_more = true;
+            break;
+        }
+        rev_lines.push(raw_line.trim_end_matches('\r'));
+    }
+    rev_lines.reverse();
+    let mut joined = rev_lines.join("\n");
     let max_preview_chars = 360_usize;
     let char_len = joined.chars().count();
     let truncated_chars = char_len > max_preview_chars;
@@ -379,7 +485,7 @@ pub fn extract_tail_lines(text: &str, max_lines: usize) -> String {
         let skip = char_len - max_preview_chars;
         joined = joined.chars().skip(skip).collect();
     }
-    if start > 0 || truncated_chars {
+    if has_more || truncated_chars {
         format!("…\n{joined}")
     } else {
         joined
@@ -481,8 +587,8 @@ fn extract_readable_prefix_tail(raw: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with('{') {
         return None;
     }
-    let body = if let Some(idx) = trimmed.find("```") {
-        trimmed[..idx].trim()
+    let body = if let Some(fence_idx) = crate::ui::ai_chat_panel::find_json_fence_start(raw) {
+        raw[..fence_idx].trim()
     } else {
         trimmed
     };
@@ -615,8 +721,15 @@ fn render_live_streaming_progress_line(
     } else {
         let chars_str = chat.live_activity.streaming_raw_chars.to_string();
         format!(
-            "{} {} ({chars_str} 文字){snippet_suffix}",
-            progress.verb, progress.target
+            "{}{snippet_suffix}",
+            tr_fmt(
+                "ai.activity_building_chars",
+                &[
+                    ("verb", &progress.verb),
+                    ("target", &progress.target),
+                    ("chars", &chars_str),
+                ],
+            )
         )
     }
 }
@@ -628,22 +741,25 @@ pub fn render_live_activity_card(
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
     let (phase_label, step_label, elapsed_secs) = match &chat.execution_state {
-        AiExecutionState::Responding {
-            started_at,
-            phase,
-            step,
-        } => {
+        AiExecutionState::Responding { phase, step, .. } => {
             let step_txt = match step {
                 Some((Some(s), Some(t))) => format!("[{s}/{t}] "),
-                Some((Some(s), None)) => format!("[ステップ {s}] "),
+                Some((Some(s), None)) => {
+                    let s_str = s.to_string();
+                    tr_fmt("ai.activity_step_badge", &[("step", &s_str)])
+                }
                 _ => String::new(),
             };
-            (phase.clone(), step_txt, started_at.elapsed().as_secs())
+            (
+                phase.clone(),
+                step_txt,
+                chat.live_activity.active_elapsed_secs(),
+            )
         }
         _ => (
             chat.status_banner.clone(),
             String::new(),
-            chat.live_activity.elapsed_secs(),
+            chat.live_activity.active_elapsed_secs(),
         ),
     };
     let elapsed_label = format_elapsed_duration(elapsed_secs);
@@ -702,13 +818,13 @@ pub fn render_live_activity_card(
                 .child(line),
         );
     }
-    if let Some(prefix_tail) = extract_readable_prefix_tail(&chat.streaming_preview) {
+    if let Some(prefix_tail) = &chat.live_activity.readable_prefix_tail_cache {
         card = card.child(
             div()
                 .w_full()
                 .min_w(px(0.))
                 .text_color(theme.muted_foreground)
-                .child(prefix_tail),
+                .child(prefix_tail.clone()),
         );
     }
     card
@@ -725,7 +841,11 @@ pub fn render_turn_activity_summary(
     let duration = format_elapsed_duration(summary.worked_secs);
     let worked_label = tr_fmt("ai.activity_worked_for", &[("duration", &duration)]);
     let steps_str = summary.steps.len().to_string();
-    let steps_label = tr_fmt("ai.activity_steps_count", &[("count", &steps_str)]);
+    let steps_label = if summary.steps.len() == 1 {
+        tr("ai.activity_steps_count_one")
+    } else {
+        tr_fmt("ai.activity_steps_count", &[("count", &steps_str)])
+    };
     let arrow = if is_expanded { "▾" } else { "▸" };
     let header_text = if summary.steps.is_empty() {
         format!("{worked_label} {arrow}")
@@ -872,6 +992,46 @@ mod tests {
         );
         assert_eq!(state.steps.len(), 0);
         assert_eq!(state.thought_buffer, "");
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_progress_ignores_nested_name_handles_trailing_backslash_and_caches_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 引数内のネスト `"name"`（例: プロジェクト名やトラック名）でツール名が誤上書きされないこと
+        let nested_name = r#"{"tool_calls":[{"name":"apply_draft_edit_command","arguments":{"command":{"type":"set_project_meta","name":"オープニング"}}}]}"#;
+        let prog = inspect_streaming_json_progress(nested_name)
+            .ok_or("nested name JSON must produce progress")?;
+        assert_eq!(prog.tool_name.as_deref(), Some("apply_draft_edit_command"));
+        assert_eq!(prog.verb, "Editing");
+
+        // `audit_timeline_slides` が登録済みであること
+        let audit = r#"{"tool_calls":[{"name":"audit_timeline_slides","arguments":{"focus_hint":"桜\n笑顔\"#;
+        let prog_audit = inspect_streaming_json_progress(audit)
+            .ok_or("audit_timeline_slides partial JSON must parse")?;
+        assert_eq!(
+            prog_audit.tool_name.as_deref(),
+            Some("audit_timeline_slides")
+        );
+        assert_eq!(prog_audit.verb, "Analyzed");
+
+        // チャンク境界 `\` で snippet が消えて点滅しないこと
+        let trailing_bs = r#"{"tool_calls":[{"name":"apply_draft_edit_command","arguments":{"text":"テスト文字列\"#;
+        let prog_bs = inspect_streaming_json_progress(trailing_bs)
+            .ok_or("trailing backslash must still produce progress")?;
+        assert_eq!(prog_bs.latest_snippet.as_deref(), Some("テスト文字列"));
+
+        // フェンス無し `{"tool_calls"...}` を前置き自然文キャッシュへ漏らさないこと
+        let mut live = AiLiveActivityState::default();
+        live.on_stream_updated(
+            "確認中です。\n{\"tool_calls\":[{\"name\":\"get_timeline_summary\"}]}",
+        );
+        assert_eq!(
+            live.readable_prefix_tail_cache.as_deref(),
+            Some("確認中です。")
+        );
+        live.on_stream_updated("{\"tool_calls\":[]}");
+        assert_eq!(live.readable_prefix_tail_cache, None);
         Ok(())
     }
 }

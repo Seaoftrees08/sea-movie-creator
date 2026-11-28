@@ -168,6 +168,9 @@ impl SeaEditorWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut controller = AppController::new();
+        if let Some(prefs_path) = crate::core::user_config_file_path("editor_prefs.json") {
+            controller.load_editor_prefs_from(prefs_path);
+        }
         controller.ai_chat.enable_user_session_store();
         controller.try_start_audio_output();
         if let Some(path) = open_project
@@ -896,8 +899,18 @@ impl SeaEditorWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        if self.controller.ai_chat.take_scroll_to_bottom_pending() {
-            self.ai_chat_scroll_handle.scroll_to_bottom();
+        match self.controller.ai_chat.take_scroll_request() {
+            crate::ui::ai_chat_panel::ChatScrollRequest::None => {}
+            crate::ui::ai_chat_panel::ChatScrollRequest::ForceBottom => {
+                self.ai_chat_scroll_handle.scroll_to_bottom();
+            }
+            crate::ui::ai_chat_panel::ChatScrollRequest::StickyIfNearBottom => {
+                let max_y = f32::from(self.ai_chat_scroll_handle.max_offset().y).max(0.0);
+                let offset_y = f32::from(self.ai_chat_scroll_handle.offset().y);
+                if max_y <= 1.0 || (max_y + offset_y) <= 48.0 {
+                    self.ai_chat_scroll_handle.scroll_to_bottom();
+                }
+            }
         }
         let win_w = f32::from(window.viewport_size().width).max(DEFAULT_WINDOW_WIDTH);
         let default_right_w = clamp_right_panel_width(win_w, self.controller.right_panel_width);

@@ -339,7 +339,7 @@ fn render_follow_and_snap_pills(
                 != crate::ui::editor_prefs::TimelinePlayheadFollowMode::Off
                 && !controller.playhead_follow_paused_by_manual_scroll,
             cx.listener(|this, _, _, cx| {
-                this.controller.cycle_playhead_follow_mode();
+                this.controller.on_playhead_follow_button_click();
                 this.reload_app_menus(cx);
                 cx.notify();
             }),
@@ -908,9 +908,10 @@ pub fn handle_timeline_window_mouse_up(
                 this.controller.status_message = format!("総尺変更失敗: {err}");
             }
         }
-        TimelinePointerGesture::RulerScrub
-        | TimelinePointerGesture::ZoomBar { .. }
-        | TimelinePointerGesture::HScrollbar { .. } => {}
+        TimelinePointerGesture::RulerScrub => {
+            this.controller.playhead_follow_paused_by_manual_scroll = false;
+        }
+        TimelinePointerGesture::ZoomBar { .. } | TimelinePointerGesture::HScrollbar { .. } => {}
     }
 
     this.controller.inspector.invalidate_sync();

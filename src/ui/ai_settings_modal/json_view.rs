@@ -56,7 +56,7 @@ pub(super) fn render_json_mode_view(
             .overflow_hidden()
             .child(
                 Editor::new(&modal.json_editor)
-                    .h(px(360.))
+                    .h(px(358.))
                     .appearance(false),
             ),
     )

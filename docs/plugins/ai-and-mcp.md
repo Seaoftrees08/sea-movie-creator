@@ -181,6 +181,6 @@ sea-movie-creator mcp --project path/to/project.smc.json
 - `AgentLlmToolCall.thought_signature`: Gemini 等が返すツール呼び出しに紐づく思考署名文字列（任意）。
 - 既存の `CallTool` / `AskUser` に対する VS Code 風アクティビティ（開始・完了・実処理時間計測）は本体機能モジュール [`src/ai/agent_host.rs`](../../src/ai/agent_host.rs) がホスト側で生成するため、プラグイン側へ新しい必須メッセージは課しません。
 
-### 2.4 テスト用フィクスチャ
+### 2.5 テスト用フィクスチャ
 
 外部 CLI を実際に起動せずにテストするため、[`examples/ai_cli_fixture.rs`](../../examples/ai_cli_fixture.rs) が用意されています。`SEA_AI_FIXTURE_MODE` 環境変数（`acp-agy-sandbox` / `acp-stdio`）で決定論的な ACP ストリーミングを再現できます。

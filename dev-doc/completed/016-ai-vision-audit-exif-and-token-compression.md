@@ -7,7 +7,7 @@
   - 自律エージェントプラグイン基盤＆構成コンパイラ設計書（完了済み）: [`012-agentic-plugin-architecture.md`](012-agentic-plugin-architecture.md)
   - AI チャット継続性修正・作業中／完了状態の可視化・選択＆コピー対応設計書（完了済み）: [`014-ai-chat-reliability-status-and-copy.md`](014-ai-chat-reliability-status-and-copy.md)
   - 外部プラグイン向け SDK・プロトコル互換性ポリシー: [`011-plugin-protocol-compatibility-policy.md`](../011-plugin-protocol-compatibility-policy.md)
-  - AI 実行中アクティビティ・思考ストリーム可視化＆質問早期表示設計書: [`015-ai-activity-ui-and-early-ask.md`](../015-ai-activity-ui-and-early-ask.md)
+  - AI 実行中アクティビティ・思考ストリーム可視化＆質問早期表示設計書: [`015-ai-activity-ui-and-early-ask.md`](015-ai-activity-ui-and-early-ask.md)
 
 ---
 

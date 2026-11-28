@@ -1,13 +1,15 @@
 //! エディタ UI のユーザー設定（タイムライン再生位置追随モード等）の永続化モジュール。
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
-
-use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::{user_config_file_path, user_config_read_path};
+use serde::{Deserialize, Serialize};
 
 const EDITOR_PREFS_FILE_NAME: &str = "editor_prefs.json";
+static PREFS_TEMP_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 再生中・シーク時のタイムライン水平スクロール追随モード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -55,10 +57,22 @@ impl EditorPreferences {
     /// 指定ファイルパスからプリファレンスを読み込む（欠如・破損時は既定値へフォールバック）。
     #[must_use]
     pub fn load_from_path(path: &Path) -> Self {
-        let Ok(raw) = fs::read_to_string(path) else {
-            return Self::default();
+        let raw = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(err) => {
+                eprintln!("[editor_prefs] failed to read {}: {err}", path.display());
+                return Self::default();
+            }
         };
-        serde_json::from_str::<Self>(&raw).unwrap_or_default()
+        let stripped = raw.trim_start_matches('\u{feff}');
+        serde_json::from_str::<Self>(stripped).unwrap_or_else(|err| {
+            eprintln!(
+                "[editor_prefs] invalid JSON in {}; falling back to defaults: {err}",
+                path.display()
+            );
+            Self::default()
+        })
     }
 
     /// ユーザー設定ディレクトリへ保存する。
@@ -73,7 +87,7 @@ impl EditorPreferences {
         self.save_to_path(&path)
     }
 
-    /// 指定ファイルパスへ整形 JSON として保存する。
+    /// 指定ファイルパスへ整形 JSON として原子的に保存する（一時ファイル書込→リネーム）。
     ///
     /// # Errors
     ///
@@ -84,7 +98,29 @@ impl EditorPreferences {
         }
         let body = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serialize editor_prefs failed: {e}"))?;
-        fs::write(path, body).map_err(|e| format!("write editor_prefs failed: {e}"))
+        let seq = PREFS_TEMP_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("editor_prefs");
+        let tmp_path = path.with_file_name(format!("{file_name}.tmp.{pid}.{seq}"));
+        let mut open_opts = fs::OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        let mut file = open_opts
+            .open(&tmp_path)
+            .map_err(|e| format!("open temp editor_prefs failed: {e}"))?;
+        if let Err(err) = file.write_all(body.as_bytes()).and_then(|()| file.flush()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("write temp editor_prefs failed: {err}"));
+        }
+        drop(file);
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("rename editor_prefs failed: {err}"));
+        }
+        Ok(())
     }
 }
 
@@ -126,11 +162,22 @@ mod tests {
         let loaded = EditorPreferences::load_from_path(&path);
         assert_eq!(loaded, prefs);
 
+        // UTF-8 BOM 付き JSON でも正しく読み込めること
+        let bom_body = format!("\u{feff}{}", fs::read_to_string(&path)?);
+        fs::write(&path, bom_body)?;
+        assert_eq!(EditorPreferences::load_from_path(&path), prefs);
+
         // 破損 JSON でもパニックせず Page (既定値) にフォールバックすること
         fs::write(&path, "{ invalid json")?;
         let fallback = EditorPreferences::load_from_path(&path);
         assert_eq!(
             fallback.playhead_follow_mode,
+            TimelinePlayheadFollowMode::Page
+        );
+
+        // 存在しないファイルは既定値へフォールバックすること
+        assert_eq!(
+            EditorPreferences::load_from_path(&dir.join("missing.json")).playhead_follow_mode,
             TimelinePlayheadFollowMode::Page
         );
 
