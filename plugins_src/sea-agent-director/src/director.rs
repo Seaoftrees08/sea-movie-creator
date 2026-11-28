@@ -517,7 +517,7 @@ fn run_vision_analysis_batches(
 
 fn is_vision_unsupported_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    [
+    let explicit_kw = [
         "vision_unsupported",
         "does not support vision",
         "vision not supported",
@@ -526,10 +526,28 @@ fn is_vision_unsupported_error(msg: &str) -> bool {
         "image input not supported",
         "multimodal not supported",
         "not a vision model",
-        "not supported",
     ]
     .iter()
-    .any(|kw| lower.contains(kw))
+    .any(|kw| lower.contains(kw));
+    if explicit_kw {
+        return true;
+    }
+    let mentions_vision_media = [
+        "vision",
+        "image",
+        "images",
+        "multimodal",
+        "visual",
+        "image_url",
+        "inline_data",
+        "media_type",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    mentions_vision_media
+        && ["does not support", "not supported", "unknown variant"]
+            .iter()
+            .any(|kw| lower.contains(kw))
 }
 
 fn populate_exif_fallback_for_indices(images: &mut [AnalyzedImageMeta], indices: &[usize]) {
@@ -1429,21 +1447,7 @@ fn run_dynamic_tool_loop(
             tool_call_id: None,
         });
 
-        if let Some(ask_pos) = tool_calls.iter().position(|c| c.name == "ask_user") {
-            // 同一ターン内に ask_user と他のツール呼び出しが混在する場合は、
-            // ask_user のみ実行し他はスキップ結果を返して確認後の誤編集を防ぐ。
-            for (idx, call) in tool_calls.into_iter().enumerate() {
-                if idx == ask_pos {
-                    execute_builtin_ask_user_tool(transport, step, call, &mut state)?;
-                } else {
-                    push_skipped_tool_result(&mut state.messages, call.id);
-                }
-            }
-        } else {
-            for call in tool_calls {
-                execute_single_dynamic_tool_call(session, transport, step, call, &mut state)?;
-            }
-        }
+        dispatch_dynamic_tool_calls(session, transport, step, tool_calls, &mut state)?;
     }
 
     if !completed_by_model {
@@ -1474,6 +1478,38 @@ fn run_dynamic_tool_loop(
         state.updated_blueprint,
         expect_timeline_edit,
     )
+}
+
+/// 1 ステップ内でモデルが要求したツール呼び出し群（`ask_user` 排他制御を含む）を実行する。
+fn dispatch_dynamic_tool_calls(
+    session: &mut DirectorSession,
+    transport: &mut AgentTransport<'_>,
+    step: u32,
+    tool_calls: Vec<AgentLlmToolCall>,
+    state: &mut DynamicToolLoopState,
+) -> Result<(), RpcError> {
+    if let Some(ask_pos) = tool_calls.iter().position(|c| c.name == "ask_user") {
+        if step + 1 >= MAX_DYNAMIC_TOOL_STEPS {
+            for call in tool_calls {
+                push_skipped_tool_result(&mut state.messages, call.id);
+            }
+        } else {
+            // 同一ターン内に ask_user と他のツール呼び出しが混在する場合は、
+            // ask_user のみ実行し他はスキップ結果を返して確認後の誤編集を防ぐ。
+            for (idx, call) in tool_calls.into_iter().enumerate() {
+                if idx == ask_pos {
+                    execute_builtin_ask_user_tool(transport, step, call, state)?;
+                } else {
+                    push_skipped_tool_result(&mut state.messages, call.id);
+                }
+            }
+        }
+    } else {
+        for call in tool_calls {
+            execute_single_dynamic_tool_call(session, transport, step, call, state)?;
+        }
+    }
+    Ok(())
 }
 
 /// ツール未呼出で完了しようとした編集依頼に対して 1 回だけ自己修復プロンプトを積む。
@@ -1675,33 +1711,32 @@ pub fn parse_ask_user_tool_args(
 /// `ask_user` 回答がユーザーによる編集中止・見送り・変更不要を示しているか判定する。
 #[must_use]
 pub fn is_user_declined_or_cancelled_answer(answer: &AgentUserAnswerPayload) -> bool {
-    let cancel_keywords = [
-        "cancel",
-        "abort",
-        "decline",
-        "no_change",
-        "stop",
-        "中止",
-        "キャンセル",
-        "やめる",
-        "変更しない",
-        "変更不要",
-    ];
-    if let Some(choice_id) = answer.choice_id.as_deref() {
+    const ASCII_CANCEL_WORDS: &[&str] = &["cancel", "abort", "decline", "no_change", "stop"];
+    const JA_CANCEL_KEYWORDS: &[&str] = &["中止", "キャンセル", "やめる", "変更しない", "変更不要"];
+    let matches_cancel_text = |raw: &str| {
+        let lower = raw.trim().to_ascii_lowercase();
+        ASCII_CANCEL_WORDS
+            .iter()
+            .any(|w| contains_ascii_word(&lower, w))
+            || JA_CANCEL_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    };
+
+    if !answer.skipped
+        && let Some(choice_id) = answer.choice_id.as_deref()
+    {
         let lower = choice_id.trim().to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "cancel" | "skip" | "no_change" | "abort" | "none" | "decline" | "stop"
-        ) || cancel_keywords.iter().any(|kw| lower.contains(kw))
+            "cancel" | "no_change" | "abort" | "none" | "decline" | "stop"
+        ) || matches_cancel_text(&lower)
         {
             return true;
         }
     }
-    if let Some(free) = answer.free_text.as_deref() {
-        let lower = free.trim().to_ascii_lowercase();
-        if cancel_keywords.iter().any(|kw| lower.contains(kw)) {
-            return true;
-        }
+    if let Some(free) = answer.free_text.as_deref()
+        && matches_cancel_text(free)
+    {
+        return true;
     }
     false
 }
@@ -2023,7 +2058,8 @@ fn build_followup_system_prompt(session: &DirectorSession) -> String {
          you MUST call `audit_timeline_slides` FIRST to inspect the actual images and all overlapping subtitles (never guess from filenames alone).\n\
          When `audit_timeline_slides` returns `recommended_rotation_deg` and `recommended_scale_x_param` / `recommended_scale_y_param`, \
          apply `RotationDeg` together with `ScaleX` and `ScaleY` `SetParameter` updates in the same `EditCommand::Batch` \
-         (when `rotation_is_animated == true` or `orientation_audit_skipped == \"animated_rotation\"`, do NOT overwrite animated `RotationDeg` with a constant).\n\
+         (when `companion_backdrop_updates` is non-empty, also apply each companion Backdrop's `recommended_rotation_deg` and `recommended_scale_x_param`/`recommended_scale_y_param` in that same `EditCommand::Batch`; \
+          when `rotation_is_animated == true` or `orientation_audit_skipped == \"animated_rotation\"`, do NOT overwrite animated `RotationDeg` with a constant).\n\
          When you need exact JSON parameter shapes for `SetParameter` (such as subtitle outline color/width or clip rotation), \
          call `get_capabilities` with `{{\"include_schemas\": true}}` to inspect the full `EditCommand` JSON Schema.\n\
          Keep exact target duration constraints when adjusting individual slides/endings.\n\
@@ -2393,6 +2429,51 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn decline_vision_and_backdrop_prompt_guards_work() {
+        // user decline / cancel 判定: skipped=true や部分一致キーワードで誤停止しない
+        let skipped_answer = AgentUserAnswerPayload {
+            choice_id: Some("skip".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: true,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&skipped_answer));
+
+        let word_boundary_ok = AgentUserAnswerPayload {
+            choice_id: None,
+            field_values: std::collections::BTreeMap::new(),
+            free_text: Some("stop_motion 演出にしてほしい".to_owned()),
+            skipped: false,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&word_boundary_ok));
+
+        let explicit_cancel = AgentUserAnswerPayload {
+            choice_id: None,
+            field_values: std::collections::BTreeMap::new(),
+            free_text: Some("やはり 中止 します".to_owned()),
+            skipped: false,
+        };
+        assert!(is_user_declined_or_cancelled_answer(&explicit_cancel));
+
+        // 無関係な "not supported" は Vision 非対応として扱わない
+        assert!(!is_vision_unsupported_error(
+            "temperature is not supported for this request"
+        ));
+        assert!(is_vision_unsupported_error(
+            "vision_unsupported: image input is not supported"
+        ));
+
+        // companion_backdrop_updates の同時更新指示がプロンプトに含まれること
+        let session = DirectorSession {
+            capabilities: Value::Null,
+            memory: DirectorMemory::default(),
+            timeline_summary: String::new(),
+        };
+        let followup = build_followup_system_prompt(&session);
+        assert!(followup.contains("companion_backdrop_updates"));
     }
 
     #[test]

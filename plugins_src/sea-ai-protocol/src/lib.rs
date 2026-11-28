@@ -171,14 +171,20 @@ impl ChildKillGuard {
         };
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return child.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    return child.wait();
+                }
             }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                return child.wait();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
         }
     }
 

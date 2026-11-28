@@ -715,6 +715,7 @@ fn run_list_models(params: &CallParams) -> Result<(), PluginRunError> {
         read_acp_until_response(&mut reader, &mut child_stdin, 2, &mut streamed)
     })();
     drop(child_stdin);
+    drop(reader);
 
     if probe_res.is_err() {
         guard.kill_and_wait();
@@ -803,6 +804,7 @@ fn run_request(params: &CallParams) -> Result<(), PluginRunError> {
         &mut streamed,
     );
     drop(child_stdin);
+    drop(reader);
 
     if conv_res.is_err() {
         guard.kill_and_wait();

@@ -118,18 +118,30 @@ impl AllowedFolderScope {
                 target.display().to_string(),
             ));
         }
-        // Windows 環境で許可外 UNC パスへ fs::canonicalize 前に SMB 接続するのを防ぐ
-        if let Some(target_unc) = unc_server_share(target) {
-            let same_unc_allowed = self
-                .roots
-                .iter()
-                .chain(self.allowed_files.iter())
-                .filter_map(|allowed| unc_server_share(allowed))
-                .any(|allowed_unc| allowed_unc == target_unc);
-            if !same_unc_allowed {
-                return Err(MediaInspectorError::AccessDenied(
-                    target.display().to_string(),
-                ));
+        // Windows 環境で許可外 UNC やデバイス/Verbatim 名前空間へ fs::canonicalize 前にアクセスするのを防ぐ
+        if let Some(Component::Prefix(prefix_comp)) = target.components().next() {
+            match prefix_comp.kind() {
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
+                    let target_unc = unc_server_share(target);
+                    let same_unc_allowed = target_unc.is_some_and(|t_unc| {
+                        self.roots
+                            .iter()
+                            .chain(self.allowed_files.iter())
+                            .filter_map(|allowed| unc_server_share(allowed))
+                            .any(|allowed_unc| allowed_unc == t_unc)
+                    });
+                    if !same_unc_allowed {
+                        return Err(MediaInspectorError::AccessDenied(
+                            target.display().to_string(),
+                        ));
+                    }
+                }
+                Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
+                    return Err(MediaInspectorError::AccessDenied(
+                        target.display().to_string(),
+                    ));
+                }
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
             }
         }
         let canon = fs::canonicalize(target)
@@ -502,6 +514,130 @@ pub fn encode_thumbnail_jpeg_base64_with_options(
         mime_type: "image/jpeg".to_owned(),
         base64_data,
     })
+}
+
+/// 単一パス・コンタクトシート生成で個別にスキップされた画像エラー。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactSheetFailure {
+    /// 元の `inputs` スライス上の 0-based インデックス。
+    pub input_index: usize,
+    /// エラーメッセージ。
+    pub reason: String,
+}
+
+/// 単一パス・部分許容型のコンタクトシート合成結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactSheetSkipResult {
+    /// 合成済みコンタクトシート。
+    pub sheet: EncodedContactSheet,
+    /// 成功してシートに含められた `inputs` 上の 0-based インデックス一覧。
+    pub accepted_input_indices: Vec<usize>,
+    /// 読込・デコード失敗等でスキップされた要素一覧。
+    pub skipped: Vec<ContactSheetFailure>,
+}
+
+/// 複数画像を単一パスでデコード・縮小し、破損画像を個別隔離したうえでコンタクトシートへ合成する。
+///
+/// # Errors
+///
+/// 入力が空またはグリッド上限超過、全画像デコード失敗、または JPEG エンコード失敗時に [`MediaInspectorError`] を返す。
+pub fn build_contact_sheet_jpeg_base64_skipping_errors(
+    scope: &AllowedFolderScope,
+    inputs: &[ContactSheetInput],
+    options: ContactSheetOptions,
+    renumber_badges_sequentially: bool,
+) -> Result<ContactSheetSkipResult, MediaInspectorError> {
+    if inputs.is_empty() {
+        return Err(MediaInspectorError::ImageFailed(
+            "contact sheet requires at least 1 input image".to_owned(),
+        ));
+    }
+    let cols = options.cols.clamp(1, 4);
+    let rows = options.rows.clamp(1, 4);
+    let capacity = usize::try_from(cols.saturating_mul(rows)).unwrap_or(16);
+    if inputs.len() > capacity {
+        return Err(MediaInspectorError::ImageFailed(format!(
+            "contact sheet tile count {} exceeds {cols}x{rows} capacity ({capacity})",
+            inputs.len()
+        )));
+    }
+    let tile_px = options.tile_max_edge_px.clamp(128, 1024);
+    let quality = options.jpeg_quality.clamp(40, 90);
+
+    let mut accepted = Vec::with_capacity(inputs.len());
+    let mut skipped = Vec::new();
+    for (idx, item) in inputs.iter().enumerate() {
+        match load_contact_sheet_tile(scope, item, tile_px) {
+            Ok((canon, rgb_tile)) => accepted.push((idx, item.badge_index, canon, rgb_tile)),
+            Err(err) => skipped.push(ContactSheetFailure {
+                input_index: idx,
+                reason: err.to_string(),
+            }),
+        }
+    }
+    if accepted.is_empty() {
+        let first_reason = skipped.first().map_or_else(
+            || "no readable images in batch".to_owned(),
+            |f| f.reason.clone(),
+        );
+        return Err(MediaInspectorError::ImageFailed(first_reason));
+    }
+
+    let active_cols = cols.min(u32::try_from(accepted.len()).unwrap_or(1).max(1));
+    let active_rows = u32::try_from(accepted.len().div_ceil(active_cols as usize)).unwrap_or(1);
+    let sheet_w = active_cols.saturating_mul(tile_px);
+    let sheet_h = active_rows.saturating_mul(tile_px);
+
+    let mut sheet = RgbImage::from_pixel(sheet_w, sheet_h, Rgb([24, 28, 36]));
+    let mut paths = Vec::with_capacity(accepted.len());
+    let mut accepted_input_indices = Vec::with_capacity(accepted.len());
+
+    for (slot_idx, (input_idx, badge_index, canon, rgb_tile)) in accepted.into_iter().enumerate() {
+        let slot_u32 = u32::try_from(slot_idx).unwrap_or(0);
+        let tile_origin_x = (slot_u32 % active_cols).saturating_mul(tile_px);
+        let tile_origin_y = (slot_u32 / active_cols).saturating_mul(tile_px);
+        blit_centered_tile(&mut sheet, &rgb_tile, tile_origin_x, tile_origin_y, tile_px);
+
+        let effective_badge = if renumber_badges_sequentially {
+            slot_idx + 1
+        } else {
+            badge_index
+        };
+        let label = format!("#{effective_badge}");
+        draw_badge_label(&mut sheet, tile_origin_x + 4, tile_origin_y + 4, &label);
+        paths.push(canon.to_string_lossy().into_owned());
+        accepted_input_indices.push(input_idx);
+    }
+
+    let base64_data = encode_rgb_image_to_jpeg_base64(&sheet, quality)?;
+    Ok(ContactSheetSkipResult {
+        sheet: EncodedContactSheet {
+            width: sheet_w,
+            height: sheet_h,
+            mime_type: "image/jpeg".to_owned(),
+            base64_data,
+            tile_count: paths.len(),
+            paths,
+        },
+        accepted_input_indices,
+        skipped,
+    })
+}
+
+fn load_contact_sheet_tile(
+    scope: &AllowedFolderScope,
+    item: &ContactSheetInput,
+    tile_px: u32,
+) -> Result<(PathBuf, RgbImage), MediaInspectorError> {
+    let canon = scope.validate_path(&item.path)?;
+    let oriented = decode_oriented_and_rotated(&canon, item.extra_rotation_deg)?;
+    let thumb = if oriented.width().max(oriented.height()) > tile_px {
+        oriented.thumbnail(tile_px, tile_px)
+    } else {
+        oriented
+    };
+    let rgb_tile = dynamic_image_to_rgb8_white_bg(thumb)?;
+    Ok((canon, rgb_tile))
 }
 
 /// 複数画像を番号バッジ付きコンタクトシート 1 枚へ合成し、JPEG Base64 で返す。
@@ -1383,10 +1519,20 @@ mod tests {
         if let Ok(guard) = guard_res {
             let scope = AllowedFolderScope::from_folders([&guard.0]);
             if cfg!(windows) {
-                assert!(matches!(
-                    scope.validate_path(Path::new(r"\\attacker.invalid\share\probe.jpg")),
-                    Err(MediaInspectorError::AccessDenied(_))
-                ));
+                for blocked in [
+                    r"\\attacker.invalid\share\probe.jpg",
+                    r"\\.\UNC\attacker.invalid\share\probe.jpg",
+                    r"\\?\unc\attacker.invalid\share\probe.jpg",
+                    r"\\?\GLOBALROOT\Device\Mup\probe.jpg",
+                ] {
+                    assert!(
+                        matches!(
+                            scope.validate_path(Path::new(blocked)),
+                            Err(MediaInspectorError::AccessDenied(_))
+                        ),
+                        "expected AccessDenied for {blocked}"
+                    );
+                }
             }
         }
     }

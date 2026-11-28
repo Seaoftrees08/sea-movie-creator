@@ -1,8 +1,8 @@
 //! 動的自己記述ツールレジストリ (`HostToolRegistry`) および軽量 `DraftSandbox` 実行環境。
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use schemars::schema_for;
@@ -14,7 +14,7 @@ use crate::ai::capabilities::{InstalledExtensionSummary, collect_host_capabiliti
 use crate::ai::context_builder::build_timeline_context;
 use crate::ai::media_inspector::{
     AllowedFolderScope, ContactSheetInput, ContactSheetOptions, ThumbnailEncodeOptions,
-    build_contact_sheet_jpeg_base64, encode_thumbnail_jpeg_base64_with_options,
+    build_contact_sheet_jpeg_base64_skipping_errors, encode_thumbnail_jpeg_base64_with_options,
     inspect_media_folder,
 };
 use crate::ai::planner::dry_run_validate_command;
@@ -172,7 +172,7 @@ pub struct ToolExecutionContext<'a> {
     /// 前回 LLM 呼び出し完了時刻への可変参照（`min_llm_interval_ms` 制御用）。
     pub last_llm_call_at: &'a mut Option<Instant>,
     /// 中断・キャンセル要求フラグ（任意）。
-    pub cancelled: Option<&'a AtomicBool>,
+    pub cancelled: Option<&'a Arc<AtomicBool>>,
     /// 進捗通知コールバック。
     pub on_progress: &'a mut dyn FnMut(&str),
     /// ツール内部で行われた LLM 呼び出しのトークン使用量通知コールバック（任意）。
@@ -421,7 +421,7 @@ impl AgentTool for AuditTimelineSlidesTool {
         AgentToolDescriptor {
             name: "audit_timeline_slides".to_owned(),
             category: "vision".to_owned(),
-            description: "タイムライン上の画像スライドと重なっている全字幕を、実画像（現行回転適用済みコンタクトシート＋低信頼時の単体再確認）でクロス監査し、内容不一致と回転補正＋スケール再フィット案を返します。".to_owned(),
+            description: "タイムライン上の画像スライドと重なっている全字幕を、実画像（現行回転適用済みコンタクトシート＋低信頼時の単体再確認）でクロス監査し、内容不一致と回転補正＋スケール再フィット案（および `companion_backdrop_updates` の背景クリップ `RotationDeg`/`ScaleX`/`ScaleY` 更新案）を返します。".to_owned(),
             safety_class: ToolSafetyClass::ReadOnly,
             supports_progress: true,
             input_schema: json!({
@@ -525,25 +525,23 @@ fn build_vision_batch_config<'a>(
     theme_hint: &'a str,
     language: &'a str,
 ) -> VisionBatchConfig<'a> {
-    let packing_mode = settings.vision_packing_mode;
-    let max_edge = settings.vision_max_edge_px.clamp(128, 1024);
-    let jpeg_quality = settings.vision_jpeg_quality.clamp(40, 90);
-    let cols = u32::from(settings.vision_contact_sheet_cols.clamp(1, 4));
-    let rows = u32::from(settings.vision_contact_sheet_rows.clamp(1, 4));
-    let tile_max_edge_px = settings.vision_contact_sheet_tile_px.clamp(192, 512);
+    let s = settings.sanitized();
+    let packing_mode = s.vision_packing_mode;
+    let cols = u32::from(s.vision_contact_sheet_cols);
+    let rows = u32::from(s.vision_contact_sheet_rows);
     let batch_size = match packing_mode {
         VisionPackingMode::ContactSheet => usize::try_from(cols * rows).unwrap_or(6).max(1),
-        VisionPackingMode::Individual => settings.vision_batch_size.clamp(1, 12),
+        VisionPackingMode::Individual => s.vision_batch_size,
     };
     VisionBatchConfig {
         packing_mode,
-        max_edge,
-        jpeg_quality,
+        max_edge: s.vision_max_edge_px,
+        jpeg_quality: s.vision_jpeg_quality,
         sheet_opts: ContactSheetOptions {
             cols,
             rows,
-            tile_max_edge_px,
-            jpeg_quality,
+            tile_max_edge_px: s.vision_contact_sheet_tile_px,
+            jpeg_quality: s.vision_jpeg_quality,
         },
         batch_size,
         theme_hint,
@@ -590,11 +588,15 @@ fn execute_vision_batches(
         }
 
         let (outcome, batch_usage) = match cfg.packing_mode {
-            VisionPackingMode::ContactSheet => {
-                run_single_contact_sheet_vision_batch(provider, ctx.folder_scope, chunk, &cfg)
-            }
+            VisionPackingMode::ContactSheet => run_single_contact_sheet_vision_batch(
+                provider,
+                ctx.folder_scope,
+                chunk,
+                &cfg,
+                ctx.cancelled,
+            ),
             VisionPackingMode::Individual => {
-                run_single_vision_batch(provider, ctx.folder_scope, chunk, &cfg)
+                run_single_vision_batch(provider, ctx.folder_scope, chunk, &cfg, ctx.cancelled)
             }
         };
         if let (Some(cb), Some(usage)) = (ctx.on_usage.as_deref_mut(), batch_usage) {
@@ -617,7 +619,9 @@ fn execute_vision_batches(
                 break;
             }
             VisionBatchOutcome::Failed { code, message } => {
-                if !all_analyses.is_empty() || matches!(code, "rate_limited" | "forbidden") {
+                if !all_analyses.is_empty()
+                    || matches!(code, "rate_limited" | "forbidden" | "cancelled")
+                {
                     return Ok(partial_vision_json(
                         &all_analyses,
                         used_vision_ok && !all_analyses.is_empty(),
@@ -705,6 +709,7 @@ fn is_vision_unsupported_text(text: &str) -> bool {
 pub(crate) fn classify_vision_api_error(err: &AiError) -> (&'static str, bool, String) {
     let msg = err.to_string();
     match err {
+        AiError::Cancelled => ("cancelled", false, msg),
         AiError::HttpStatus { status: 429, .. } => ("rate_limited", false, msg),
         AiError::HttpStatus { status: 403, .. } => ("forbidden", false, msg),
         AiError::HttpStatus {
@@ -761,60 +766,55 @@ fn run_single_contact_sheet_vision_batch(
     scope: &AllowedFolderScope,
     paths: &[String],
     cfg: &VisionBatchConfig<'_>,
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
-    let mut inputs = Vec::with_capacity(paths.len());
-    let mut manifest_lines = Vec::with_capacity(paths.len());
-    let mut failed_items = Vec::new();
-    let mut first_err: Option<String> = None;
-    let probe_opts = ThumbnailEncodeOptions {
-        max_edge_px: cfg.sheet_opts.tile_max_edge_px,
-        jpeg_quality: cfg.sheet_opts.jpeg_quality,
-        extra_rotation_deg: 0,
-    };
-
-    for p in paths {
-        let path_buf = std::path::PathBuf::from(p);
-        if let Err(err) = encode_thumbnail_jpeg_base64_with_options(scope, &path_buf, probe_opts) {
-            if first_err.is_none() {
-                first_err = Some(err.to_string());
-            }
-            failed_items.push(build_failed_vision_item(p, &err));
-            continue;
-        }
-        let idx = inputs.len();
-        let badge = idx + 1;
-        let fname = path_buf
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("photo");
-        manifest_lines.push(format!("[index={idx}, badge=#{badge}] file={fname}"));
-        inputs.push(ContactSheetInput {
-            path: path_buf,
-            badge_index: badge,
+    let inputs: Vec<ContactSheetInput> = paths
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| ContactSheetInput {
+            path: std::path::PathBuf::from(p),
+            badge_index: idx + 1,
             extra_rotation_deg: 0,
-        });
-    }
-    if inputs.is_empty() {
-        return (
-            VisionBatchOutcome::Failed {
-                code: "media_error",
-                message: first_err.unwrap_or_else(|| "no readable images in batch".to_owned()),
-            },
-            None,
-        );
-    }
-    let sheet = match build_contact_sheet_jpeg_base64(scope, &inputs, cfg.sheet_opts) {
-        Ok(s) => s,
-        Err(err) => {
-            return (
-                VisionBatchOutcome::Failed {
-                    code: "media_error",
-                    message: err.to_string(),
-                },
-                None,
-            );
-        }
-    };
+        })
+        .collect();
+    let res =
+        match build_contact_sheet_jpeg_base64_skipping_errors(scope, &inputs, cfg.sheet_opts, true)
+        {
+            Ok(r) => r,
+            Err(err) => {
+                return (
+                    VisionBatchOutcome::Failed {
+                        code: "media_error",
+                        message: err.to_string(),
+                    },
+                    None,
+                );
+            }
+        };
+    let failed_items: Vec<Value> = res
+        .skipped
+        .iter()
+        .filter_map(|f| {
+            paths
+                .get(f.input_index)
+                .map(|p| build_failed_vision_item(p, &f.reason))
+        })
+        .collect();
+    let manifest_lines: Vec<String> = res
+        .accepted_input_indices
+        .iter()
+        .enumerate()
+        .map(|(idx, &orig_idx)| {
+            let badge = idx + 1;
+            let fname = paths
+                .get(orig_idx)
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("photo");
+            format!("[index={idx}, badge=#{badge}] file={fname}")
+        })
+        .collect();
+    let sheet = res.sheet;
     let lang_desc = describe_target_language(cfg.language);
     let prompt = format!(
         "Analyze every tile in the attached contact sheet for the video theme: \"{}\".\n\
@@ -833,7 +833,7 @@ fn run_single_contact_sheet_vision_batch(
             base64_data: sheet.base64_data,
         },
     ];
-    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &sheet.paths);
+    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &sheet.paths, cancelled);
     (merge_failed_vision_items(outcome, failed_items), usage)
 }
 
@@ -842,6 +842,7 @@ fn run_single_vision_batch(
     scope: &AllowedFolderScope,
     paths: &[String],
     cfg: &VisionBatchConfig<'_>,
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let mut parts = Vec::new();
     let mut manifest_lines = Vec::new();
@@ -902,7 +903,7 @@ fn run_single_vision_batch(
         manifest_lines.join("\n")
     );
     parts.insert(0, AiContentPart::text(prompt_head));
-    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &valid_paths);
+    let (outcome, usage) = execute_vision_analysis_turn(provider, parts, &valid_paths, cancelled);
     (merge_failed_vision_items(outcome, failed_items), usage)
 }
 
@@ -910,6 +911,7 @@ fn execute_vision_analysis_turn(
     provider: &dyn AiProvider,
     parts: Vec<AiContentPart>,
     valid_paths: &[String],
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> (VisionBatchOutcome, Option<AiTokenUsage>) {
     let req = AiAgentTurnRequest {
         system_prompt:
@@ -927,7 +929,7 @@ fn execute_vision_analysis_turn(
         temperature: Some(0.2),
     };
 
-    let resp = match provider.send_agent_turn(&req, &mut |_| {}) {
+    let resp = match provider.send_agent_turn_cancellable(&req, cancelled, &mut |_| {}) {
         Ok(r) => r,
         Err(err) => {
             let (code, is_unsupported, message) = classify_vision_api_error(&err);
@@ -963,43 +965,70 @@ fn parse_vision_analyses_json(raw: &str, valid_paths: &[String]) -> Option<Vec<V
     }
     // コンタクトシートの黄色バッジ `#1..#N` につられて LLM が 1-based で返した場合を自動吸収する
     let has_zero_index = arr.iter().any(|item| item["index"].as_u64() == Some(0));
-    let one_based_hint =
-        !has_zero_index && arr.iter().any(|item| item["index"].as_u64() == Some(1));
+    let max_one_based = u64::try_from(valid_paths.len()).unwrap_or(u64::MAX);
+    let one_based_hint = !has_zero_index
+        && arr.iter().any(|item| {
+            item["index"]
+                .as_u64()
+                .is_some_and(|n| (1..=max_one_based).contains(&n))
+        });
     let mut used = vec![false; arr.len()];
-    let mut out = Vec::with_capacity(valid_paths.len());
+    let mut resolved: Vec<Option<usize>> = vec![None; valid_paths.len()];
     let mut matched_count = 0_usize;
 
-    for (idx, default_path) in valid_paths.iter().enumerate() {
+    // 1 巡目: 明示的な index が一致する要素のみを先に割り当てる（後続要素のインデックス横取りを防止）
+    for (idx, item_slot) in resolved.iter_mut().enumerate() {
         let expected_index = if one_based_hint {
             u64::try_from(idx + 1).ok()
         } else {
             u64::try_from(idx).ok()
         };
-        let pos = expected_index
-            .and_then(|target| {
-                arr.iter()
-                    .enumerate()
-                    .position(|(i, item)| !used[i] && item["index"].as_u64() == Some(target))
+        if let Some(target) = expected_index
+            && let Some(arr_idx) = arr.iter().enumerate().position(|(i, item)| {
+                !used[i] && item.is_object() && item["index"].as_u64() == Some(target)
             })
-            .or_else(|| (!used.get(idx).copied().unwrap_or(true)).then_some(idx));
-
-        if let Some(arr_idx) = pos
-            && let Some(item_map) = arr.get(arr_idx).and_then(Value::as_object)
         {
             used[arr_idx] = true;
+            *item_slot = Some(arr_idx);
             matched_count += 1;
-            let mut obj_map = item_map.clone();
-            // LLM がハルシネーションやインジェクションで別パスを返しても正規実パスで上書きする
-            obj_map.insert("path".to_owned(), Value::String(default_path.clone()));
-            obj_map.insert(
-                "index".to_owned(),
-                Value::Number(serde_json::Number::from(idx)),
-            );
-            out.push(Value::Object(obj_map));
-        } else {
-            out.push(build_filename_fallback_analysis(default_path));
         }
     }
+
+    // 2 巡目: index を欠落した要素のみ、未割当の同一順序スロットへフォールバックする
+    for (idx, item_slot) in resolved.iter_mut().enumerate() {
+        if item_slot.is_some() {
+            continue;
+        }
+        let unindexed = arr
+            .get(idx)
+            .is_some_and(|item| item.is_object() && item.get("index").is_none_or(Value::is_null));
+        if unindexed && !used.get(idx).copied().unwrap_or(true) {
+            used[idx] = true;
+            *item_slot = Some(idx);
+            matched_count += 1;
+        }
+    }
+
+    let out = valid_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, default_path)| {
+            if let Some(arr_idx) = resolved[idx]
+                && let Some(item_map) = arr.get(arr_idx).and_then(Value::as_object)
+            {
+                let mut obj_map = item_map.clone();
+                // LLM がハルシネーションやインジェクションで別パスを返しても正規実パスで上書きする
+                obj_map.insert("path".to_owned(), Value::String(default_path.clone()));
+                obj_map.insert(
+                    "index".to_owned(),
+                    Value::Number(serde_json::Number::from(idx)),
+                );
+                Value::Object(obj_map)
+            } else {
+                build_filename_fallback_analysis(default_path)
+            }
+        })
+        .collect();
     (matched_count > 0).then_some(out)
 }
 
@@ -1483,6 +1512,18 @@ mod tests {
         assert_eq!(parsed_3[1]["suggested_subtitle"], "海辺の夕暮れ");
         assert_eq!(parsed_3[2]["suggested_subtitle"], "笑顔の記念写真");
         assert_eq!(parsed_3[1]["path"], "D:/p/02.jpg");
+
+        // 1-based 部分欠落応答（index=1 が抜けて index=2 から始まる）でも後続要素を slot 0 へ横取りしないこと
+        let partial_one_based = r#"{"analyses":[
+            {"index":2,"suggested_subtitle":"海辺の夕暮れ"},
+            {"index":3,"suggested_subtitle":"笑顔の記念写真"}
+        ]}"#;
+        let parsed_partial = parse_vision_analyses_json(partial_one_based, &paths_3)
+            .ok_or("partial 1-based analyses parse failed")?;
+        assert_eq!(parsed_partial[0]["path"], "D:/p/01.jpg");
+        assert_ne!(parsed_partial[0]["suggested_subtitle"], "海辺の夕暮れ");
+        assert_eq!(parsed_partial[1]["suggested_subtitle"], "海辺の夕暮れ");
+        assert_eq!(parsed_partial[2]["suggested_subtitle"], "笑顔の記念写真");
 
         // 無関係なパラメータエラーを vision_unsupported へ誤分類しないこと
         assert!(!is_vision_unsupported_text(

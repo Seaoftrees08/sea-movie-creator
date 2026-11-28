@@ -487,15 +487,22 @@ fn decode_oriented_from_reader<R: std::io::BufRead + std::io::Seek>(
     let mut decoder = reader
         .into_decoder()
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    // Orientation 取得は形式未対応の場合も NoTransforms として安全に続行する
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // ImageReader::into_decoder() は max_alloc に対する reserve を行わないため手動検証する
     effective_limits
         .reserve(decoder.total_bytes())
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    // 90°/270° 回転を伴う場合は apply_orientation が追加の一時バッファを確保するため 2 面分を検査する
+    if orientation_swaps_dimensions(orientation) {
+        effective_limits
+            .clone()
+            .reserve(decoder.total_bytes())
+            .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
+    }
     decoder
         .set_limits(effective_limits)
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
-    // Orientation 取得は形式未対応の場合も NoTransforms として安全に続行する
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder)
         .map_err(|err| MediaError::ImageDecode(err.to_string()))?;
     image.apply_orientation(orientation);

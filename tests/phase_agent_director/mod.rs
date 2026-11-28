@@ -1006,3 +1006,85 @@ fn director_stops_safely_on_audit_vision_unsupported() -> Result<(), Box<dyn std
     runner2.shutdown();
     Ok(())
 }
+
+#[test]
+fn director_stops_safely_when_provider_lacks_vision_capability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let guard = TempDirGuard::new("audit_static_no_vision")?;
+    let img_path = guard.0.join("sample.png");
+    write_test_png(&img_path, 320, 240)?;
+    let doc_static = build_audit_stop_doc(&img_path)?;
+
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let static_counter = Arc::new(AtomicUsize::new(0));
+    let static_counter_clone = Arc::clone(&static_counter);
+    let provider_static_no_vision = Arc::new(
+        MockAiProvider::with_agent_handler(move |_req| {
+            let idx = static_counter_clone.fetch_add(1, Ordering::AcqRel);
+            if idx == 0 {
+                Ok(AiAgentTurnResponse {
+                    text: None,
+                    thinking_blocks: Vec::new(),
+                    tool_calls: vec![AiToolCall {
+                        id: "audit_static_1".to_owned(),
+                        name: "audit_timeline_slides".to_owned(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }],
+                    model: "mock-no-vision".to_owned(),
+                    finish_reason: Some("tool_calls".to_owned()),
+                    usage: None,
+                })
+            } else {
+                Ok(AiAgentTurnResponse {
+                    text: Some("画像非対応のため安全停止しました。".to_owned()),
+                    thinking_blocks: Vec::new(),
+                    tool_calls: Vec::new(),
+                    model: "mock-no-vision".to_owned(),
+                    finish_reason: Some("stop".to_owned()),
+                    usage: None,
+                })
+            }
+        })
+        .with_capabilities(false, true),
+    );
+    let runner3 = AgentSessionRunner::start(AgentSessionStartConfig {
+        plugin: director,
+        session_id: "sess_audit_static_no_vision".to_owned(),
+        goal: "写真の向きを直して".to_owned(),
+        resume: false,
+        attached_folders: Vec::new(),
+        attached_clips: Vec::new(),
+        base_document: doc_static,
+        timeline_summary: "{}".to_owned(),
+        agent_memory: json!({}),
+        provider: provider_static_no_vision,
+        provider_kind: AiProviderKind::Mock,
+        model_name: "mock-no-vision".to_owned(),
+        thinking_level: AiThinkingLevel::Auto,
+        approval_mode: AiApprovalMode::Autopilot,
+        runtime_settings: AgentRuntimeSettings::default(),
+        tool_registry: None,
+        extra_extensions: Vec::new(),
+        project_dir: None,
+    })?;
+    let summary3 = recv_runner_until(&runner3, Duration::from_secs(10), |ev| {
+        if let AgentHostEvent::Proposal {
+            summary_markdown, ..
+        } = ev
+        {
+            Some(summary_markdown.clone())
+        } else {
+            None
+        }
+    })?;
+    assert_eq!(static_counter.load(Ordering::Acquire), 2);
+    assert!(!summary3.contains("タイムラインへの変更は行われませんでした"));
+    runner3.shutdown();
+    Ok(())
+}

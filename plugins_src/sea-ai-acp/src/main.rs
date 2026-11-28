@@ -500,6 +500,7 @@ fn run_acp_session(params: &CallParams) -> Result<(), PluginRunError> {
 
     let conv_res = execute_acp_session_io(&mut reader, &mut child_stdin, params, &mut streamed);
     drop(child_stdin);
+    drop(reader);
 
     if conv_res.is_err() {
         guard.kill_and_wait();

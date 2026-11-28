@@ -764,7 +764,9 @@ fn read_runtime_file(path: &Path) -> Option<AgentRuntimeSettings> {
         return None;
     }
     let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<AgentRuntimeSettings>(&raw).ok()
+    serde_json::from_str::<AgentRuntimeSettings>(&raw)
+        .ok()
+        .map(|s| s.sanitized())
 }
 
 fn atomic_write_text(path: &Path, text: &str) -> Result<(), std::io::Error> {

@@ -2,13 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
 use crate::ai::context_builder::{TimelineSlidePairSummary, build_timeline_slide_pairs};
 use crate::ai::media_inspector::{
     ContactSheetInput, ContactSheetOptions, ThumbnailEncodeOptions,
-    build_contact_sheet_jpeg_base64, encode_thumbnail_jpeg_base64_with_options,
+    build_contact_sheet_jpeg_base64_skipping_errors, encode_thumbnail_jpeg_base64_with_options,
 };
 use crate::ai::provider::{
     AiAgentTurnRequest, AiContentPart, AiProvider, AiTokenUsage, AiTurnMessage, VisionPackingMode,
@@ -175,7 +177,7 @@ pub fn execute_audit_timeline_slides(
 ) -> Result<Value, String> {
     let Some(provider) = ctx.llm_provider.filter(|p| p.supports_vision()) else {
         return Err(
-            "audit_timeline_slides requires a Vision-capable provider (cannot verify slide visuals or orientation without Vision)"
+            "vision_unsupported: audit_timeline_slides requires a Vision-capable provider (cannot verify slide visuals or orientation without Vision)"
                 .to_owned(),
         );
     };
@@ -242,11 +244,21 @@ type AuditTurnOutput = (Result<Vec<ParsedAuditItem>, String>, Option<AiTokenUsag
 fn parse_slide_indices_arg(args: &Value) -> Result<Option<Vec<usize>>, String> {
     match args.get("slide_indices") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(arr)) => Ok(Some(
-            arr.iter()
-                .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
-                .collect(),
-        )),
+        Some(Value::Array(arr)) => {
+            let mut indices = Vec::with_capacity(arr.len());
+            for v in arr {
+                let n = v
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n >= 1)
+                    .ok_or_else(|| {
+                        "audit_timeline_slides: `slide_indices` items must be integers >= 1"
+                            .to_owned()
+                    })?;
+                indices.push(n);
+            }
+            Ok(Some(indices))
+        }
         Some(_) => Err("audit_timeline_slides: `slide_indices` must be an array".to_owned()),
     }
 }
@@ -288,21 +300,19 @@ fn build_audit_pass_config<'a>(
     args: &'a Value,
     ctx: &ToolExecutionContext<'_>,
 ) -> AuditPassConfig<'a> {
+    let s = ctx.runtime_settings.sanitized();
     AuditPassConfig {
         check_subtitles: args["check_subtitle_mismatch"].as_bool().unwrap_or(true),
         check_orientation: args["check_orientation"].as_bool().unwrap_or(true),
         focus_hint: args["focus_hint"].as_str(),
-        packing_mode: ctx.runtime_settings.vision_packing_mode,
-        individual_max_edge_px: ctx.runtime_settings.vision_max_edge_px.clamp(64, 2048),
-        individual_batch_size: ctx.runtime_settings.vision_batch_size.clamp(1, 12),
+        packing_mode: s.vision_packing_mode,
+        individual_max_edge_px: s.vision_max_edge_px,
+        individual_batch_size: s.vision_batch_size,
         sheet_opts: ContactSheetOptions {
-            cols: u32::from(ctx.runtime_settings.vision_contact_sheet_cols.clamp(1, 4)),
-            rows: u32::from(ctx.runtime_settings.vision_contact_sheet_rows.clamp(1, 4)),
-            tile_max_edge_px: ctx
-                .runtime_settings
-                .vision_contact_sheet_tile_px
-                .clamp(192, 512),
-            jpeg_quality: ctx.runtime_settings.vision_jpeg_quality.clamp(40, 90),
+            cols: u32::from(s.vision_contact_sheet_cols),
+            rows: u32::from(s.vision_contact_sheet_rows),
+            tile_max_edge_px: s.vision_contact_sheet_tile_px,
+            jpeg_quality: s.vision_jpeg_quality,
         },
     }
 }
@@ -346,44 +356,59 @@ fn run_first_pass_contact_sheets(
         ));
         ctx.throttle_before_llm_call()?;
 
-        // 破損・巨大画像 1 枚で他スライドの監査まで全停止しないよう、事前に個別エンコード検証して隔離する
-        let mut valid_chunk = Vec::new();
-        let mut inputs = Vec::new();
-        for slide in chunk {
-            let candidate = [ContactSheetInput {
+        // 破損・巨大画像 1 枚で他スライドの監査まで全停止しないよう、単一パスでデコード＆個別隔離する
+        let inputs: Vec<ContactSheetInput> = chunk
+            .iter()
+            .map(|slide| ContactSheetInput {
                 path: slide.asset_path.clone(),
                 badge_index: slide.pair.slide_index,
                 extra_rotation_deg: slide.pre_rotation_deg.unwrap_or(0),
-            }];
-            let probe = ThumbnailEncodeOptions {
-                max_edge_px: cfg.sheet_opts.tile_max_edge_px,
-                jpeg_quality: cfg.sheet_opts.jpeg_quality,
-                extra_rotation_deg: slide.pre_rotation_deg.unwrap_or(0),
-            };
-            if let Err(err) = encode_thumbnail_jpeg_base64_with_options(
-                ctx.folder_scope,
-                &slide.asset_path,
-                probe,
-            ) {
+            })
+            .collect();
+        let res = match build_contact_sheet_jpeg_base64_skipping_errors(
+            ctx.folder_scope,
+            &inputs,
+            cfg.sheet_opts,
+            false,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                // チャンク内の全スライドがデコード不可でも後続チャンクは継続できるよう記録して進む
+                for slide in chunk {
+                    acc.skipped_slides.push(json!({
+                        "slide_index": slide.pair.slide_index,
+                        "image_clip_id": slide.pair.image_clip_id,
+                        "reason": format!("image_decode_failed: {err}"),
+                    }));
+                }
+                continue;
+            }
+        };
+        for failure in &res.skipped {
+            if let Some(slide) = chunk.get(failure.input_index) {
                 acc.skipped_slides.push(json!({
                     "slide_index": slide.pair.slide_index,
                     "image_clip_id": slide.pair.image_clip_id,
-                    "reason": format!("image_decode_failed: {err}"),
+                    "reason": format!("image_decode_failed: {}", failure.reason),
                 }));
-                continue;
             }
-            valid_chunk.push(PreparedSlide {
-                pair: slide.pair,
-                asset_path: slide.asset_path.clone(),
-                pre_rotation_deg: slide.pre_rotation_deg,
-            });
-            inputs.extend(candidate);
         }
+        let valid_chunk: Vec<PreparedSlide<'_>> = res
+            .accepted_input_indices
+            .iter()
+            .filter_map(|&idx| {
+                chunk.get(idx).map(|slide| PreparedSlide {
+                    pair: slide.pair,
+                    asset_path: slide.asset_path.clone(),
+                    pre_rotation_deg: slide.pre_rotation_deg,
+                })
+            })
+            .collect();
         if valid_chunk.is_empty() {
             continue;
         }
-        let sheet = build_contact_sheet_jpeg_base64(ctx.folder_scope, &inputs, cfg.sheet_opts)
-            .map_err(|e| e.to_string())?;
+        let expected_indices: Vec<usize> = valid_chunk.iter().map(|s| s.pair.slide_index).collect();
+        let sheet = res.sheet;
         let prompt = build_contact_sheet_audit_prompt(&valid_chunk, cfg);
         let req = build_vision_audit_turn_request(
             prompt,
@@ -392,7 +417,7 @@ fn run_first_pass_contact_sheets(
                 base64_data: sheet.base64_data,
             }],
         );
-        collect_audit_turn_into_map(provider, &req, ctx, acc)?;
+        collect_audit_turn_into_map(provider, &req, &expected_indices, ctx, acc)?;
     }
     Ok(())
 }
@@ -456,9 +481,10 @@ fn run_first_pass_individual(
         if valid_chunk.is_empty() {
             continue;
         }
+        let expected_indices: Vec<usize> = valid_chunk.iter().map(|s| s.pair.slide_index).collect();
         let prompt = build_contact_sheet_audit_prompt(&valid_chunk, cfg);
         let req = build_vision_audit_turn_request(prompt, image_parts);
-        collect_audit_turn_into_map(provider, &req, ctx, acc)?;
+        collect_audit_turn_into_map(provider, &req, &expected_indices, ctx, acc)?;
     }
     Ok(())
 }
@@ -466,17 +492,25 @@ fn run_first_pass_individual(
 fn collect_audit_turn_into_map(
     provider: &dyn AiProvider,
     req: &AiAgentTurnRequest,
+    expected_indices: &[usize],
     ctx: &mut ToolExecutionContext<'_>,
     acc: &mut AuditRunState,
 ) -> Result<(), String> {
-    let (parsed_res, usage) = execute_audit_llm_turn(provider, req)?;
+    let (parsed_res, usage) = execute_audit_llm_turn(provider, req, ctx.cancelled)?;
     if let (Some(cb), Some(u)) = (ctx.on_usage.as_deref_mut(), usage) {
         cb(u);
     }
     match parsed_res {
         Ok(items) => {
             for item in items {
-                acc.parsed_by_slide.insert(item.slide_index, item);
+                if expected_indices.contains(&item.slide_index) {
+                    acc.parsed_by_slide.insert(item.slide_index, item);
+                } else {
+                    acc.parse_warnings.push(format!(
+                        "ignored unexpected slide_index {} outside batch {:?}",
+                        item.slide_index, expected_indices
+                    ));
+                }
             }
         }
         Err(warn) => acc.parse_warnings.push(warn),
@@ -548,7 +582,7 @@ fn run_second_pass_refinements(
                 base64_data: thumb.base64_data,
             }],
         );
-        match execute_audit_llm_turn(provider, &req) {
+        match execute_audit_llm_turn(provider, &req, ctx.cancelled) {
             Ok((parsed_res, usage)) => {
                 if let (Some(cb), Some(u)) = (ctx.on_usage.as_deref_mut(), usage) {
                     cb(u);
@@ -585,15 +619,22 @@ fn run_second_pass_refinements(
 fn execute_audit_llm_turn(
     provider: &dyn AiProvider,
     req: &AiAgentTurnRequest,
+    cancelled: Option<&Arc<AtomicBool>>,
 ) -> Result<AuditTurnOutput, String> {
-    let resp = provider.send_agent_turn(req, &mut |_| {}).map_err(|err| {
-        let (_code, is_unsupported, msg) = classify_vision_api_error(&err);
-        if is_unsupported {
-            format!("audit_timeline_slides aborted (provider does not support Vision): {msg}")
-        } else {
-            msg
-        }
-    })?;
+    let resp = provider
+        .send_agent_turn_cancellable(req, cancelled, &mut |_| {})
+        .map_err(|err| {
+            let (code, is_unsupported, msg) = classify_vision_api_error(&err);
+            if is_unsupported {
+                format!(
+                    "vision_unsupported: audit_timeline_slides aborted (provider does not support Vision): {msg}"
+                )
+            } else if code == "cancelled" {
+                format!("cancelled: {msg}")
+            } else {
+                msg
+            }
+        })?;
     let in_chars = req.estimated_input_chars();
     let out_chars = resp.estimated_output_chars();
     let usage = resp
@@ -766,6 +807,7 @@ fn build_contact_sheet_audit_prompt(
     } else {
         "Inspect each attached individual image matching `slide_index=N` below."
     };
+    let sample_slide_index = chunk.first().map_or(1, |s| s.pair.slide_index);
     format!(
         "{intro}\n\
          Important: each image already reflects the current timeline orthogonal rotation.{focus_line}\n\
@@ -778,7 +820,7 @@ fn build_contact_sheet_audit_prompt(
          Set `rotation_confidence` to `\"high\"`, `\"medium\"`, or `\"low\"`.\n\
          If any overlapping subtitle contradicts the visible scene, set `subtitle_matches_image=false`, explain in `subtitle_mismatch_reason`, and propose a natural Japanese `recommended_subtitle` (12-26 chars).\n\
          Return ONLY valid JSON:\n\
-         {{\"audits\":[{{\"slide_index\":1,\"visual_summary\":\"...\",\"subtitle_matches_image\":true,\"subtitle_mismatch_reason\":null,\"recommended_subtitle\":null,\"needs_rotation_deg\":0,\"rotation_confidence\":\"high\"}}]}}\n\
+         {{\"audits\":[{{\"slide_index\":{sample_slide_index},\"visual_summary\":\"...\",\"subtitle_matches_image\":true,\"subtitle_mismatch_reason\":null,\"recommended_subtitle\":null,\"needs_rotation_deg\":0,\"rotation_confidence\":\"high\"}}]}}\n\
          Slides:\n{}",
         cfg.check_subtitles,
         cfg.check_orientation,
@@ -878,13 +920,8 @@ fn build_final_audit_records(
                 use_cover_scale: pair.is_cover_scaled,
             },
         );
-        let backdrop_updates = build_backdrop_scale_updates(
-            doc,
-            pair,
-            slide.pre_rotation_deg,
-            needs_rotation_deg,
-            (canvas_w, canvas_h),
-        );
+        let backdrop_updates =
+            build_backdrop_scale_updates(doc, pair, needs_rotation_deg, (canvas_w, canvas_h));
         let subtitle_matches = if cfg.check_subtitles {
             parsed.subtitle_matches_image
         } else {
@@ -932,33 +969,41 @@ fn build_final_audit_records(
 fn build_backdrop_scale_updates(
     doc: &ProjectDocument,
     pair: &TimelineSlidePairSummary,
-    pre_rotation_deg: Option<i32>,
     needs_rotation_deg: i32,
     canvas_size: (f64, f64),
 ) -> Vec<Value> {
-    if needs_rotation_deg.abs() != 90 || pair.companion_backdrop_clip_ids.is_empty() {
+    if needs_rotation_deg == 0 || pair.companion_backdrop_clip_ids.is_empty() {
         return Vec::new();
     }
     pair.companion_backdrop_clip_ids
         .iter()
         .filter_map(|clip_id| {
+            let visual = find_clip_visual(doc, None, clip_id)?;
+            let AnimatedParameter::Constant { value: bd_rot_deg } = visual.rotation_deg else {
+                return None;
+            };
+            let bd_pre_rot = orthogonal_pre_rotation_deg(bd_rot_deg)?;
+            let bd_rec_rot = normalize_signed_deg(bd_rot_deg + f64::from(needs_rotation_deg));
             let (sx, sy) = compute_recommended_scales(
                 doc,
                 &ScaleRefInput {
                     clip_id,
                     layer_id: None,
                     asset_dimensions: pair.asset_dimensions,
-                    pre_rotation_deg,
+                    pre_rotation_deg: Some(bd_pre_rot),
                     needs_rotation_deg,
                     canvas_size,
                     use_cover_scale: true,
                 },
             );
-            Some(json!({
-                "clip_id": clip_id,
-                "recommended_scale_x_param": sx?,
-                "recommended_scale_y_param": sy?,
-            }))
+            let mut obj = serde_json::Map::new();
+            obj.insert("clip_id".to_owned(), Value::String(clip_id.clone()));
+            obj.insert("recommended_rotation_deg".to_owned(), json!(bd_rec_rot));
+            if let (Some(rec_sx), Some(rec_sy)) = (sx, sy) {
+                obj.insert("recommended_scale_x_param".to_owned(), rec_sx);
+                obj.insert("recommended_scale_y_param".to_owned(), rec_sy);
+            }
+            Some(Value::Object(obj))
         })
         .collect()
 }
@@ -1464,6 +1509,107 @@ mod tests {
         assert_eq!(audits[0]["needs_rotation_deg"], 0);
         let skipped = out["skipped_slides"].as_array().ok_or("skipped array")?;
         assert_eq!(skipped.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn slide_indices_backdrop_and_out_of_batch_guards_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let guard = TempDirGuard::create("backdrop_out_of_batch")?;
+        let p1 = guard.0.join("a.jpg");
+        let p2 = guard.0.join("b.jpg");
+        write_sample_jpg(&p1, 400, 300)?;
+        write_sample_jpg(&p2, 400, 300)?;
+        let scope = AllowedFolderScope::from_folders([&guard.0]);
+
+        // slide_indices バリデーション: 0 以下や非整数を拒否すること
+        assert!(parse_slide_indices_arg(&json!({ "slide_indices": [0] })).is_err());
+        assert!(parse_slide_indices_arg(&json!({ "slide_indices": ["1"] })).is_err());
+        assert!(parse_slide_indices_arg(&json!({ "slide_indices": [1, 3] }))?.is_some());
+
+        // バッチ範囲外 slide_index の無視（parse_warnings 記録）＋ backdrop 90°/180° 更新案検証
+        let mut bd_doc = build_audit_test_doc(&p1, &p2, &p1)?;
+        let mut bd_layer = Layer::new(LayerId::new("L_BG")?, "Backdrop");
+        bd_layer.clips.push(Clip {
+            id: ClipId::new("BG1")?,
+            name: "Backdrop 1".to_owned(),
+            timeline_start: FrameIndex::ZERO,
+            duration: FrameCount::new(120)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: AssetId::new("a1")?,
+                visual: VisualProperties {
+                    rotation_deg: AnimatedParameter::constant(0.0),
+                    scale_x: AnimatedParameter::constant(cover_scale_for_dims(
+                        1920.0, 1080.0, 400, 300,
+                    )),
+                    scale_y: AnimatedParameter::constant(cover_scale_for_dims(
+                        1920.0, 1080.0, 400, 300,
+                    )),
+                    ..VisualProperties::default()
+                },
+            },
+        });
+        bd_doc.layers.insert(0, bd_layer);
+        let bd_pairs = build_timeline_slide_pairs(&bd_doc, None);
+        let updates_90 = build_backdrop_scale_updates(&bd_doc, &bd_pairs[0], 90, (1920.0, 1080.0));
+        assert_eq!(updates_90.len(), 1);
+        assert_eq!(updates_90[0]["recommended_rotation_deg"], 90.0);
+        let rec_bd_sx: AnimatedParameter =
+            serde_json::from_value(updates_90[0]["recommended_scale_x_param"].clone())?;
+        assert!(matches!(rec_bd_sx, AnimatedParameter::Constant { .. }));
+        let updates_180 =
+            build_backdrop_scale_updates(&bd_doc, &bd_pairs[0], 180, (1920.0, 1080.0));
+        assert_eq!(updates_180.len(), 1);
+        assert_eq!(updates_180[0]["recommended_rotation_deg"], 180.0);
+        assert!(updates_180[0].get("recommended_scale_x_param").is_none());
+
+        // バッチ外 slide_index を含む応答でも無視され parse_warnings が記録されること
+        let out_of_batch_resp = AiAgentTurnResponse {
+            text: Some(
+                json!({
+                    "audits": [{
+                        "slide_index": 999,
+                        "visual_summary": "不正インデックス",
+                        "subtitle_matches_image": true,
+                        "needs_rotation_deg": 0,
+                        "rotation_confidence": "high"
+                    }]
+                })
+                .to_string(),
+            ),
+            thinking_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            model: "mock-vision".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            usage: None,
+        };
+        let mut bd_sandbox = DraftSandbox::new(bd_doc);
+        let bd_settings = AgentRuntimeSettings::default();
+        let bd_provider = MockAiProvider::with_agent_turns([out_of_batch_resp]);
+        let mut bd_last = None;
+        let mut bd_prog = |_: &str| {};
+        let mut bd_ctx = ToolExecutionContext {
+            folder_scope: &scope,
+            sandbox: &mut bd_sandbox,
+            llm_provider: Some(&bd_provider),
+            runtime_settings: &bd_settings,
+            last_llm_call_at: &mut bd_last,
+            cancelled: None,
+            on_progress: &mut bd_prog,
+            on_usage: None,
+            extra_extensions: Vec::new(),
+            project_dir: None,
+        };
+        let bd_out = execute_audit_timeline_slides(&json!({ "slide_indices": [1] }), &mut bd_ctx)?;
+        assert_eq!(bd_out["audited_count"], 0);
+        let warnings = bd_out["parse_warnings"]
+            .as_array()
+            .ok_or("parse_warnings")?;
+        assert_ne!(warnings.len(), 0);
+
         Ok(())
     }
 }
