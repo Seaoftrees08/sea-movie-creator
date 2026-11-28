@@ -2,12 +2,12 @@
 
 - **ステータス**: Draft
 - **作成日**: 2026-11-25
-- **更新日**: 2026-11-25
+- **更新日**: 2026-11-28
 - **関連ドキュメント**:
   - 自律エージェントプラグイン基盤＆構成コンパイラ設計書（完了済み）: [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md)
   - 外部プラグイン向け SDK・プロトコル互換性ポリシー: [`011-plugin-protocol-compatibility-policy.md`](011-plugin-protocol-compatibility-policy.md)
   - AI プラグイン・MCP 利用ガイド: [`../docs/plugins/ai-and-mcp.md`](../docs/plugins/ai-and-mcp.md)
-  - 関連先行設計（別 PR にて実装済み）: `015-ai-activity-ui-and-early-ask.md`、`016-ai-vision-audit-exif-and-token-compression.md`
+  - 関連先行設計（`main` へ統合済み）: [`completed/015-ai-activity-ui-and-early-ask.md`](completed/015-ai-activity-ui-and-early-ask.md)・[`completed/016-ai-vision-audit-exif-and-token-compression.md`](completed/016-ai-vision-audit-exif-and-token-compression.md)・[`completed/017-editor-ux-timeline-follow-preview-backdrop-json-hl.md`](completed/017-editor-ux-timeline-follow-preview-backdrop-json-hl.md)
 
 ---
 
@@ -114,6 +114,9 @@
      - `Trim`
    - `allow_empty_text: bool`（既定 `false` — 置換後に空文字または空白のみになる場合はそのクリップの文字置換を拒否／エラー計上して字幕消失を防ぐ）
    - `dry_run: bool`（既定 `false` — `true` の場合は `DraftSandbox` を変更せず影響件数とプレビュー差分のみ返す）
+   - **ロック保護・事前バリデーション（Sandbox 変更前に検証）**:
+     - `layer.locked == true` 上のクリップは変更せず、`skipped` へ `{ clip_id, reason: "locked_layer" }` として記録する。
+     - `font_size` と `min_font_size`/`max_font_size` の併用、`min_font_size > max_font_size`、非有限浮動小数点（`NaN` / `inf`）、`font_size <= 0.0`、`outline_width < 0.0`、`opacity` の `0.0..=1.0` 範囲外、`LiteralReplace { find: "" }`、`text_transforms.len() > 16` はいずれも `Err(...)` を即時返却し、`DraftSandbox` を一切変更しない。
 
 2. **`AnimatedParameter` への `min_font_size` / `max_font_size` 適用ルール**:
    - `Constant { value }` → `value.clamp(min, max)`
@@ -156,6 +159,10 @@
 - 字幕以外のクリップ（画像・動画・音声・字幕の共通パラメータ）を一括変更したい場合用。
   - フィルタ: `kind`（`"all" | "image" | "video" | "audio" | "subtitle"`）、`clip_ids`, `layer_ids`, `name_contains`, `include_name_prefixes`, `exclude_name_prefixes`, `time_range_frames`
   - パッチ: `x`, `y`, `scale_x`, `scale_y`, `rotation_deg`, `rotation_delta_deg`, `opacity`, `brightness`, `contrast`, `saturation`, `hue_deg`, `gamma`, `gain_db`, `pan`, `audio_muted`
+  - 規則:
+    - `rotation_deg` と `rotation_delta_deg` の同時指定は不可（`Err(...)`）。
+    - `rotation_delta_deg` は `Constant` / `Easing` / `Keyframes` の各値へ加算後に `normalize_signed_deg` で `(-180.0, 180.0]` へ正規化し、`Expression` は `"animated_expression_preserved"` として `skipped` に記録する。
+    - `layer.locked == true` 上のクリップは `"locked_layer"` として `skipped` に記録し変更しない。
   - 全対象を 1 つの `EditCommand::Batch` として `DraftSandbox::apply_command` へ適用し、変更件数・スキップ詳細を返却する。
 
 ---
@@ -169,8 +176,9 @@
     - `layer_ids`, `layer_names`, `clip_ids`
     - `name_contains`, `text_contains`, `text_regex`
     - `font_size_lt: Option<f64>` / `outline_width_lt: Option<f64>`（規定未達クリップの即時特定用）
-    - `time_range_frames: Option<{ start: u64, end: u64 }>`
+    - `time_range_frames: Option<{ start: u64, end: u64 }>`（`start < end` を検証し半開区間 `[start, end)` の重なりで判定）
     - `limit: usize`（既定 `50`, 上限 `200`）
+    - ※ `text_regex` には `bulk_edit.rs` と共通の `RegexBuilder` サイズ／DFA 上限を適用し、不正・上限超過パターンは `Err(...)` を返す。
   - **集計サマリ (`summary`)**:
     - `total_clips_in_timeline`, `matched_count`, `returned_count`
     - 字幕統計（該当字幕が 1 件以上ある場合）: `min_font_size`, `max_font_size`, `outline_widths_distinct`（代表値一覧）, `outline_zero_count`
@@ -185,19 +193,22 @@
 ### 4.3 柱 3: `audit_timeline_slides` の選別拡張＋セッション内監査キャッシュ
 
 #### 選別引数の拡張（[`src/ai/toolbox.rs`](../src/ai/toolbox.rs)・[`src/ai/vision_audit.rs`](../src/ai/vision_audit.rs)）
-既存の `slide_indices`, `check_subtitle_mismatch`, `check_orientation`, `focus_hint` を維持したまま、以下の任意引数を追加する：
+既存の `slide_indices`, `check_subtitle_mismatch`, `check_orientation`, `focus_hint` を維持したまま、以下の任意引数を追加する（複数フィルタ指定時は **AND 結合** とし、応答内の `total_slides` は常にタイムライン全体の実スライド数を維持する）：
 - `clip_ids: Option<Vec<String>>` — 指定画像クリップ ID に対応するスライドのみ監査
-- `time_range_frames: Option<{ start: u64, end: u64 }>` — 指定時間範囲と重なるスライドのみ監査
+- `time_range_frames: Option<{ start: u64, end: u64 }>` — `start < end` を検証し半開区間 `[start, end)` と重なるスライドのみ監査
 - `subtitle_query: Option<String>` — 重なっている字幕テキストに部分一致するスライドのみ監査（例：`"りんご飴"` が付いているスライドだけ見たいとき 102 枚中 1 枚だけを監査可能）
 - `use_cache: bool`（既定 `true`）— セッション内キャッシュを利用
 - `only_changed: bool`（既定 `false`）— キャッシュに一致エントリがあるスライドを監査リストから除外し、未監査または変化したスライドだけを実行・返却する
 - `force_refresh: bool`（既定 `false`）— キャッシュを無視して Vision 再実行しキャッシュを上書き更新
+- **フラグ優先順位**: `force_refresh: true` は `use_cache` および `only_changed` より優先され常に全対象を再監査する。また `use_cache: false` 指定時はキャッシュ参照（および `only_changed` によるスキップ）を無効化する。
 
 #### `VisionAuditCache` 設計（[`src/ai/vision_audit.rs`](../src/ai/vision_audit.rs)・[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)）
 - **保持場所**: `CoordinatorState::vision_audit_cache: VisionAuditCache`（常駐セッション単位で保持・最大 256 エントリ FIFO/LRU 上限）。`ToolExecutionContext` に `pub vision_audit_cache: Option<&'a mut VisionAuditCache>` を追加して受け渡す。
+- **キャッシュ対象（生 LLM 判定のみ保持）**: 最終出力 JSON ではなく生 LLM 判定である `ParsedAuditItem` のみをキャッシュする。出力構築時の `recommended_rotation_deg`・`recommended_scale_x_param` / `recommended_scale_y_param`・`companion_backdrop_updates` は毎回最新の `DraftSandbox::draft_document()` から決定論的に再計算するため、他クリップ変更後の出力値陳腐化が起きない。
 - **キャッシュキー（決定論スナップショット）**:
+  - `provider_id: String` + `model_name: String`（セッション途中のプロバイダ／モデル切替による誤再利用を防止）
   - `canonical_asset_path: String`
-  - `file_len_bytes: u64` + `file_modified_epoch_secs: Option<u64>`
+  - `file_len_bytes: u64` + `file_modified_epoch_nanos: Option<u128>`
   - `pre_rotation_deg: Option<i32>`（現在タイムライン上の回転角）
   - `overlapping_subtitles_digest: String`（重複字幕の `clip_id + text` 列を結んだ決定論文字列／ハッシュ）
   - `check_subtitles: bool` + `check_orientation: bool` + `focus_hint: String`
@@ -226,14 +237,14 @@ flowchart TD
 ```
 
 1. **案 A（UI 側フォルダ添付チップ自動解除: [`src/ui/ai_chat_panel.rs`](../src/ui/ai_chat_panel.rs)）**:
-   - エージェント送信開始時（`start_or_send_agent_turn`）に「このターンで `attached_folders` を送信したか（`turn_had_attached_folders: bool` 等）」を `AiChatState` に記録する。
+   - エージェント送信開始時（`start_agent_prompt_with_provider`）に「このターンで `attached_folders` を送信したか（送信時フォルダ一覧スナップショット等）」を `AiChatState` に記録する。
    - `handle_agent_proposal_event` で `Proposal` が届いた際、そのターンがフォルダ取り込みを完了していた場合（かつ現在の `attached_folders` が送信時と一致している場合）は `self.ai_chat.attached_folders.clear()` を実行し、ステータス／システム注記で「取り込み済みフォルダの添付を解除しました（編集・監査はプロジェクト内素材から継続可能）」と案内する。
    - **安全ガード**: 送信後にユーザーが手動で別フォルダへ変更していた場合や、`AgentError` / `Cancel` で中断した場合は `attached_folders` を消さず、そのままワンクリックで再試行できるようにする。
 
 2. **多層防御（プラグイン側既読フォルダ保護: [`plugins_src/sea-agent-director/src/director.rs`](../plugins_src/sea-agent-director/src/director.rs)）**:
    - `DirectorMemory` に `#[serde(default)] pub ingested_folders: Vec<String>` を追加。
-   - `scan_attached_folders` 完了時に正規化済みフォルダパスを `ingested_folders` へ記録する。
-   - `DirectorSession::handle_follow_up` では、渡された `attached_folders` のうち **未取り込み（`!ingested_folders.contains(...)`）のものだけ** を抽出し、すべて既読かつプロンプトに明示的な再スキャン語（「再スキャン」「フォルダ再読込」「新しい写真を追加」等）が無ければ `ingest_folders_and_vision` をスキップする。
+   - `scan_attached_folders` 完了時にフォルダパスを正規化（`canonicalize` 可能なら正規パス、失敗時は `trim` パス。Windows 環境では大文字・小文字を区別せず同一判定）したうえで `ingested_folders` へ重複なく記録する。
+   - `DirectorSession::handle_follow_up` では、渡された `attached_folders` のうち同正規化基準で **未取り込み（`!ingested_folders.contains(...)`）のものだけ** を抽出し、すべて既読かつプロンプトに明示的な再スキャン語（「再スキャン」「フォルダ再読込」「新しい写真を追加」等）が無ければ `ingest_folders_and_vision` をスキップする。
 
 3. **ステップ上限連動（[`plugins_src/sea-agent-protocol/src/lib.rs`](../plugins_src/sea-agent-protocol/src/lib.rs)・[`src/ai/agent_host.rs`](../src/ai/agent_host.rs)・[`plugins_src/sea-agent-director/src/director.rs`](../plugins_src/sea-agent-director/src/director.rs)）**:
    - `HostToAgentMessage::{StartTask, ResumeSession, FollowUp}` へ以下を追加（後方互換）：
@@ -242,10 +253,12 @@ flowchart TD
      #[serde(default, skip_serializing_if = "Option::is_none")]
      pub max_steps_per_turn: Option<u32>,
      ```
+   - `CoordinatorState` は `StartTask` / `ResumeSession` に加えて毎回の `FollowUp` でも最新の `runtime_settings.max_steps_per_turn` を送出し、セッション途中の `UpdateRuntime` 設定変更が次ターンから即時反映されるようにする。
    - `director.rs` の `effective_dynamic_tool_steps(configured: Option<u32>) -> u32`:
      - `Some(0)`（「無制限」選択時）→ 安全側サーキットブレーカ付き上限 `40`
      - `Some(n)` → `n.clamp(4, 100)`
      - `None` → `20`（従来の 12 から引き上げ、バルク編集の余地を確保）
+   - 算出された `max_steps` はツールループ反復回数だけでなく、最終ステップでの `ask_user` 除外条件（`step + 1 < max_steps`）および実行時 `ask_user` スキップガード（`step + 1 >= max_steps`）の双方へ一貫して適用する。
    - **連続同一エラーガード**: `(tool_name, normalized_error)` を追跡し、同じ失敗が 3 回連続したら即座にツールループの無意味なリトライを止め、LLM へ「別ツールを使うか `ask_user` で確認せよ」と注記する（バルク編集系でスキーマミスを繰り返す暴走を防止）。
 
 4. **システムプロンプト（`build_followup_system_prompt`）の 3 段階ルーティング指針**:
@@ -322,4 +335,4 @@ flowchart TD
 
 - [x] **決定済み（案 A 採用）**: 初回／追加フォルダ取り込みが `Proposal` 到達まで正常完了したら入力欄のフォルダ添付チップ（`attached_folders`）を自動解除する。加えて多層防御として `DirectorMemory::ingested_folders` による既読フォルダ再走査スキップも併用する。
 - [x] **決定済み（バルク編集ツール導入）**: 大量クリップのスタイル・文字修正を LLM の個別 JSON 手書きに頼らず、`batch_update_subtitles` / `batch_update_clips` + `post_check` 定量検証サマリで決定論処理する。
-- [ ] **実装時確認事項**: ワークスペース `Cargo.toml` へ `regex` クレートを追加する際、既存の推移依存とバージョンが揃うかを確認し、`cargo deny check` で警告が出ないことを確認する。
+- [x] **実装時確認済み (`Cargo.lock`)**: `regex = "1.13.1"`（MIT/Apache-2.0）がすでに推移依存として `Cargo.lock` に存在するため、`Cargo.toml` へ同系バージョンを直接依存として追加する際は既存ロック整合・`cargo deny check` を最終確認する。
