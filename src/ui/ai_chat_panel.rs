@@ -1,6 +1,6 @@
 //! VS Code 風 AI チャットパネル状態管理、非同期ストリーミングポーリング、差分適用/1クリック Undo UI。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +14,12 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Side, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
     Anchor, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    px,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use sea_agent_protocol::AgentUserAnswerPayload;
 use serde_json::{Value, json};
@@ -48,8 +47,8 @@ use crate::ai::providers::openai_compat::{
     OpenAiCompatConfig, OpenAiCompatProvider, OpenRouterCreditsSnapshot, fetch_openrouter_credits,
 };
 use crate::ai::session_store::{
-    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage, AiTurnBadge,
-    PendingAgentQuestionSnapshot, StoredChatTurn,
+    AiSessionRecord, AiSessionStore, AiSessionSummary, AiSessionUsage, AiTurnActivitySummary,
+    AiTurnBadge, PendingAgentQuestionSnapshot, StoredChatTurn,
 };
 use crate::ai::settings::{
     AI_SETTINGS_FILE_NAME, AiUserSettings, ProbedModelEntry, ResolvedAiModel,
@@ -57,6 +56,10 @@ use crate::ai::settings::{
 };
 use crate::core::ids::ClipId;
 use crate::timeline::document::ProjectDocument;
+use crate::ui::ai_activity_view::{
+    AiLiveActivityState, ToolCompletionUpdate, render_live_activity_card,
+    render_turn_activity_summary,
+};
 use crate::ui::ai_agent_widgets::{
     render_agent_mode_menu_button, render_ask_user_card, render_attached_folder_chip,
     render_folder_attach_button, render_session_history_drawer, render_tool_approval_card,
@@ -79,6 +82,8 @@ pub struct AiChatTurn {
     pub rendered_markdown: SharedString,
     /// 完了・停止・エラー状態を示す任意バッジ。
     pub status_badge: Option<AiTurnBadge>,
+    /// 完了済みターンに紐づく折りたたみアクティビティ要約。
+    pub activity_log: Option<AiTurnActivitySummary>,
 }
 
 const CHAT_HISTORY_COLLAPSE_THRESHOLD: usize = 200;
@@ -138,6 +143,18 @@ impl AiChatTurn {
     /// 指定された ID・ロール・本文・状態バッジからチャットターンを構築する。
     #[must_use]
     pub fn new(id: u64, role: AiRole, text: String, status_badge: Option<AiTurnBadge>) -> Self {
+        Self::new_with_activity(id, role, text, status_badge, None)
+    }
+
+    /// 完了済みアクティビティログ付きでチャットターンを構築する。
+    #[must_use]
+    pub fn new_with_activity(
+        id: u64,
+        role: AiRole,
+        text: String,
+        status_badge: Option<AiTurnBadge>,
+        activity_log: Option<AiTurnActivitySummary>,
+    ) -> Self {
         let rendered_markdown = match role {
             AiRole::User => SharedString::from(escape_plain_text_for_markdown(&text)),
             AiRole::Assistant | AiRole::System => SharedString::from(text.clone()),
@@ -148,6 +165,7 @@ impl AiChatTurn {
             text,
             rendered_markdown,
             status_badge,
+            activity_log,
         }
     }
 }
@@ -211,7 +229,7 @@ pub fn format_elapsed_duration(secs: u64) -> String {
     }
 }
 
-fn find_json_fence_start(raw: &str) -> Option<usize> {
+pub(crate) fn find_json_fence_start(raw: &str) -> Option<usize> {
     let mut earliest = raw.find("{\"tool_calls\"");
     for (idx, _) in raw.match_indices("```") {
         let after = &raw[idx + 3..];
@@ -285,6 +303,18 @@ pub struct PendingAiProposal {
     pub model: String,
     /// ドライラン検証を通過した適用待ち計画。
     pub plan: AiEditPlan,
+}
+
+/// チャット履歴の次回描画時スクロール追従要求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatScrollRequest {
+    /// スクロール不要。
+    #[default]
+    None,
+    /// 最下部付近を閲覧中の場合のみ追従する（ストリーム更新・AI 完了通知向け）。
+    StickyIfNearBottom,
+    /// 閲覧位置に関わらず強制的に最下部へ移動する（ユーザー送信・質問/承認カード向け）。
+    ForceBottom,
 }
 
 /// `Manual` 承認モード時に確認待ち中の外部副作用ツール実行リクエスト。
@@ -443,6 +473,12 @@ pub struct AiChatState {
     pub show_all_history: bool,
     /// セッション内で次に割り当てる安定ターン ID（`1` 始まり）。
     pub next_turn_id: u64,
+    /// 実行中のライブステップ・思考・ストリーム進捗状態。
+    pub live_activity: AiLiveActivityState,
+    /// 完了済みターンでアクティビティ要約を展開中のターン ID 集合。
+    pub expanded_activity_turns: HashSet<u64>,
+    /// 次回 UI 描画時に履歴スクロールを最下部へ追従させる保留要求。
+    pub scroll_request: ChatScrollRequest,
     runtime_api_key: Option<SecretString>,
     running_job: Option<AiChatJobHandle>,
     credits_rx: Option<mpsc::Receiver<Result<OpenRouterCreditsSnapshot, String>>>,
@@ -515,6 +551,9 @@ impl Default for AiChatState {
             execution_state: AiExecutionState::Idle,
             show_all_history: false,
             next_turn_id: 1,
+            live_activity: AiLiveActivityState::default(),
+            expanded_activity_turns: HashSet::new(),
+            scroll_request: ChatScrollRequest::None,
             runtime_api_key: None,
             running_job: None,
             credits_rx: None,
@@ -760,7 +799,8 @@ impl AiChatState {
     }
 
     /// ステップ上限・呼出間隔設定を更新・保存し、常駐エージェントにも即時反映する。
-    pub fn apply_runtime_settings(&mut self, settings: AgentRuntimeSettings) {
+    pub fn apply_runtime_settings(&mut self, mut settings: AgentRuntimeSettings) {
+        settings = settings.sanitized();
         self.runtime_settings = settings.clone();
         self.user_settings.runtime = settings;
         if let Some(store) = &self.session_store {
@@ -831,6 +871,7 @@ impl AiChatState {
                     text: t.text.clone(),
                     timestamp_unix_secs: now,
                     status_badge: t.status_badge,
+                    activity_log: t.activity_log.clone(),
                 })
                 .collect(),
             pending_question: self.pending_question.clone(),
@@ -1229,21 +1270,77 @@ impl AiChatState {
         matches!(self.execution_state, AiExecutionState::Responding { .. })
     }
 
-    /// 応答中 (`AiExecutionState::Responding`) の経過秒数を返す。
+    /// 応答中 (`AiExecutionState::Responding`) の正味経過秒数を返す（待機時間を除外）。
     #[must_use]
     pub fn responding_elapsed_secs(&self) -> Option<u64> {
         match &self.execution_state {
-            AiExecutionState::Responding { started_at, .. } => Some(started_at.elapsed().as_secs()),
+            AiExecutionState::Responding { started_at, .. } => {
+                if self.live_activity.started_at.is_some() {
+                    Some(self.live_activity.active_elapsed_secs())
+                } else {
+                    Some(started_at.elapsed().as_secs())
+                }
+            }
             _ => None,
         }
     }
 
+    fn elapsed_for_finalize(&self) -> Option<u64> {
+        if self.live_activity.started_at.is_some() {
+            Some(self.live_activity.active_elapsed_secs())
+        } else {
+            self.responding_elapsed_secs()
+        }
+    }
+
+    /// 次回描画時のスクロール追従要求を設定する（既に `ForceBottom` がある場合は維持する）。
+    pub fn request_scroll(&mut self, req: ChatScrollRequest) {
+        if matches!(self.scroll_request, ChatScrollRequest::ForceBottom)
+            || matches!(req, ChatScrollRequest::None)
+        {
+            return;
+        }
+        self.scroll_request = req;
+    }
+
+    /// 保留中の自動最下部スクロール要求を取り出す。
+    pub fn take_scroll_request(&mut self) -> ChatScrollRequest {
+        std::mem::take(&mut self.scroll_request)
+    }
+
     /// 新規ターンを安定連番 ID 付きで履歴へ追加する。
     pub fn push_turn(&mut self, role: AiRole, text: String, status_badge: Option<AiTurnBadge>) {
+        self.push_turn_with_activity(role, text, status_badge, None);
+    }
+
+    /// アクティビティログ付きで新規ターンを履歴へ追加する。
+    pub fn push_turn_with_activity(
+        &mut self,
+        role: AiRole,
+        text: String,
+        status_badge: Option<AiTurnBadge>,
+        activity_log: Option<AiTurnActivitySummary>,
+    ) {
         let id = self.next_turn_id;
         self.next_turn_id = self.next_turn_id.saturating_add(1);
-        self.turns
-            .push(AiChatTurn::new(id, role, text, status_badge));
+        let scroll = if role == AiRole::User {
+            ChatScrollRequest::ForceBottom
+        } else {
+            ChatScrollRequest::StickyIfNearBottom
+        };
+        self.turns.push(AiChatTurn::new_with_activity(
+            id,
+            role,
+            text,
+            status_badge,
+            activity_log,
+        ));
+        self.request_scroll(scroll);
+    }
+
+    /// 保留中の自動最下部スクロール要求を消費して `true`/`false` を返す。
+    pub fn take_scroll_to_bottom_pending(&mut self) -> bool {
+        self.take_scroll_request() != ChatScrollRequest::None
     }
 
     fn set_responding_phase(&mut self, phase: String, step: Option<(Option<u32>, Option<u32>)>) {
@@ -1251,6 +1348,7 @@ impl AiChatState {
             AiExecutionState::Responding { started_at, .. } => *started_at,
             _ => Instant::now(),
         };
+        self.live_activity.resume_active_timer();
         self.execution_state = AiExecutionState::Responding {
             started_at,
             phase,
@@ -1281,6 +1379,9 @@ impl AiChatState {
         self.turns.clear();
         self.next_turn_id = 1;
         self.show_all_history = false;
+        self.live_activity.reset();
+        self.expanded_activity_turns.clear();
+        self.scroll_request = ChatScrollRequest::None;
         self.execution_state = AiExecutionState::Idle;
         self.streaming_preview.clear();
         self.pending_proposal = None;
@@ -1424,6 +1525,7 @@ impl AppController {
             format!("[添付: {}]\n{trimmed}", attached_labels.join(", "))
         };
         self.ai_chat.push_turn(AiRole::User, display_turn, None);
+        self.ai_chat.live_activity.begin_turn();
         self.ai_chat.attached_clip_ids.clear();
         self.ai_chat.streaming_preview.clear();
         self.ai_chat.last_error = None;
@@ -1450,10 +1552,14 @@ impl AppController {
 
         let mut streamed_buf = String::new();
         let mut status_buf = String::new();
+        let mut live_activity = AiLiveActivityState::default();
+        live_activity.begin_turn();
         let response = provider
             .send_streaming(&req, &mut |evt| match evt {
                 AiStreamEvent::Status(msg) => status_buf = msg,
                 AiStreamEvent::DeltaText(delta) => streamed_buf.push_str(&delta),
+                AiStreamEvent::ThoughtDelta(t) => live_activity.on_thought_delta(&t),
+                AiStreamEvent::ActivityHint(l) => live_activity.on_activity_hint(&l),
                 AiStreamEvent::Completed(_) | AiStreamEvent::Failed(_) => {}
             })
             .map_err(|err| {
@@ -1462,6 +1568,8 @@ impl AppController {
                 self.ai_chat.status_banner = format!("AI 通信エラー: {msg}");
                 msg
             })?;
+
+        self.ai_chat.live_activity = live_activity;
 
         self.ai_chat.streaming_preview = streamed_buf;
         if !status_buf.is_empty() {
@@ -1675,6 +1783,11 @@ impl AppController {
             runtime_settings: self.ai_chat.runtime_settings.clone(),
             tool_registry: None,
             extra_extensions: Vec::new(),
+            project_dir: self
+                .project_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
         };
         let runner = AgentSessionRunner::start(cfg).map_err(|err| err.to_string())?;
         self.ai_chat.active_agent = Some(runner);
@@ -1709,6 +1822,7 @@ impl AppController {
             self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(trimmed);
         }
         self.ai_chat.push_turn(AiRole::User, display_turn, None);
+        self.ai_chat.live_activity.begin_turn();
         self.ai_chat.attached_clip_ids.clear();
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
@@ -1785,6 +1899,7 @@ impl AppController {
         self.ai_chat.ask_field_values.clear();
         self.ai_chat.last_error = None;
         self.ai_chat.push_turn(AiRole::User, answer_summary, None);
+        self.ai_chat.live_activity.resume_active_timer();
         self.ai_chat.agent_busy = true;
         let phase = "回答を受けて構成を設計中...".to_owned();
         self.ai_chat.status_banner.clone_from(&phase);
@@ -1833,6 +1948,7 @@ impl AppController {
         }
         self.ai_chat.pending_tool_approval = None;
         self.ai_chat.last_error = None;
+        self.ai_chat.live_activity.resume_active_timer();
         self.ai_chat.agent_busy = true;
         let msg = if approved {
             format!("外部ツール `{tool_name}` を実行中...")
@@ -1899,6 +2015,8 @@ impl AppController {
         self.ai_chat.agent_step_status = None;
         self.ai_chat.execution_state = AiExecutionState::Idle;
         self.ai_chat.show_all_history = false;
+        self.ai_chat.live_activity.reset();
+        self.ai_chat.expanded_activity_turns.clear();
         self.ai_chat.streaming_preview.clear();
         self.ai_chat.pending_proposal = None;
         self.ai_chat.pending_question = None;
@@ -1937,7 +2055,11 @@ impl AppController {
         self.ai_chat.turns.clear();
         self.ai_chat.next_turn_id = 1;
         for t in rec.turns {
-            self.ai_chat.push_turn(t.role, t.text, t.status_badge);
+            self.ai_chat
+                .push_turn_with_activity(t.role, t.text, t.status_badge, t.activity_log);
+        }
+        if !self.ai_chat.turns.is_empty() {
+            self.ai_chat.request_scroll(ChatScrollRequest::ForceBottom);
         }
         // ResumeSession 後のプラグインはアイドル待機に入るため、未回答質問カードをそのまま復元すると永続待ちハングになる
         self.ai_chat.ask_field_values.clear();
@@ -1992,6 +2114,11 @@ impl AppController {
             runtime_settings: self.ai_chat.runtime_settings.clone(),
             tool_registry: None,
             extra_extensions: Vec::new(),
+            project_dir: self
+                .project_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
         };
         if let Ok(runner) = AgentSessionRunner::start(cfg) {
             self.ai_chat.active_agent = Some(runner);
@@ -2033,11 +2160,22 @@ impl AppController {
 
     fn record_cancelled_preview(&mut self) {
         let partial = std::mem::take(&mut self.ai_chat.streaming_preview);
-        if let Some(readable) = extract_readable_cancelled_preview(&partial) {
-            self.ai_chat.push_turn(
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.elapsed_for_finalize(), true);
+        let readable = extract_readable_cancelled_preview(&partial);
+        if readable.is_some() || activity.is_some() {
+            let stopped_tag = tr("ai.status_stopped_tag");
+            let body = readable.map_or_else(
+                || stopped_tag.clone(),
+                |text| format!("{stopped_tag}\n{text}"),
+            );
+            self.ai_chat.push_turn_with_activity(
                 AiRole::Assistant,
-                format!("[停止済み]\n{readable}"),
+                body,
                 Some(AiTurnBadge::Cancelled),
+                activity,
             );
         }
     }
@@ -2086,95 +2224,157 @@ impl AppController {
 
     fn finish_running_job_error(&mut self, err_msg: &str) {
         self.ai_chat.streaming_preview.clear();
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.elapsed_for_finalize(), false);
         self.ai_chat.last_error = Some(err_msg.to_owned());
         self.ai_chat.execution_state = AiExecutionState::Failed {
             summary: err_msg.to_owned(),
         };
-        self.ai_chat.push_turn(
+        self.ai_chat.push_turn_with_activity(
             AiRole::Assistant,
             format!("エラー: {err_msg}"),
             Some(AiTurnBadge::Error),
+            activity,
         );
         self.ai_chat.persist_session();
+    }
+
+    fn flush_pending_stream_deltas(
+        &mut self,
+        pending_delta: &mut String,
+        pending_thought: &mut String,
+    ) {
+        if !pending_delta.is_empty() {
+            self.ai_chat.streaming_preview.push_str(pending_delta);
+            pending_delta.clear();
+            self.ai_chat
+                .live_activity
+                .on_stream_updated(&self.ai_chat.streaming_preview);
+            self.ai_chat
+                .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+        }
+        if !pending_thought.is_empty() {
+            self.ai_chat.live_activity.on_thought_delta(pending_thought);
+            pending_thought.clear();
+            self.ai_chat
+                .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+        }
+    }
+
+    fn poll_running_job(&mut self) -> (bool, Option<bool>) {
+        let Some(handle) = self.ai_chat.running_job.take() else {
+            return (false, None);
+        };
+        let mut changed = false;
+        let mut completed = None;
+        let mut failed = None;
+        let mut disconnected = false;
+        let mut pending_delta = String::new();
+        let mut pending_thought = String::new();
+
+        loop {
+            match handle.rx.try_recv() {
+                Ok(evt) => {
+                    changed = true;
+                    match evt {
+                        AiStreamEvent::Status(msg) => {
+                            self.ai_chat.status_banner.clone_from(&msg);
+                            self.ai_chat.set_responding_phase(msg, None);
+                        }
+                        AiStreamEvent::DeltaText(delta) => pending_delta.push_str(&delta),
+                        AiStreamEvent::ThoughtDelta(t) => pending_thought.push_str(&t),
+                        AiStreamEvent::ActivityHint(l) => {
+                            self.flush_pending_stream_deltas(
+                                &mut pending_delta,
+                                &mut pending_thought,
+                            );
+                            self.ai_chat.live_activity.on_activity_hint(&l);
+                            self.ai_chat
+                                .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+                        }
+                        AiStreamEvent::Completed(resp) => completed = Some(resp),
+                        AiStreamEvent::Failed(err) => failed = Some(err),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        self.flush_pending_stream_deltas(&mut pending_delta, &mut pending_thought);
+
+        if let Some(resp) = completed {
+            let usage = resp.usage.clone().unwrap_or_else(|| {
+                AiTokenUsage::estimate_from_chars(
+                    handle.estimated_input_chars,
+                    resp.raw_text.chars().count(),
+                )
+            });
+            self.ai_chat.record_turn_usage(&usage);
+            if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
+                self.ai_chat.refresh_openrouter_credits_async();
+            }
+            let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
+            self.ai_chat.persist_session();
+            return (true, Some(true));
+        }
+        if let Some(err_msg) = failed {
+            self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
+            self.finish_running_job_error(&err_msg);
+            return (true, Some(true));
+        }
+        if disconnected {
+            let err_msg = "AI プロバイダが応答を返さず終了しました";
+            err_msg.clone_into(&mut self.ai_chat.status_banner);
+            self.finish_running_job_error(err_msg);
+            return (true, Some(true));
+        }
+        self.ai_chat.running_job = Some(handle);
+        (changed, None)
+    }
+
+    fn process_agent_event_batch(&mut self, events: Vec<AgentHostEvent>) -> (bool, bool) {
+        let mut exited = false;
+        let mut need_persist = false;
+        let mut pending_delta = String::new();
+        let mut pending_thought = String::new();
+        for evt in events {
+            match evt {
+                AgentHostEvent::StreamDelta { text } => pending_delta.push_str(&text),
+                AgentHostEvent::ThoughtDelta { text } => pending_thought.push_str(&text),
+                other => {
+                    self.flush_pending_stream_deltas(&mut pending_delta, &mut pending_thought);
+                    let (did_exit, persist_evt) = self.handle_agent_host_event(other);
+                    exited |= did_exit;
+                    need_persist |= persist_evt;
+                }
+            }
+        }
+        self.flush_pending_stream_deltas(&mut pending_delta, &mut pending_thought);
+        (exited, need_persist)
     }
 
     /// 非同期 AI チャット・バックグラウンドプローブおよび常駐エージェント受信キューをポーリングし、UI 更新が必要なら `true` を返す。
     pub fn poll_ai_chat(&mut self) -> bool {
         let mut changed = self.ai_chat.poll_background_probes();
 
-        if let Some(handle) = self.ai_chat.running_job.take() {
-            let mut completed = None;
-            let mut failed = None;
-            let mut disconnected = false;
-
-            loop {
-                match handle.rx.try_recv() {
-                    Ok(evt) => {
-                        changed = true;
-                        match evt {
-                            AiStreamEvent::Status(msg) => {
-                                self.ai_chat.status_banner.clone_from(&msg);
-                                self.ai_chat.set_responding_phase(msg, None);
-                            }
-                            AiStreamEvent::DeltaText(delta) => {
-                                self.ai_chat.streaming_preview.push_str(&delta);
-                            }
-                            AiStreamEvent::Completed(resp) => completed = Some(resp),
-                            AiStreamEvent::Failed(err) => failed = Some(err),
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if let Some(resp) = completed {
-                let usage = resp.usage.clone().unwrap_or_else(|| {
-                    AiTokenUsage::estimate_from_chars(
-                        handle.estimated_input_chars,
-                        resp.raw_text.chars().count(),
-                    )
-                });
-                self.ai_chat.record_turn_usage(&usage);
-                if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
-                    self.ai_chat.refresh_openrouter_credits_async();
-                }
-                let _ = self.finalize_ai_response(&handle.prompt, &resp.model, &resp.raw_text);
-                self.ai_chat.persist_session();
-                return true;
-            }
-            if let Some(err_msg) = failed {
-                self.ai_chat.status_banner = format!("AI エラー: {err_msg}");
-                self.finish_running_job_error(&err_msg);
-                return true;
-            }
-            if disconnected {
-                let err_msg = "AI プロバイダが応答を返さず終了しました";
-                err_msg.clone_into(&mut self.ai_chat.status_banner);
-                self.finish_running_job_error(err_msg);
-                return true;
-            }
-            self.ai_chat.running_job = Some(handle);
+        let (job_changed, early_ret) = self.poll_running_job();
+        changed |= job_changed;
+        if let Some(ret) = early_ret {
+            return ret;
         }
 
         if let Some(runner) = self.ai_chat.active_agent.take() {
             let events = runner.poll_events();
             let mut exited = false;
-            let mut need_persist = false;
             if !events.is_empty() {
                 changed = true;
-                for evt in events {
-                    let (did_exit, persist_evt) = self.handle_agent_host_event(evt);
-                    if did_exit {
-                        exited = true;
-                    }
-                    if persist_evt {
-                        need_persist = true;
-                    }
-                }
+                let (did_exit, need_persist) = self.process_agent_event_batch(events);
+                exited = did_exit;
                 if need_persist {
                     self.ai_chat.persist_session();
                 }
@@ -2203,76 +2403,72 @@ impl AppController {
             } => self.handle_agent_status_event(message, step, total_steps),
             AgentHostEvent::StreamDelta { text } => {
                 self.ai_chat.streaming_preview.push_str(&text);
+                self.ai_chat
+                    .live_activity
+                    .on_stream_updated(&self.ai_chat.streaming_preview);
+                self.ai_chat
+                    .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+                (false, false)
+            }
+            AgentHostEvent::ThoughtDelta { text } => {
+                self.ai_chat.live_activity.on_thought_delta(&text);
+                self.ai_chat
+                    .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+                (false, false)
+            }
+            AgentHostEvent::ActivityHint { label } => {
+                self.ai_chat.live_activity.on_activity_hint(&label);
+                self.ai_chat
+                    .request_scroll(ChatScrollRequest::StickyIfNearBottom);
+                (false, false)
+            }
+            AgentHostEvent::ToolStarted {
+                call_id,
+                verb,
+                target,
+                ..
+            } => {
+                self.ai_chat
+                    .live_activity
+                    .on_tool_started(&call_id, &verb, &target);
+                self.ai_chat
+                    .request_scroll(ChatScrollRequest::StickyIfNearBottom);
                 (false, false)
             }
             AgentHostEvent::ToolActivity {
+                call_id,
                 tool_name,
+                verb,
+                target,
                 ok,
                 summary,
+                duration_ms,
             } => {
-                self.ai_chat.streaming_preview.clear();
-                let banner = if ok {
-                    format!("ツール実行完了: {tool_name}")
-                } else {
-                    format!("ツール失敗 ({tool_name}): {summary}")
+                let update = ToolCompletionUpdate {
+                    call_id: &call_id,
+                    verb: &verb,
+                    target: &target,
+                    ok,
+                    summary: &summary,
+                    duration_ms,
                 };
-                self.ai_chat.status_banner.clone_from(&banner);
-                self.ai_chat
-                    .set_responding_phase(banner, self.ai_chat.agent_step_status);
-                (false, false)
+                self.handle_agent_tool_activity_event(update, &tool_name)
             }
             AgentHostEvent::MemoryUpdated { agent_memory } => {
                 self.ai_chat.agent_memory = agent_memory;
                 (false, true)
             }
-            AgentHostEvent::UsageReported { usage } => {
-                self.ai_chat.record_turn_usage(&usage);
-                if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
-                    self.ai_chat.refresh_openrouter_credits_async();
-                }
-                (false, true)
-            }
-            AgentHostEvent::AskUser {
-                request_id,
-                title,
-                message,
-                fields,
-                choices,
-                allow_skip,
-            } => {
-                self.handle_agent_ask_user_event(PendingAgentQuestionSnapshot {
-                    request_id,
-                    title,
-                    message,
-                    fields,
-                    choices,
-                    allow_skip,
-                });
-                (false, true)
-            }
-            AgentHostEvent::ToolApprovalRequired {
-                request_id,
-                tool_name,
-                arguments,
-                description,
-            } => {
-                self.handle_agent_tool_approval_event(
-                    request_id,
-                    &tool_name,
-                    arguments,
-                    description,
-                );
-                (false, false)
+            AgentHostEvent::UsageReported { usage } => self.handle_agent_usage_reported(&usage),
+            evt @ AgentHostEvent::AskUser { .. } => self.handle_agent_ask_user_variant(evt),
+            evt @ AgentHostEvent::ToolApprovalRequired { .. } => {
+                self.handle_agent_tool_approval_variant(evt)
             }
             AgentHostEvent::Proposal {
                 summary_markdown,
                 plan,
                 agent_memory,
                 ..
-            } => {
-                self.handle_agent_proposal_event(summary_markdown, *plan, agent_memory);
-                (false, true)
-            }
+            } => self.handle_agent_proposal_tuple(summary_markdown, *plan, agent_memory),
             AgentHostEvent::AgentError {
                 code,
                 message,
@@ -2280,6 +2476,86 @@ impl AppController {
             } => self.handle_agent_error_event(&code, &message, recoverable),
             AgentHostEvent::Exited { reason } => self.handle_agent_exited_event(&reason),
         }
+    }
+
+    fn handle_agent_ask_user_variant(&mut self, evt: AgentHostEvent) -> (bool, bool) {
+        if let AgentHostEvent::AskUser {
+            request_id,
+            title,
+            message,
+            fields,
+            choices,
+            allow_skip,
+        } = evt
+        {
+            self.handle_agent_ask_user_event(PendingAgentQuestionSnapshot {
+                request_id,
+                title,
+                message,
+                fields,
+                choices,
+                allow_skip,
+            });
+            return (false, true);
+        }
+        (false, false)
+    }
+
+    fn handle_agent_tool_approval_variant(&mut self, evt: AgentHostEvent) -> (bool, bool) {
+        if let AgentHostEvent::ToolApprovalRequired {
+            request_id,
+            tool_name,
+            arguments,
+            description,
+        } = evt
+        {
+            self.handle_agent_tool_approval_event(request_id, &tool_name, arguments, description);
+        }
+        (false, false)
+    }
+
+    fn handle_agent_usage_reported(&mut self, usage: &AiTokenUsage) -> (bool, bool) {
+        self.ai_chat.record_turn_usage(usage);
+        if self.ai_chat.selected_provider == AiProviderKind::OpenRouter {
+            self.ai_chat.refresh_openrouter_credits_async();
+        }
+        (false, true)
+    }
+
+    fn handle_agent_proposal_tuple(
+        &mut self,
+        summary_markdown: String,
+        plan: AiEditPlan,
+        agent_memory: Value,
+    ) -> (bool, bool) {
+        self.handle_agent_proposal_event(summary_markdown, plan, agent_memory);
+        (false, true)
+    }
+
+    fn handle_agent_tool_activity_event(
+        &mut self,
+        update: ToolCompletionUpdate<'_>,
+        tool_name: &str,
+    ) -> (bool, bool) {
+        let ok = update.ok;
+        let summary_text = update.summary.to_owned();
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.clear_stream_progress();
+        self.ai_chat.live_activity.on_tool_completed(update);
+        if tool_name != "ask_user" {
+            let banner = if ok {
+                tr_fmt("ai.status_tool_completed", &[("tool", tool_name)])
+            } else {
+                tr_fmt(
+                    "ai.status_tool_failed",
+                    &[("tool", tool_name), ("summary", &summary_text)],
+                )
+            };
+            self.ai_chat.status_banner.clone_from(&banner);
+            self.ai_chat
+                .set_responding_phase(banner, self.ai_chat.agent_step_status);
+        }
+        (false, false)
     }
 
     fn handle_agent_status_event(
@@ -2294,6 +2570,7 @@ impl AppController {
         }
         if step.is_some() {
             self.ai_chat.streaming_preview.clear();
+            self.ai_chat.live_activity.clear_stream_progress();
         }
         self.ai_chat
             .set_responding_phase(message, self.ai_chat.agent_step_status);
@@ -2308,6 +2585,9 @@ impl AppController {
         description: String,
     ) {
         self.ai_chat.agent_busy = false;
+        self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.clear_stream_progress();
+        self.ai_chat.live_activity.pause_active_timer();
         self.ai_chat.execution_state = AiExecutionState::WaitingApproval {
             tool_name: tool_name.to_owned(),
         };
@@ -2317,6 +2597,7 @@ impl AppController {
             arguments,
             description,
         });
+        self.ai_chat.request_scroll(ChatScrollRequest::ForceBottom);
         self.ai_chat.status_banner =
             format!("Manual 承認待ち: ツール `{tool_name}` の実行許可が必要です");
     }
@@ -2325,18 +2606,33 @@ impl AppController {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.clear_pending_agent_interactions();
-        if reason != "cancelled" {
-            self.ai_chat.status_banner = format!("エージェントプロセス終了: {reason}");
-            if matches!(
-                self.ai_chat.execution_state,
-                AiExecutionState::Responding { .. }
-                    | AiExecutionState::WaitingUserInput { .. }
-                    | AiExecutionState::WaitingApproval { .. }
-            ) {
-                self.ai_chat.execution_state = AiExecutionState::Failed {
-                    summary: self.ai_chat.status_banner.clone(),
-                };
-            }
+        if reason == "cancelled" {
+            self.ai_chat.live_activity.reset();
+            return (true, true);
+        }
+        let was_active = matches!(
+            self.ai_chat.execution_state,
+            AiExecutionState::Responding { .. }
+                | AiExecutionState::WaitingUserInput { .. }
+                | AiExecutionState::WaitingApproval { .. }
+        );
+        self.ai_chat.status_banner = format!("エージェントプロセス終了: {reason}");
+        if was_active {
+            let activity = self
+                .ai_chat
+                .live_activity
+                .finalize_summary(self.ai_chat.elapsed_for_finalize(), false);
+            self.ai_chat.execution_state = AiExecutionState::Failed {
+                summary: self.ai_chat.status_banner.clone(),
+            };
+            self.ai_chat.push_turn_with_activity(
+                AiRole::Assistant,
+                format!("エラー: {}", self.ai_chat.status_banner),
+                Some(AiTurnBadge::Error),
+                activity,
+            );
+        } else {
+            self.ai_chat.live_activity.reset();
         }
         (true, true)
     }
@@ -2347,6 +2643,16 @@ impl AppController {
         message: &str,
         recoverable: bool,
     ) -> (bool, bool) {
+        if code == "pending_interaction" {
+            let formatted = format!("[{code}] {message}");
+            self.ai_chat.last_error = Some(formatted);
+            self.ai_chat.status_banner = format!("確認待ち: {message}");
+            return (false, false);
+        }
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.elapsed_for_finalize(), false);
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.clear_pending_agent_interactions();
@@ -2355,10 +2661,11 @@ impl AppController {
         self.ai_chat.execution_state = AiExecutionState::Failed {
             summary: formatted.clone(),
         };
-        self.ai_chat.push_turn(
+        self.ai_chat.push_turn_with_activity(
             AiRole::Assistant,
             format!("エラー: {formatted}"),
             Some(AiTurnBadge::Error),
+            activity,
         );
         self.ai_chat.status_banner = if recoverable {
             format!("中断 ({code}): 別プロバイダへ切替や追加入力で続行できます")
@@ -2372,6 +2679,8 @@ impl AppController {
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.streaming_preview.clear();
+        self.ai_chat.live_activity.clear_stream_progress();
+        self.ai_chat.live_activity.pause_active_timer();
         self.ai_chat.ask_field_values.clear();
         for field in &snap.fields {
             if let Some(def) = &field.default_value {
@@ -2389,6 +2698,7 @@ impl AppController {
             detail: snap.title.clone(),
         };
         self.ai_chat.pending_question = Some(snap);
+        self.ai_chat.request_scroll(ChatScrollRequest::ForceBottom);
         "エージェントが確認事項を送りました（カードから入力または選択してください）"
             .clone_into(&mut self.ai_chat.status_banner);
     }
@@ -2399,6 +2709,10 @@ impl AppController {
         plan: AiEditPlan,
         agent_memory: Value,
     ) {
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.elapsed_for_finalize(), false);
         self.ai_chat.agent_busy = false;
         self.ai_chat.agent_step_status = None;
         self.ai_chat.streaming_preview.clear();
@@ -2406,10 +2720,11 @@ impl AppController {
         self.ai_chat.agent_memory = agent_memory;
         if plan.is_no_op() {
             self.ai_chat.pending_proposal = None;
-            self.ai_chat.push_turn(
+            self.ai_chat.push_turn_with_activity(
                 AiRole::Assistant,
                 summary_markdown,
                 Some(AiTurnBadge::CompletedNoChange),
+                activity,
             );
             let completed_summary = tr("ai.status_completed_no_change");
             self.ai_chat.status_banner.clone_from(&completed_summary);
@@ -2419,7 +2734,12 @@ impl AppController {
             };
         } else if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
             self.ai_chat.pending_proposal = None;
-            let _ = self.apply_ai_plan_with_summary(&plan, true, Some(&summary_markdown));
+            let _ = self.apply_ai_plan_with_summary_and_activity(
+                &plan,
+                true,
+                Some(&summary_markdown),
+                activity,
+            );
         } else {
             let mut body = summary_markdown;
             if !body.contains("承認して適用") && !body.contains("準備完了") {
@@ -2427,8 +2747,12 @@ impl AppController {
                     "\n\n✅ 編集案の作成が完了しました。下の「承認して適用」でタイムラインへ反映できます。",
                 );
             }
-            self.ai_chat
-                .push_turn(AiRole::Assistant, body, Some(AiTurnBadge::ProposalReady));
+            self.ai_chat.push_turn_with_activity(
+                AiRole::Assistant,
+                body,
+                Some(AiTurnBadge::ProposalReady),
+                activity,
+            );
             self.ai_chat.pending_proposal = Some(PendingAiProposal {
                 prompt: self.ai_chat.agent_active_prompt.clone(),
                 model: self.ai_chat.agent_active_model_label.clone(),
@@ -2453,20 +2777,25 @@ impl AppController {
             .pending_proposal
             .take()
             .ok_or_else(|| "承認待ちの AI 提案はありません".to_owned())?;
-        self.apply_ai_plan_with_summary(&proposal.plan, false, None)
+        self.apply_ai_plan_with_summary_and_activity(&proposal.plan, false, None, None)
     }
 
-    fn apply_ai_plan_with_summary(
+    fn apply_ai_plan_with_summary_and_activity(
         &mut self,
         plan: &AiEditPlan,
         is_autopilot: bool,
         reply_note: Option<&str>,
+        activity: Option<AiTurnActivitySummary>,
     ) -> Result<(), String> {
         if let Err(err) = self.dispatch_command(&plan.command) {
             let msg = format!("提案の適用に失敗しました: {err}");
             self.ai_chat.last_error = Some(msg.clone());
-            self.ai_chat
-                .push_turn(AiRole::Assistant, msg.clone(), Some(AiTurnBadge::Error));
+            self.ai_chat.push_turn_with_activity(
+                AiRole::Assistant,
+                msg.clone(),
+                Some(AiTurnBadge::Error),
+                activity,
+            );
             self.ai_chat.status_banner.clone_from(&msg);
             self.ai_chat.execution_state = AiExecutionState::Failed {
                 summary: msg.clone(),
@@ -2500,8 +2829,12 @@ impl AppController {
             summary: banner,
             changed_timeline: true,
         };
-        self.ai_chat
-            .push_turn(AiRole::Assistant, turn_text, Some(AiTurnBadge::Applied));
+        self.ai_chat.push_turn_with_activity(
+            AiRole::Assistant,
+            turn_text,
+            Some(AiTurnBadge::Applied),
+            activity,
+        );
         self.ai_chat.persist_session();
         Ok(())
     }
@@ -2537,6 +2870,10 @@ impl AppController {
         raw_text: &str,
     ) -> Result<(), String> {
         self.ai_chat.streaming_preview.clear();
+        let activity = self
+            .ai_chat
+            .live_activity
+            .finalize_summary(self.ai_chat.elapsed_for_finalize(), false);
         match dry_run_validate(&self.document, raw_text) {
             Ok(plan) if plan.is_no_op() => {
                 let note = plan
@@ -2550,10 +2887,11 @@ impl AppController {
                 );
                 self.ai_chat.last_error = None;
                 self.ai_chat.pending_proposal = None;
-                self.ai_chat.push_turn(
+                self.ai_chat.push_turn_with_activity(
                     AiRole::Assistant,
                     reply_text,
                     Some(AiTurnBadge::CompletedNoChange),
+                    activity,
                 );
                 let completed_summary = tr("ai.status_completed_no_change");
                 self.ai_chat.status_banner.clone_from(&completed_summary);
@@ -2567,10 +2905,11 @@ impl AppController {
                 self.ai_chat.last_error = None;
                 if self.ai_chat.approval_mode == AiApprovalMode::Autopilot {
                     self.ai_chat.pending_proposal = None;
-                    return self.apply_ai_plan_with_summary(
+                    return self.apply_ai_plan_with_summary_and_activity(
                         &plan,
                         true,
                         plan.reply_note.as_deref(),
+                        activity,
                     );
                 }
                 let summary_body = plan.summary_lines.join("\n");
@@ -2587,10 +2926,11 @@ impl AppController {
                 preview.push_str(
                     "\n\n✅ 編集案の作成が完了しました。下の「承認して適用」でタイムラインへ反映できます。",
                 );
-                self.ai_chat.push_turn(
+                self.ai_chat.push_turn_with_activity(
                     AiRole::Assistant,
                     preview,
                     Some(AiTurnBadge::ProposalReady),
+                    activity,
                 );
                 self.ai_chat.pending_proposal = Some(PendingAiProposal {
                     prompt: prompt.to_owned(),
@@ -2607,8 +2947,12 @@ impl AppController {
             Err(err) => {
                 let msg = format!("コマンド検証エラー（タイムラインは無変更）: {err}");
                 self.ai_chat.last_error = Some(msg.clone());
-                self.ai_chat
-                    .push_turn(AiRole::Assistant, msg.clone(), Some(AiTurnBadge::Error));
+                self.ai_chat.push_turn_with_activity(
+                    AiRole::Assistant,
+                    msg.clone(),
+                    Some(AiTurnBadge::Error),
+                    activity,
+                );
                 self.ai_chat.status_banner.clone_from(&msg);
                 self.ai_chat.execution_state = AiExecutionState::Failed {
                     summary: msg.clone(),
@@ -2693,6 +3037,21 @@ impl AiProvider for FailedPluginProvider {
     }
 }
 
+/// AI チャットパネル描画に必要なウィジェット参照束。
+#[derive(Clone, Copy)]
+pub struct AiChatPanelWidgets<'a> {
+    /// プロバイダ選択コンボボックス。
+    pub ai_provider_select: &'a Entity<SelectState<Vec<AiProviderSelectItem>>>,
+    /// プロンプト入力欄。
+    pub ai_chat_input: &'a Entity<TextareaState>,
+    /// 対話確認カード用の入力欄一覧。
+    pub ai_ask_inputs: &'a [(String, Entity<InputState>)],
+    /// チャット履歴コンテナ用のフォーカスハンドル。
+    pub ai_chat_history_focus: &'a FocusHandle,
+    /// チャット履歴スクロールハンドル。
+    pub ai_chat_scroll_handle: &'a ScrollHandle,
+}
+
 /// 右側 AI Chat タブの VS Code 風チャットパネルを描画する。
 ///
 /// 上部はプロバイダ切替・セッション履歴・設定のみのシンプルなヘッダとし、
@@ -2700,12 +3059,16 @@ impl AiProvider for FailedPluginProvider {
 /// モデル／エージェント／フォルダ添付を内包したコンポーザーを最下部に固定配置する。
 pub fn render_ai_chat_panel(
     controller: &AppController,
-    ai_provider_select: &Entity<SelectState<Vec<AiProviderSelectItem>>>,
-    ai_chat_input: &Entity<TextareaState>,
-    ai_ask_inputs: &[(String, Entity<InputState>)],
-    ai_chat_history_focus: &FocusHandle,
+    widgets: AiChatPanelWidgets<'_>,
     cx: &mut Context<SeaEditorWindow>,
 ) -> impl IntoElement {
+    let AiChatPanelWidgets {
+        ai_provider_select,
+        ai_chat_input,
+        ai_ask_inputs,
+        ai_chat_history_focus,
+        ai_chat_scroll_handle,
+    } = widgets;
     let chat = &controller.ai_chat;
     let theme = cx.theme().clone();
     let drag_theme = theme.clone();
@@ -2772,6 +3135,7 @@ pub fn render_ai_chat_panel(
             chat,
             ai_ask_inputs,
             ai_chat_history_focus,
+            ai_chat_scroll_handle,
             cx,
         ))
         .children(render_status_bar(chat, &theme))
@@ -2892,6 +3256,7 @@ fn render_chat_body(
     chat: &AiChatState,
     ai_ask_inputs: &[(String, Entity<InputState>)],
     ai_chat_history_focus: &FocusHandle,
+    ai_chat_scroll_handle: &ScrollHandle,
     cx: &mut Context<SeaEditorWindow>,
 ) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
@@ -2925,10 +3290,15 @@ fn render_chat_body(
         );
     }
     for turn in &chat.turns[collapsed_count..] {
-        thread = thread.child(render_chat_turn(turn, &theme));
+        thread = thread.child(render_chat_turn(
+            turn,
+            &chat.expanded_activity_turns,
+            &theme,
+            cx,
+        ));
     }
     if chat.is_busy() {
-        thread = thread.child(render_busy_indicator(chat, &theme));
+        thread = thread.child(render_live_activity_card(chat, &theme, cx));
     }
     if let Some(approval) = &chat.pending_tool_approval {
         thread = thread.child(render_tool_approval_card(approval, cx));
@@ -2960,13 +3330,25 @@ fn render_chat_body(
     }
 
     div()
-        .id("ai-chat-history-scroll")
-        .track_focus(ai_chat_history_focus)
+        .relative()
+        .flex()
+        .flex_col()
         .flex_1()
         .w_full()
         .min_h(px(0.))
-        .overflow_y_scrollbar()
-        .child(thread)
+        .overflow_y_hidden()
+        .child(
+            div()
+                .id("ai-chat-history-scroll")
+                .track_focus(ai_chat_history_focus)
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(ai_chat_scroll_handle)
+                .child(thread),
+        )
+        .vertical_scrollbar(ai_chat_scroll_handle)
         .into_any_element()
 }
 
@@ -3064,7 +3446,10 @@ fn render_status_bar(
                 .unwrap_or_default();
             let step_tag = match step {
                 Some((Some(s), Some(t))) => format!("[{s}/{t}] "),
-                Some((Some(s), None)) => format!("[ステップ {s}] "),
+                Some((Some(s), None)) => {
+                    let s_str = s.to_string();
+                    tr_fmt("ai.activity_step_badge", &[("step", &s_str)])
+                }
                 _ => String::new(),
             };
             ("⏳", format!("{step_tag}{phase}{elapsed}"), theme.primary)
@@ -3126,76 +3511,6 @@ fn render_status_bar(
     )
 }
 
-fn render_busy_indicator(
-    chat: &AiChatState,
-    theme: &gpui_kit::component::Theme,
-) -> impl IntoElement {
-    let (phase_label, step_label, elapsed_label) = match &chat.execution_state {
-        AiExecutionState::Responding {
-            started_at,
-            phase,
-            step,
-        } => {
-            let step_txt = match step {
-                Some((Some(s), Some(t))) => format!("[{s}/{t}] "),
-                Some((Some(s), None)) => format!("[ステップ {s}] "),
-                _ => String::new(),
-            };
-            let elapsed_txt = format_elapsed_duration(started_at.elapsed().as_secs());
-            (phase.clone(), step_txt, elapsed_txt)
-        }
-        _ => (chat.status_banner.clone(), String::new(), String::new()),
-    };
-
-    let preview = format_streaming_preview_for_ui(&chat.streaming_preview);
-    let mut card = v_flex()
-        .w_full()
-        .gap_1()
-        .p_2()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_1p5()
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .items_center()
-                        .gap_1p5()
-                        .child(Spinner::new().xsmall().color(theme.primary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_color(theme.foreground)
-                                .child(format!("{step_label}{phase_label}")),
-                        ),
-                )
-                .children((!elapsed_label.is_empty()).then(|| {
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.muted_foreground)
-                        .child(elapsed_label)
-                })),
-        );
-    if !preview.is_empty() {
-        card = card.child(
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .text_color(theme.muted_foreground)
-                .child(preview),
-        );
-    }
-    card
-}
-
 fn turn_badge_label(badge: AiTurnBadge) -> &'static str {
     match badge {
         AiTurnBadge::Applied => "完了・適用済み",
@@ -3206,7 +3521,12 @@ fn turn_badge_label(badge: AiTurnBadge) -> &'static str {
     }
 }
 
-fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
+fn render_chat_turn(
+    turn: &AiChatTurn,
+    expanded_activity_turns: &HashSet<u64>,
+    theme: &gpui_kit::component::Theme,
+    cx: &mut Context<SeaEditorWindow>,
+) -> gpui_kit::AnyElement {
     use gpui_kit::IntoElement as _;
 
     let copy_btn = Clipboard::new(("ai-turn-copy", turn.id))
@@ -3263,6 +3583,15 @@ fn render_chat_turn(turn: &AiChatTurn, theme: &gpui_kit::component::Theme) -> gp
                         .child(left_meta)
                         .child(copy_btn),
                 )
+                .children(turn.activity_log.as_ref().map(|summary| {
+                    render_turn_activity_summary(
+                        turn.id,
+                        summary,
+                        expanded_activity_turns.contains(&turn.id),
+                        theme,
+                        cx,
+                    )
+                }))
                 .child(
                     div().w_full().min_w(px(0.)).child(
                         TextView::markdown(("ai-turn-md", turn.id), turn.rendered_markdown.clone())
@@ -4804,6 +5133,239 @@ mod tests {
         assert_eq!(
             super::extract_readable_cancelled_preview(inline_raw).as_deref(),
             Some("確認中")
+        );
+    }
+
+    #[test]
+    fn activity_events_accumulate_persist_across_sessions_and_trigger_scroll_to_bottom()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::session_store::{AiActivityStepStatus, AiSessionStore};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "sea_ai_activity_roundtrip_{}_{}",
+            std::process::id(),
+            AiSessionStore::generate_session_id()
+        ));
+        let store = AiSessionStore::new(&store_dir);
+
+        let mut controller = AppController::new();
+        controller.ai_chat.session_store = Some(store);
+        controller.ai_chat.live_activity.begin_turn();
+        controller.handle_agent_host_event(AgentHostEvent::ThoughtDelta {
+            text: "タイムライン構成を確認します".to_owned(),
+        });
+        controller.handle_agent_host_event(AgentHostEvent::ToolStarted {
+            call_id: "c1".to_owned(),
+            tool_name: "get_timeline_summary".to_owned(),
+            verb: "Analyzed".to_owned(),
+            target: "タイムライン構成".to_owned(),
+        });
+        controller.handle_agent_host_event(AgentHostEvent::ToolActivity {
+            call_id: "c1".to_owned(),
+            tool_name: "get_timeline_summary".to_owned(),
+            verb: "Analyzed".to_owned(),
+            target: "タイムライン構成".to_owned(),
+            ok: true,
+            summary: "ok".to_owned(),
+            duration_ms: Some(18),
+        });
+        assert_eq!(controller.ai_chat.live_activity.steps.len(), 1);
+        assert!(
+            controller
+                .ai_chat
+                .live_activity
+                .thought_tail_cache
+                .contains("タイムライン構成を確認します")
+        );
+
+        controller.handle_agent_host_event(AgentHostEvent::AskUser {
+            request_id: "ask_1".to_owned(),
+            title: "対象選択".to_owned(),
+            message: "番号を指定してください".to_owned(),
+            fields: Vec::new(),
+            choices: Vec::new(),
+            allow_skip: true,
+        });
+        assert!(controller.ai_chat.take_scroll_to_bottom_pending());
+        assert!(!controller.ai_chat.take_scroll_to_bottom_pending());
+
+        // 進行中ステップをキャンセル確定してターン履歴へ保存・復元できること
+        controller.handle_agent_host_event(AgentHostEvent::ToolStarted {
+            call_id: "c2".to_owned(),
+            tool_name: "apply_draft_edit_command".to_owned(),
+            verb: "Editing".to_owned(),
+            target: "タイムライン編集".to_owned(),
+        });
+        assert!(controller.cancel_ai_prompt());
+        let cancelled_turn = controller
+            .ai_chat
+            .turns
+            .last()
+            .ok_or("expected cancelled turn")?;
+        let activity = cancelled_turn
+            .activity_log
+            .as_ref()
+            .ok_or("expected activity_log on cancelled turn")?;
+        assert_eq!(activity.steps.len(), 2);
+        assert_eq!(activity.steps[0].status, AiActivityStepStatus::Done);
+        assert_eq!(activity.steps[0].duration_ms, Some(18));
+        assert_eq!(activity.steps[1].status, AiActivityStepStatus::Cancelled);
+
+        controller.ai_chat.persist_session();
+        let sid = controller.ai_chat.session_id.clone();
+        let mut controller2 = AppController::new();
+        controller2.ai_chat.session_store = controller.ai_chat.session_store.clone();
+        controller2.open_saved_ai_session_with_provider(&sid, None, None)?;
+        let restored_last = controller2
+            .ai_chat
+            .turns
+            .last()
+            .ok_or("expected restored turn")?;
+        assert_eq!(
+            restored_last.activity_log.as_ref().map(|a| a.steps.len()),
+            Some(2)
+        );
+        assert!(controller2.ai_chat.take_scroll_to_bottom_pending());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_approval_exited_cleanup_ask_skip_banner_and_scroll_modes_work() {
+        use std::time::Instant;
+
+        use super::{AiExecutionState, ChatScrollRequest};
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::session_store::AiTurnBadge;
+
+        let mut controller = AppController::new();
+        controller.ai_chat.live_activity.begin_turn();
+        controller.ai_chat.execution_state = AiExecutionState::Responding {
+            started_at: Instant::now(),
+            phase: "処理中".to_owned(),
+            step: Some((Some(1), Some(4))),
+        };
+        controller.ai_chat.streaming_preview = "確認中です".to_owned();
+        controller
+            .ai_chat
+            .live_activity
+            .on_stream_updated(&controller.ai_chat.streaming_preview);
+
+        // 1) ToolApprovalRequired でストリームプレビュー消去＋ForceBottom＋タイマー一時停止
+        controller.handle_agent_host_event(AgentHostEvent::ToolApprovalRequired {
+            request_id: "req_1".to_owned(),
+            tool_name: "external_export".to_owned(),
+            arguments: serde_json::json!({}),
+            description: "desc".to_owned(),
+        });
+        assert_eq!(controller.ai_chat.streaming_preview, "");
+        assert!(
+            controller
+                .ai_chat
+                .live_activity
+                .readable_prefix_tail_cache
+                .is_none()
+        );
+        assert_eq!(
+            controller.ai_chat.take_scroll_request(),
+            ChatScrollRequest::ForceBottom
+        );
+
+        // 2) ask_user の ToolActivity は status_banner を上書きしないこと
+        controller.ai_chat.status_banner = "希望回答を受領しました".to_owned();
+        controller.handle_agent_host_event(AgentHostEvent::ToolActivity {
+            call_id: "ask_1".to_owned(),
+            tool_name: "ask_user".to_owned(),
+            verb: "Asking".to_owned(),
+            target: "希望確認".to_owned(),
+            ok: true,
+            summary: "skipped".to_owned(),
+            duration_ms: None,
+        });
+        assert_eq!(controller.ai_chat.status_banner, "希望回答を受領しました");
+
+        // 3) 異常 Exited で live_activity が残留せず Failed ターンへ記録されること
+        let (did_exit, _) = controller.handle_agent_exited_event("broken pipe");
+        assert!(did_exit);
+        assert!(controller.ai_chat.live_activity.started_at.is_none());
+        assert_eq!(
+            controller.ai_chat.turns.last().and_then(|t| t.status_badge),
+            Some(AiTurnBadge::Error)
+        );
+        assert_eq!(
+            controller.ai_chat.take_scroll_request(),
+            ChatScrollRequest::StickyIfNearBottom
+        );
+    }
+
+    #[test]
+    fn pending_interaction_preserves_cards_runtime_sanitizes_and_activity_hint_scrolls() {
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+        use super::{AiChatJobHandle, AiExecutionState, ChatScrollRequest};
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::provider::{AgentRuntimeSettings, AiStreamEvent};
+
+        let mut controller = AppController::new();
+        // 1) pending_interaction エラー受信時は待機中の承認カードを破棄せず WaitingApproval を維持する
+        controller.handle_agent_host_event(AgentHostEvent::ToolApprovalRequired {
+            request_id: "req_pending".to_owned(),
+            tool_name: "apply_draft_edit_command".to_owned(),
+            arguments: serde_json::json!({}),
+            description: "desc".to_owned(),
+        });
+        assert!(controller.ai_chat.pending_tool_approval.is_some());
+        let _ = controller.ai_chat.take_scroll_request();
+
+        let (did_exit, persist) = controller.handle_agent_error_event(
+            "pending_interaction",
+            "確認カードの操作完了まで追加指示を受け付けられません",
+            true,
+        );
+        assert!(!did_exit);
+        assert!(!persist);
+        assert!(controller.ai_chat.pending_tool_approval.is_some());
+        assert!(matches!(
+            controller.ai_chat.execution_state,
+            AiExecutionState::WaitingApproval { .. }
+        ));
+        assert!(controller.ai_chat.status_banner.contains("確認待ち"));
+
+        // 2) apply_runtime_settings が範囲外値を sanitized() で丸めて保持する
+        controller
+            .ai_chat
+            .apply_runtime_settings(AgentRuntimeSettings {
+                vision_jpeg_quality: 5,
+                vision_contact_sheet_cols: 99,
+                ..AgentRuntimeSettings::default()
+            });
+        assert_eq!(controller.ai_chat.runtime_settings.vision_jpeg_quality, 40);
+        assert_eq!(
+            controller
+                .ai_chat
+                .runtime_settings
+                .vision_contact_sheet_cols,
+            4
+        );
+
+        // 3) poll_running_job の ActivityHint で StickyIfNearBottom が要求される
+        let (tx, rx) = mpsc::channel();
+        controller.ai_chat.running_job = Some(AiChatJobHandle {
+            rx,
+            prompt: "test".to_owned(),
+            estimated_input_chars: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        tx.send(AiStreamEvent::ActivityHint("検索中".to_owned()))
+            .ok();
+        let (changed, early) = controller.poll_running_job();
+        assert!(changed);
+        assert!(early.is_none());
+        assert_eq!(
+            controller.ai_chat.take_scroll_request(),
+            ChatScrollRequest::StickyIfNearBottom
         );
     }
 }

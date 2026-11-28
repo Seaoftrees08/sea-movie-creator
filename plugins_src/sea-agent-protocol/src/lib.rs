@@ -76,6 +76,20 @@ pub struct AgentUserAnswerPayload {
     pub skipped: bool,
 }
 
+/// Anthropic 等がマルチターン Tool Use で再送を要求する署名付き思考ブロック。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentThinkingBlock {
+    /// 思考テキスト本体。
+    #[serde(default)]
+    pub thinking: String,
+    /// プロバイダ発行の署名文字列。
+    #[serde(default)]
+    pub signature: String,
+    /// Anthropic `redacted_thinking` ブロックの生データ（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_data: Option<String>,
+}
+
 /// `llm_chat` / `llm_response` で扱うツール呼び出し記述。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentLlmToolCall {
@@ -86,6 +100,9 @@ pub struct AgentLlmToolCall {
     /// 引数 JSON オブジェクト。
     #[serde(default)]
     pub arguments: Value,
+    /// Gemini 3/4 等が返すツール呼び出し思考署名（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// エージェントがホストの LLM ゲートウェイへ送信する会話メッセージ。
@@ -99,6 +116,9 @@ pub struct AgentLlmMessage {
     /// ホスト側の許可フォルダ検証・サムネイル縮小を経て添付される画像ファイルパス群。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_paths: Vec<String>,
+    /// assistant メッセージに保持された署名付き思考ブロック群（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<AgentThinkingBlock>,
     /// assistant メッセージに含めるツール呼び出し要求。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AgentLlmToolCall>,
@@ -214,6 +234,9 @@ pub enum HostToAgentMessage {
         /// モデルが出力したテキスト。
         #[serde(default)]
         text: String,
+        /// モデルが返した署名付き思考ブロック群（任意・後方互換）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<AgentThinkingBlock>,
         /// モデルが要求したツール呼び出し一覧。
         #[serde(default)]
         tool_calls: Vec<AgentLlmToolCall>,
@@ -549,6 +572,56 @@ mod tests {
         };
         assert_eq!(mb_err.kind(), io::ErrorKind::InvalidData);
         assert!(mb_err.to_string().contains("exceeds max size"));
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_blocks_and_thought_signature_roundtrip_and_stay_backward_compatible()
+    -> io::Result<()> {
+        let msg = HostToAgentMessage::LlmResponse {
+            request_id: "req_1".to_owned(),
+            ok: true,
+            text: "思考完了".to_owned(),
+            thinking_blocks: vec![AgentThinkingBlock {
+                thinking: "step 1".to_owned(),
+                signature: "sig_abc".to_owned(),
+                redacted_data: Some("redacted_payload".to_owned()),
+            }],
+            tool_calls: vec![AgentLlmToolCall {
+                id: "call_1".to_owned(),
+                name: "get_timeline_summary".to_owned(),
+                arguments: json!({}),
+                thought_signature: Some("gem_sig_1".to_owned()),
+            }],
+            finish_reason: Some("tool_calls".to_owned()),
+            error: None,
+        };
+        let mut buf = Vec::new();
+        write_ndjson_line(&mut buf, &msg)?;
+        let mut cursor = Cursor::new(buf);
+        let decoded: Option<HostToAgentMessage> = read_ndjson_line(&mut cursor)?;
+        assert_eq!(decoded.as_ref(), Some(&msg));
+
+        // 旧プロトコル JSON（thinking_blocks / thought_signature 欠如）も問題なく読めること
+        let legacy_llm_resp = r#"{"type":"llm_response","request_id":"r0","ok":true,"text":"hi","tool_calls":[{"id":"c0","name":"x","arguments":{}}]}"#;
+        let parsed_resp: HostToAgentMessage =
+            serde_json::from_str(legacy_llm_resp).map_err(io::Error::other)?;
+        match parsed_resp {
+            HostToAgentMessage::LlmResponse {
+                thinking_blocks,
+                tool_calls,
+                ..
+            } => {
+                assert_eq!(thinking_blocks, Vec::<AgentThinkingBlock>::new());
+                assert_eq!(tool_calls[0].thought_signature, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_msg = r#"{"role":"assistant","text":"ok","tool_calls":[]}"#;
+        let parsed_msg: AgentLlmMessage =
+            serde_json::from_str(legacy_msg).map_err(io::Error::other)?;
+        assert_eq!(parsed_msg.thinking_blocks, Vec::<AgentThinkingBlock>::new());
         Ok(())
     }
 }

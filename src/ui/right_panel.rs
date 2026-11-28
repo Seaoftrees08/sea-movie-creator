@@ -7,11 +7,12 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::{
-    Context, Entity, FocusHandle, IntoElement, ParentElement as _, Styled as _, div, px, rgba,
+    Context, Entity, FocusHandle, IntoElement, ParentElement as _, ScrollHandle, Styled as _, div,
+    px, rgba,
 };
 
 use crate::timeline::document::TimelineLengthMode;
-use crate::ui::ai_chat_panel::{AiProviderSelectItem, render_ai_chat_panel};
+use crate::ui::ai_chat_panel::{AiChatPanelWidgets, AiProviderSelectItem, render_ai_chat_panel};
 use crate::ui::app_controller::{AppController, RightPanelTab};
 use crate::ui::i18n::{
     active_language_code, available_languages, primary_lang_dir, reload_languages,
@@ -33,6 +34,8 @@ pub struct RightPanelWidgets<'a> {
     pub ai_ask_inputs: &'a [(String, Entity<InputState>)],
     /// チャット履歴コンテナ用のフォーカスハンドル。
     pub ai_chat_history_focus: &'a FocusHandle,
+    /// チャット履歴の明示スクロールハンドル。
+    pub ai_chat_scroll_handle: &'a ScrollHandle,
 }
 
 /// 4 タブ（クリップ設定 / AI / レイヤー / プロジェクト情報）を切り替える右側パネルを構築する。
@@ -103,10 +106,13 @@ pub fn render_right_panel(
             .overflow_hidden()
             .child(render_ai_chat_panel(
                 controller,
-                widgets.ai_provider_select,
-                widgets.ai_chat_input,
-                widgets.ai_ask_inputs,
-                widgets.ai_chat_history_focus,
+                AiChatPanelWidgets {
+                    ai_provider_select: widgets.ai_provider_select,
+                    ai_chat_input: widgets.ai_chat_input,
+                    ai_ask_inputs: widgets.ai_ask_inputs,
+                    ai_chat_history_focus: widgets.ai_chat_history_focus,
+                    ai_chat_scroll_handle: widgets.ai_chat_scroll_handle,
+                },
                 cx,
             ))
             .into_any_element(),

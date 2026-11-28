@@ -97,6 +97,12 @@ actions!(
         TimelineZoomIn,
         /// タイムラインを縮小する。
         TimelineZoomOut,
+        /// タイムライン再生位置追随モードを「ページ」に設定する。
+        SetPlayheadFollowPageAction,
+        /// タイムライン再生位置追随モードを「中央」に設定する。
+        SetPlayheadFollowCenterAction,
+        /// タイムライン再生位置追随モードを「OFF」に設定する。
+        SetPlayheadFollowOffAction,
         /// 右パネルをクリップ設定タブへ切り替える。
         ShowTabClipInspectorAction,
         /// 右パネルを AI チャットタブへ切り替える。
@@ -176,6 +182,8 @@ pub struct MenuCheckState {
     pub preview_overlays: PreviewOverlayChecks,
     /// シーク追従チェック状態。
     pub follow_selected_on_seek: bool,
+    /// タイムライン再生位置追随モード。
+    pub playhead_follow_mode: crate::ui::editor_prefs::TimelinePlayheadFollowMode,
     /// 再生停止時に開始位置へ戻すチェック状態。
     pub return_to_start_on_stop: bool,
     /// 現在のプレビュー倍率モード。
@@ -433,6 +441,7 @@ fn build_language_submenu() -> Menu {
 }
 
 fn build_view_menu(state: MenuCheckState) -> Menu {
+    use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
     Menu {
         name: tr("menu.view").into(),
         items: vec![
@@ -454,6 +463,22 @@ fn build_view_menu(state: MenuCheckState) -> Menu {
             MenuItem::separator(),
             MenuItem::action(tr("menu.view.tl_zoom_in"), TimelineZoomIn),
             MenuItem::action(tr("menu.view.tl_zoom_out"), TimelineZoomOut),
+            MenuItem::separator(),
+            MenuItem::action(
+                tr("menu.view.follow_playhead_page"),
+                SetPlayheadFollowPageAction,
+            )
+            .checked(state.playhead_follow_mode == TimelinePlayheadFollowMode::Page),
+            MenuItem::action(
+                tr("menu.view.follow_playhead_center"),
+                SetPlayheadFollowCenterAction,
+            )
+            .checked(state.playhead_follow_mode == TimelinePlayheadFollowMode::Center),
+            MenuItem::action(
+                tr("menu.view.follow_playhead_off"),
+                SetPlayheadFollowOffAction,
+            )
+            .checked(state.playhead_follow_mode == TimelinePlayheadFollowMode::Off),
             MenuItem::separator(),
             MenuItem::action(tr("menu.view.tab_inspector"), ShowTabClipInspectorAction)
                 .checked(state.right_tab == RightPanelTab::ClipInspector),

@@ -1,14 +1,18 @@
 //! Google Gemini REST / SSE API クライアント。
 
+use std::sync::{Arc, atomic::AtomicBool};
+
 use serde_json::{Value, json};
 
 use crate::ai::provider::{
     AiAgentTurnRequest, AiAgentTurnResponse, AiContentPart, AiError, AiProvider, AiProviderKind,
-    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage, AiToolCall,
-    AiTurnMessage, SecretString,
+    AiRequest, AiResponse, AiRole, AiStreamEvent, AiThinkingBlock, AiThinkingLevel, AiTokenUsage,
+    AiToolCall, AiTurnMessage, SecretString,
 };
 use crate::ai::providers::credentials::require_api_key;
-use crate::ai::providers::sse::{HttpJsonRequest, post_json_streaming_or_sync, post_json_sync};
+use crate::ai::providers::sse::{HttpJsonRequest, post_json_sse_or_sync};
+
+const MAX_GEMINI_FLASH_THINKING_BUDGET: u32 = 24_576;
 
 /// Google Gemini API 接続設定。
 #[derive(Debug, Clone)]
@@ -102,12 +106,36 @@ impl GeminiProvider {
 
     fn apply_thinking_config(&self, gen_cfg: &mut Value) {
         let lower_model = self.config.model.to_ascii_lowercase();
-        if lower_model.contains("gemini-3") || lower_model.contains("gemini-4") {
+        let is_modern_gemini = lower_model.contains("gemini-3") || lower_model.contains("gemini-4");
+        let is_thinking_capable = is_modern_gemini
+            || lower_model.contains("gemini-2.5")
+            || lower_model.contains("thinking");
+        if !is_thinking_capable {
+            return;
+        }
+        if is_modern_gemini {
             if let Some(level) = self.config.thinking_level.gemini_thinking_level() {
-                gen_cfg["thinkingConfig"] = json!({ "thinkingLevel": level });
+                gen_cfg["thinkingConfig"] = json!({
+                    "thinkingLevel": level,
+                    "includeThoughts": true,
+                });
+            } else {
+                // Gemini 3/4 は Auto でも既定で思考するため includeThoughts を明示有効化する
+                gen_cfg["thinkingConfig"] = json!({ "includeThoughts": true });
             }
-        } else if let Some(budget) = self.config.thinking_level.gemini_thinking_budget() {
-            gen_cfg["thinkingConfig"] = json!({ "thinkingBudget": budget });
+        } else if let Some(raw_budget) = self.config.thinking_level.gemini_thinking_budget() {
+            let budget = if lower_model.contains("flash") {
+                raw_budget.min(MAX_GEMINI_FLASH_THINKING_BUDGET)
+            } else {
+                raw_budget
+            };
+            let mut cfg = json!({ "thinkingBudget": budget });
+            if budget > 0 {
+                cfg["includeThoughts"] = json!(true);
+            }
+            gen_cfg["thinkingConfig"] = cfg;
+        } else {
+            gen_cfg["thinkingConfig"] = json!({ "includeThoughts": true });
         }
     }
 
@@ -154,8 +182,14 @@ impl GeminiProvider {
             }));
         }
 
-        let temp = request.temperature.unwrap_or(0.2);
-        let mut gen_cfg = json!({ "temperature": temp });
+        let lower_model = self.config.model.to_ascii_lowercase();
+        let is_modern_gemini = lower_model.contains("gemini-3") || lower_model.contains("gemini-4");
+        let mut gen_cfg = json!({});
+        if let Some(temp) = request.temperature {
+            gen_cfg["temperature"] = json!(temp);
+        } else if !is_modern_gemini {
+            gen_cfg["temperature"] = json!(0.2);
+        }
         if request.tools.is_empty()
             && let Some(schema) = &request.response_json_schema
         {
@@ -240,14 +274,42 @@ impl AiProvider for GeminiProvider {
             headers: &headers,
             body: &body,
             timeout_secs: self.config.timeout_secs,
+            cancel_flag: None,
         };
-        let mut sse_usage: Option<AiTokenUsage> = None;
-        let mut sync_usage: Option<AiTokenUsage> = None;
-        let raw_text = post_json_streaming_or_sync(
+        let (raw_text, sse_usage, sync_usage, on_event) = post_json_sse_or_sync(
             &http_req,
-            |payload| parse_gemini_json_text(payload, &mut sse_usage),
-            |val| parse_gemini_sync_text(val, &mut sync_usage),
-            on_event,
+            (
+                String::new(),
+                None::<String>,
+                None::<AiTokenUsage>,
+                None::<AiTokenUsage>,
+                on_event,
+            ),
+            |(collected, finish_reason, sse_u, _, evt_cb), _event_name, payload| {
+                process_gemini_streaming_payload(
+                    payload,
+                    collected,
+                    finish_reason,
+                    sse_u,
+                    *evt_cb,
+                )?;
+                Ok(false)
+            },
+            |(collected, finish_reason, sse_u, sync_u, evt_cb)| {
+                if finish_reason.is_none() {
+                    return Err(AiError::ParseFailed(
+                        "Gemini SSE stream terminated prematurely without finishReason".to_owned(),
+                    ));
+                }
+                Ok((collected, sse_u, sync_u, evt_cb))
+            },
+            |(_, _, sse_u, mut sync_u, evt_cb), val| {
+                let text = parse_gemini_sync_text_and_thoughts(val, &mut sync_u, evt_cb)?;
+                if !text.is_empty() {
+                    evt_cb(AiStreamEvent::DeltaText(text.clone()));
+                }
+                Ok((text, sse_u, sync_u, evt_cb))
+            },
         )?;
 
         let response = AiResponse {
@@ -264,6 +326,15 @@ impl AiProvider for GeminiProvider {
         request: &AiAgentTurnRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiAgentTurnResponse, AiError> {
+        self.send_agent_turn_cancellable(request, None, on_event)
+    }
+
+    fn send_agent_turn_cancellable(
+        &self,
+        request: &AiAgentTurnRequest,
+        cancel_flag: Option<&Arc<AtomicBool>>,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
         self.validate_model_id()?;
         let key = require_api_key(&AiProviderKind::Gemini, self.config.api_key.as_ref())?
             .ok_or_else(|| AiError::MissingCredentials {
@@ -272,7 +343,14 @@ impl AiProvider for GeminiProvider {
             })?;
 
         let base = self.config.base_url.trim_end_matches('/');
-        let url = format!("{base}/models/{}:generateContent", self.config.model);
+        let url = if self.config.use_streaming {
+            format!(
+                "{base}/models/{}:streamGenerateContent?alt=sse",
+                self.config.model
+            )
+        } else {
+            format!("{base}/models/{}:generateContent", self.config.model)
+        };
         let body = self.build_agent_request_body(request);
         let headers = [("x-goog-api-key", key.expose())];
 
@@ -285,10 +363,47 @@ impl AiProvider for GeminiProvider {
             headers: &headers,
             body: &body,
             timeout_secs: self.config.timeout_secs,
+            cancel_flag: cancel_flag.cloned(),
         };
-        let json_val = post_json_sync(&http_req)?;
-        parse_gemini_agent_response(&json_val, &self.config.model)
+        post_json_sse_or_sync(
+            &http_req,
+            (GeminiAgentStreamAcc::default(), on_event),
+            |(acc, evt_cb), _event_name, payload| {
+                process_gemini_agent_sse_payload(acc, payload, *evt_cb)?;
+                Ok(false)
+            },
+            |(state, _)| {
+                if state.finish_reason.is_none() {
+                    return Err(AiError::ParseFailed(
+                        "Gemini SSE stream terminated prematurely without finishReason".to_owned(),
+                    ));
+                }
+                Ok(AiAgentTurnResponse {
+                    text: (!state.text_buf.is_empty()).then_some(state.text_buf),
+                    thinking_blocks: state.thinking_blocks,
+                    tool_calls: state.tool_calls,
+                    model: self.config.model.clone(),
+                    finish_reason: state.finish_reason,
+                    usage: state.usage,
+                })
+            },
+            |(_, evt_cb), json_val| {
+                let parsed = parse_gemini_agent_response_with_events(
+                    json_val,
+                    &self.config.model,
+                    Some(evt_cb),
+                )?;
+                if let Some(txt) = parsed.text.as_ref().filter(|s| !s.is_empty()) {
+                    evt_cb(AiStreamEvent::DeltaText(txt.clone()));
+                }
+                Ok(parsed)
+            },
+        )
     }
+}
+
+fn is_api_function_call_id(id: &str) -> bool {
+    !id.is_empty() && !id.starts_with("gem_call_") && !id.starts_with("fallback_call_")
 }
 
 fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value>) {
@@ -312,20 +427,54 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
                 .collect();
             ("user", gem_parts)
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text,
+            thinking_blocks,
+            tool_calls,
+        } => {
             let mut gem_parts = Vec::new();
+            let mut non_thought_sigs = Vec::new();
+            for tb in thinking_blocks.iter().filter(|b| !b.signature.is_empty()) {
+                if tb.thinking.is_empty() {
+                    non_thought_sigs.push(tb.signature.as_str());
+                } else {
+                    gem_parts.push(json!({
+                        "text": tb.thinking,
+                        "thought": true,
+                        "thoughtSignature": tb.signature,
+                    }));
+                }
+            }
+            let mut non_thought_iter = non_thought_sigs.into_iter();
             if let Some(txt) = text
                 && !txt.is_empty()
             {
-                gem_parts.push(json!({ "text": txt }));
+                let mut text_part = json!({ "text": txt });
+                // functionCall の有無に関わらず非 thought のテキストパート署名を本体 text パートへ復元する
+                if let Some(sig) = non_thought_iter.next() {
+                    text_part["thoughtSignature"] = json!(sig);
+                }
+                gem_parts.push(text_part);
+            }
+            for sig in non_thought_iter {
+                gem_parts.push(json!({
+                    "text": "",
+                    "thoughtSignature": sig,
+                }));
             }
             for call in tool_calls {
-                gem_parts.push(json!({
-                    "functionCall": {
-                        "name": call.name,
-                        "args": call.arguments,
-                    }
-                }));
+                let mut fc = json!({
+                    "name": call.name,
+                    "args": call.arguments,
+                });
+                if is_api_function_call_id(&call.id) {
+                    fc["id"] = json!(call.id);
+                }
+                let mut part = json!({ "functionCall": fc });
+                if let Some(sig) = &call.thought_signature {
+                    part["thoughtSignature"] = json!(sig);
+                }
+                gem_parts.push(part);
             }
             if gem_parts.is_empty() {
                 gem_parts.push(json!({ "text": "" }));
@@ -333,10 +482,10 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
             ("model", gem_parts)
         }
         AiTurnMessage::ToolResult {
+            tool_call_id,
             name,
             content_json,
             is_error,
-            ..
         } => {
             let parsed = serde_json::from_str::<Value>(content_json)
                 .unwrap_or_else(|_| Value::String(content_json.clone()));
@@ -345,43 +494,211 @@ fn gemini_turn_message_to_parts(msg: &AiTurnMessage) -> (&'static str, Vec<Value
             } else {
                 json!({ "result": parsed })
             };
-            (
-                "user",
-                vec![json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": payload,
-                    }
-                })],
-            )
+            let mut fr = json!({
+                "name": name,
+                "response": payload,
+            });
+            if is_api_function_call_id(tool_call_id) {
+                fr["id"] = json!(tool_call_id);
+            }
+            ("user", vec![json!({ "functionResponse": fr })])
         }
     }
 }
 
+#[derive(Debug, Default)]
+struct GeminiAgentStreamAcc {
+    text_buf: String,
+    thinking_blocks: Vec<AiThinkingBlock>,
+    tool_calls: Vec<AiToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<AiTokenUsage>,
+}
+
+fn check_gemini_payload_error(val: &Value) -> Result<(), AiError> {
+    if let Some(err_obj) = val.get("error").filter(|v| !v.is_null()) {
+        let msg = err_obj["message"]
+            .as_str()
+            .unwrap_or("Gemini API returned error payload");
+        return Err(AiError::ParseFailed(format!("Gemini error: {msg}")));
+    }
+    let has_candidates = val["candidates"]
+        .as_array()
+        .is_some_and(|arr| !arr.is_empty());
+    if !has_candidates
+        && let Some(reason) = val["promptFeedback"]["blockReason"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+    {
+        return Err(AiError::ParseFailed(format!(
+            "Gemini prompt blocked: {reason}"
+        )));
+    }
+    Ok(())
+}
+
+fn process_gemini_streaming_payload(
+    payload: &str,
+    collected: &mut String,
+    finish_reason: &mut Option<String>,
+    captured_usage: &mut Option<AiTokenUsage>,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<(), AiError> {
+    let val: Value = serde_json::from_str(payload)
+        .map_err(|err| AiError::ParseFailed(format!("Gemini SSE JSON parse failed: {err}")))?;
+    check_gemini_payload_error(&val)?;
+    if let Some(usage) = extract_gemini_usage(&val) {
+        *captured_usage = Some(usage);
+    }
+    if let Some(reason) = val["candidates"][0]["finishReason"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        *finish_reason = Some(reason.to_owned());
+    }
+    if let Some(parts) = val["candidates"][0]["content"]["parts"].as_array() {
+        for part in parts {
+            let Some(txt) = part["text"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if part["thought"].as_bool() == Some(true) {
+                on_event(AiStreamEvent::ThoughtDelta(txt.to_owned()));
+            } else {
+                on_event(AiStreamEvent::DeltaText(txt.to_owned()));
+                collected.push_str(txt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn process_gemini_agent_sse_payload(
+    acc: &mut GeminiAgentStreamAcc,
+    payload: &str,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<(), AiError> {
+    let val: Value = serde_json::from_str(payload).map_err(|err| {
+        AiError::ParseFailed(format!("Gemini agent SSE JSON parse failed: {err}"))
+    })?;
+    check_gemini_payload_error(&val)?;
+    if let Some(usage) = extract_gemini_usage(&val) {
+        acc.usage = Some(usage);
+    }
+    let candidate = &val["candidates"][0];
+    if let Some(reason) = candidate["finishReason"].as_str().filter(|s| !s.is_empty()) {
+        acc.finish_reason = Some(reason.to_owned());
+    }
+    if let Some(parts) = candidate["content"]["parts"].as_array() {
+        for part in parts {
+            let is_thought = part["thought"].as_bool() == Some(true);
+            let txt_opt = part["text"].as_str().filter(|s| !s.is_empty());
+            if let Some(txt) = txt_opt {
+                if is_thought {
+                    on_event(AiStreamEvent::ThoughtDelta(txt.to_owned()));
+                } else {
+                    on_event(AiStreamEvent::DeltaText(txt.to_owned()));
+                    acc.text_buf.push_str(txt);
+                }
+            }
+            let part_sig = part["thoughtSignature"]
+                .as_str()
+                .or_else(|| part["thought_signature"].as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(fc) = part.get("functionCall").filter(|v| v.is_object())
+                && let Some(name) = fc["name"].as_str()
+            {
+                let idx = acc.tool_calls.len();
+                let call_id = fc["id"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map_or_else(|| format!("gem_call_{idx}"), ToOwned::to_owned);
+                acc.tool_calls.push(AiToolCall {
+                    id: call_id,
+                    name: name.to_owned(),
+                    arguments: fc.get("args").cloned().unwrap_or_else(|| json!({})),
+                    thought_signature: part_sig,
+                });
+            } else if let Some(sig) = part_sig {
+                acc.thinking_blocks.push(AiThinkingBlock {
+                    thinking: if is_thought {
+                        txt_opt.unwrap_or("").to_owned()
+                    } else {
+                        String::new()
+                    },
+                    signature: sig,
+                    redacted_data: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnResponse, AiError> {
+    parse_gemini_agent_response_with_events(val, model, None)
+}
+
+fn parse_gemini_agent_response_with_events(
+    val: &Value,
+    model: &str,
+    mut on_event: Option<&mut dyn FnMut(AiStreamEvent)>,
+) -> Result<AiAgentTurnResponse, AiError> {
+    check_gemini_payload_error(val)?;
     let candidate = &val["candidates"][0];
     let parts = candidate["content"]["parts"]
         .as_array()
         .ok_or_else(|| AiError::ParseFailed("Gemini agent response missing parts".to_owned()))?;
     let mut text_buf = String::new();
+    let mut thinking_blocks = Vec::new();
     let mut tool_calls = Vec::new();
-    for (idx, part) in parts.iter().enumerate() {
+    for part in parts {
         let is_thought = part["thought"].as_bool() == Some(true);
-        if !is_thought && let Some(txt) = part["text"].as_str() {
-            text_buf.push_str(txt);
+        let txt_opt = part["text"].as_str();
+        if let Some(txt) = txt_opt.filter(|s| !s.is_empty()) {
+            if is_thought {
+                if let Some(cb) = on_event.as_deref_mut() {
+                    cb(AiStreamEvent::ThoughtDelta(txt.to_owned()));
+                }
+            } else {
+                text_buf.push_str(txt);
+            }
         }
+        let part_sig = part["thoughtSignature"]
+            .as_str()
+            .or_else(|| part["thought_signature"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         if let Some(fc) = part.get("functionCall").filter(|v| v.is_object())
             && let Some(name) = fc["name"].as_str()
         {
+            let idx = tool_calls.len();
+            let call_id = fc["id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map_or_else(|| format!("gem_call_{idx}"), ToOwned::to_owned);
             tool_calls.push(AiToolCall {
-                id: format!("gem_call_{idx}"),
+                id: call_id,
                 name: name.to_owned(),
                 arguments: fc.get("args").cloned().unwrap_or_else(|| json!({})),
+                thought_signature: part_sig,
+            });
+        } else if let Some(sig) = part_sig {
+            thinking_blocks.push(AiThinkingBlock {
+                thinking: if is_thought {
+                    txt_opt.unwrap_or("").to_owned()
+                } else {
+                    String::new()
+                },
+                signature: sig,
+                redacted_data: None,
             });
         }
     }
     Ok(AiAgentTurnResponse {
         text: (!text_buf.is_empty()).then_some(text_buf),
+        thinking_blocks,
         tool_calls,
         model: model.to_owned(),
         finish_reason: candidate["finishReason"].as_str().map(ToOwned::to_owned),
@@ -389,24 +706,23 @@ fn parse_gemini_agent_response(val: &Value, model: &str) -> Result<AiAgentTurnRe
     })
 }
 
-fn parse_gemini_json_text(
-    payload: &str,
-    captured_usage: &mut Option<AiTokenUsage>,
-) -> Result<Option<String>, AiError> {
-    let val: Value = serde_json::from_str(payload)
-        .map_err(|err| AiError::ParseFailed(format!("Gemini SSE JSON parse failed: {err}")))?;
-    if let Some(usage) = extract_gemini_usage(&val) {
-        *captured_usage = Some(usage);
-    }
-    Ok(extract_candidate_text(&val))
-}
-
-fn parse_gemini_sync_text(
+fn parse_gemini_sync_text_and_thoughts(
     val: &Value,
     captured_usage: &mut Option<AiTokenUsage>,
+    on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<String, AiError> {
+    check_gemini_payload_error(val)?;
     if let Some(usage) = extract_gemini_usage(val) {
         *captured_usage = Some(usage);
+    }
+    if let Some(parts) = val["candidates"][0]["content"]["parts"].as_array() {
+        for part in parts {
+            if part["thought"].as_bool() == Some(true)
+                && let Some(txt) = part["text"].as_str().filter(|s| !s.is_empty())
+            {
+                on_event(AiStreamEvent::ThoughtDelta(txt.to_owned()));
+            }
+        }
     }
     extract_candidate_text(val)
         .ok_or_else(|| AiError::ParseFailed("Gemini response missing candidates text".to_owned()))
@@ -627,6 +943,230 @@ mod tests {
         assert!(encoded_model.validate_model_id().is_err());
         let colon_model = GeminiProvider::new(GeminiConfig::new("gemini:evil", None));
         assert!(colon_model.validate_model_id().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_agent_turn_streams_thoughts_and_preserves_thought_signature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"どの写真を回すか確認しよう\",\"thought\":true}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"確認カードを表示します。\"},{\"functionCall\":{\"name\":\"ask_user\",\"args\":{\"title\":\"確認\"}},\"thoughtSignature\":\"sig_gem_123\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10,\"thoughtsTokenCount\":5,\"totalTokenCount\":35}}\n\n"
+        );
+        let (addr, srv) = spawn_single_response_server("text/event-stream", sse)?;
+        let mut cfg = GeminiConfig::new("gemini-3.0-pro", Some(SecretString::new("gem-sse")));
+        cfg.base_url = format!("http://{addr}/v1beta");
+        let provider = GeminiProvider::new(cfg);
+
+        let turn_req = AiAgentTurnRequest {
+            system_prompt: "Director".to_owned(),
+            messages: vec![AiTurnMessage::Assistant {
+                text: None,
+                thinking_blocks: Vec::new(),
+                tool_calls: vec![AiToolCall {
+                    id: "prev_1".to_owned(),
+                    name: "get_timeline_summary".to_owned(),
+                    arguments: json!({}),
+                    thought_signature: Some("prev_sig_99".to_owned()),
+                }],
+            }],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        };
+        let mut thoughts = Vec::new();
+        let mut deltas = Vec::new();
+        let res = provider.send_agent_turn(&turn_req, &mut |evt| match evt {
+            AiStreamEvent::ThoughtDelta(t) => thoughts.push(t),
+            AiStreamEvent::DeltaText(t) => deltas.push(t),
+            _ => {}
+        })?;
+        assert_eq!(thoughts, vec!["どの写真を回すか確認しよう"]);
+        assert_eq!(deltas, vec!["確認カードを表示します。"]);
+        assert_eq!(res.text.as_deref(), Some("確認カードを表示します。"));
+        assert_eq!(res.tool_calls.len(), 1);
+        assert_eq!(
+            res.tool_calls[0].thought_signature.as_deref(),
+            Some("sig_gem_123")
+        );
+        assert_eq!(res.usage.as_ref().map(|u| u.total_tokens), Some(35));
+
+        let cap = srv.join().map_err(|_| "srv join")??;
+        assert!(cap.contains("streamGenerateContent?alt=sse"), "cap={cap}");
+        let (_, json_body) = cap.split_once("\r\n\r\n").ok_or("missing HTTP body")?;
+        let req_json: Value = serde_json::from_str(json_body)?;
+        assert_eq!(
+            req_json["contents"][0]["parts"][0]["functionCall"]["id"],
+            json!("prev_1")
+        );
+        assert_eq!(
+            req_json["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("prev_sig_99")
+        );
+        assert_eq!(
+            req_json["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_thinking_config_flash_clamp_non_fc_signature_and_call_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. gemini-2.5-flash Extra clamp to 24576 + includeThoughts
+        let flash = GeminiProvider::new(
+            GeminiConfig::new("gemini-2.5-flash", None).with_thinking_level(AiThinkingLevel::Extra),
+        );
+        let flash_body = flash.build_agent_request_body(&AiAgentTurnRequest {
+            system_prompt: "S".to_owned(),
+            messages: vec![AiTurnMessage::user_text("hi")],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        });
+        assert_eq!(
+            flash_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(24576)
+        );
+        assert_eq!(
+            flash_body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(true)
+        );
+
+        // 2. gemini-3 omits default temperature when None, sets includeThoughts, and non-thinking model omits thinkingConfig
+        let g3 = GeminiProvider::new(GeminiConfig::new("gemini-3.0-pro", None));
+        let g3_body = g3.build_agent_request_body(&AiAgentTurnRequest {
+            system_prompt: "S".to_owned(),
+            messages: vec![AiTurnMessage::user_text("hi")],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        });
+        assert!(g3_body["generationConfig"].get("temperature").is_none());
+        assert_eq!(
+            g3_body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(true)
+        );
+        let g15 = GeminiProvider::new(
+            GeminiConfig::new("gemini-1.5-flash", None).with_thinking_level(AiThinkingLevel::High),
+        );
+        let g15_body = g15.build_agent_request_body(&AiAgentTurnRequest {
+            system_prompt: "S".to_owned(),
+            messages: vec![AiTurnMessage::user_text("hi")],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        });
+        assert!(g15_body["generationConfig"].get("thinkingConfig").is_none());
+
+        // 3. non-functionCall thoughtSignature & functionCall.id preservation + sync ThoughtDelta
+        assert_gemini_sig_call_id_and_block_reason(&g3)?;
+        Ok(())
+    }
+
+    fn assert_gemini_sig_call_id_and_block_reason(
+        g3: &GeminiProvider,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let sync_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "考え中", "thought": true },
+                        { "text": "応答です", "thoughtSignature": "sig_text_only" },
+                        { "functionCall": { "id": "api_fc_99", "name": "get_timeline_summary", "args": {} } }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut thoughts = Vec::new();
+        let parsed = parse_gemini_agent_response_with_events(
+            &sync_resp,
+            "gemini-3.0-pro",
+            Some(&mut |evt| {
+                if let AiStreamEvent::ThoughtDelta(t) = evt {
+                    thoughts.push(t);
+                }
+            }),
+        )?;
+        assert_eq!(thoughts, vec!["考え中"]);
+        assert_eq!(parsed.thinking_blocks.len(), 1);
+        assert_eq!(parsed.thinking_blocks[0].signature, "sig_text_only");
+        assert_eq!(parsed.tool_calls[0].id, "api_fc_99");
+
+        let next_req = AiAgentTurnRequest {
+            system_prompt: "S".to_owned(),
+            messages: vec![
+                AiTurnMessage::Assistant {
+                    text: parsed.text,
+                    thinking_blocks: parsed.thinking_blocks,
+                    tool_calls: parsed.tool_calls,
+                },
+                AiTurnMessage::ToolResult {
+                    tool_call_id: "api_fc_99".to_owned(),
+                    name: "get_timeline_summary".to_owned(),
+                    content_json: "{}".to_owned(),
+                    is_error: false,
+                },
+            ],
+            tools: Vec::new(),
+            response_json_schema: None,
+            temperature: None,
+        };
+        let next_body = g3.build_agent_request_body(&next_req);
+        let next_s = next_body.to_string();
+        assert!(next_s.contains("sig_text_only"));
+        assert!(next_s.contains("api_fc_99"));
+
+        let mut acc = GeminiAgentStreamAcc::default();
+        assert!(
+            process_gemini_agent_sse_payload(
+                &mut acc,
+                r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#,
+                &mut |_| {},
+            )
+            .is_err()
+        );
+
+        // #02 & #03: thought パート先頭配置・非 thought 署名 text_part 優先配置・自前 ID (gem_call_*/fallback_call_*) 非送信
+        let (_role, mixed_parts) = gemini_turn_message_to_parts(&AiTurnMessage::Assistant {
+            text: Some("呼び出します".to_owned()),
+            thinking_blocks: vec![
+                AiThinkingBlock {
+                    thinking: String::new(),
+                    signature: "sig_text_mixed".to_owned(),
+                    redacted_data: None,
+                },
+                AiThinkingBlock {
+                    thinking: "まず考える".to_owned(),
+                    signature: "sig_thought_first".to_owned(),
+                    redacted_data: None,
+                },
+            ],
+            tool_calls: vec![AiToolCall {
+                id: "gem_call_0".to_owned(),
+                name: "get_timeline_summary".to_owned(),
+                arguments: json!({}),
+                thought_signature: Some("sig_fc_0".to_owned()),
+            }],
+        });
+        assert_eq!(mixed_parts.len(), 3);
+        assert_eq!(mixed_parts[0]["thought"], json!(true));
+        assert_eq!(
+            mixed_parts[0]["thoughtSignature"],
+            json!("sig_thought_first")
+        );
+        assert_eq!(mixed_parts[1]["text"], json!("呼び出します"));
+        assert_eq!(mixed_parts[1]["thoughtSignature"], json!("sig_text_mixed"));
+        assert!(mixed_parts[2]["functionCall"].get("id").is_none());
+
+        let (_role_fr, fr_parts) = gemini_turn_message_to_parts(&AiTurnMessage::ToolResult {
+            tool_call_id: "gem_call_0".to_owned(),
+            name: "get_timeline_summary".to_owned(),
+            content_json: "{}".to_owned(),
+            is_error: false,
+        });
+        assert!(fr_parts[0]["functionResponse"].get("id").is_none());
         Ok(())
     }
 

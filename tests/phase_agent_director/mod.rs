@@ -140,7 +140,12 @@ fn mock_vision_batch_reply(
 
     let mut analyses = Vec::new();
     for (idx, p) in image_paths.iter().enumerate() {
-        if user_txt.contains(p.as_str()) {
+        let matches_path_or_file = user_txt.contains(p.as_str())
+            || Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|fname| user_txt.contains(fname));
+        if matches_path_or_file {
             let pos = analyses.len();
             analyses.push(json!({
                 "index": pos,
@@ -155,6 +160,7 @@ fn mock_vision_batch_reply(
     }
     AiAgentTurnResponse {
         text: Some(json!({ "analyses": analyses }).to_string()),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         model: "mock-vision-v1".to_owned(),
         finish_reason: Some("stop".to_owned()),
@@ -184,6 +190,7 @@ fn build_wedding_mock_provider(
                     })
                     .to_string(),
                 ),
+                thinking_blocks: Vec::new(),
                 tool_calls: Vec::new(),
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("stop".to_owned()),
@@ -231,6 +238,7 @@ fn build_wedding_mock_provider(
         });
         Ok(AiAgentTurnResponse {
             text: Some(valid_bp.to_string()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
@@ -256,6 +264,7 @@ fn verify_session_reload_and_followup(
         if step == 0 {
             return Ok(AiAgentTurnResponse {
                 text: None,
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AiToolCall {
                     id: "call_meta_1".to_owned(),
                     name: "apply_draft_edit_command".to_owned(),
@@ -265,6 +274,7 @@ fn verify_session_reload_and_followup(
                             "name": "太郎 & 花子 Profile Movie (Final Cut)"
                         }
                     }),
+                    thought_signature: None,
                 }],
                 model: "mock-director-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -273,6 +283,7 @@ fn verify_session_reload_and_followup(
         }
         Ok(AiAgentTurnResponse {
             text: Some("ご指示どおり構成タイトルをブラッシュアップしました。".to_owned()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-director-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
@@ -371,7 +382,7 @@ fn wedding_three_minute_agent_workflow_session_resume_and_followup()
         Some(director.clone()),
     )?;
 
-    // 1) Vision 解析完了後、ask_user リッチ対話カードへ到達するのを待機
+    // 1) フォルダ走査直後（Vision 解析前）、ask_user リッチ対話カードへ到達するのを待機
     poll_until(&mut controller, Duration::from_secs(20), |c| {
         c.ai_chat.pending_question.is_some()
     })?;
@@ -493,10 +504,12 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
         if idx == 0 {
             return Ok(AiAgentTurnResponse {
                 text: None,
+                thinking_blocks: Vec::new(),
                 tool_calls: vec![AiToolCall {
                     id: "ext_1".to_owned(),
                     name: "future_tts_narration".to_owned(),
                     arguments: json!({ "text": "本日はご列席ありがとうございます" }),
+                    thought_signature: None,
                 }],
                 model: "mock-v1".to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -505,6 +518,7 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
         }
         Ok(AiAgentTurnResponse {
             text: Some("外部 TTS 拡張ツールを呼び出しました。".to_owned()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),
@@ -533,9 +547,11 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
             min_llm_interval_ms: 120,
             vision_batch_size: 4,
             vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
         },
         tool_registry: Some(toolbox),
         extra_extensions: Vec::new(),
+        project_dir: None,
     })?;
 
     // 1) Manual モードのため ExternalSideEffect 実行前に承認要求で一時停止する
@@ -578,16 +594,9 @@ fn dynamic_external_tool_approval_and_rate_limit_work_end_to_end()
     Ok(())
 }
 
-#[test]
-fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_question()
--> Result<(), Box<dyn std::error::Error>> {
-    let reg = AgentPluginRegistry::discover_default();
-    let director = reg
-        .find_by_id("sea.agent.director")
-        .cloned()
-        .ok_or("sea.agent.director plugin manifest missing")?;
-
-    let guard = TempDirGuard::new("partial_429")?;
+fn setup_partial_429_fixture(
+    guard: &TempDirGuard,
+) -> Result<(PathBuf, PathBuf, Arc<MockAiProvider>), Box<dyn std::error::Error>> {
     let media_dir = guard.0.join("photos");
     let store_dir = guard.0.join("sessions");
     fs::create_dir_all(&media_dir)?;
@@ -600,22 +609,36 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
     }
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let call_ref = Arc::clone(&call_count);
-    let paths_for_mock = paths.clone();
     let provider = Arc::new(MockAiProvider::with_agent_handler(move |req| {
-        let call_idx = call_ref.fetch_add(1, Ordering::SeqCst);
+        let call_idx = call_count.fetch_add(1, Ordering::SeqCst);
         if call_idx == 0 {
-            return Ok(mock_vision_batch_reply(req, &paths_for_mock));
+            return Ok(mock_vision_batch_reply(req, &paths));
         }
         Err(sea_movie_creator::ai::provider::AiError::HttpStatus {
             status: 429,
             body: "rate limit exceeded".to_owned(),
         })
     }));
+    Ok((media_dir, store_dir, provider))
+}
+
+#[test]
+fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_question()
+-> Result<(), Box<dyn std::error::Error>> {
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let guard = TempDirGuard::new("partial_429")?;
+    let (media_dir, store_dir, provider) = setup_partial_429_fixture(&guard)?;
 
     let store = AiSessionStore::new(&store_dir);
     let mut controller = AppController::new();
     controller.ai_chat.session_store = Some(store.clone());
+    controller.ai_chat.runtime_settings.vision_packing_mode =
+        sea_movie_creator::ai::provider::VisionPackingMode::Individual;
     controller.ai_chat.runtime_settings.vision_batch_size = 4;
     controller.ai_chat.attach_folder_with_auto_agent(media_dir);
     let sid = controller.ai_chat.session_id.clone();
@@ -624,6 +647,17 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
         "写真を整理してムービーにして",
         provider,
         Some(director.clone()),
+    )?;
+
+    // 先に提示される初回希望確認カードへ応答し、後続の Vision バッチ解析へ進める
+    poll_until(&mut controller, Duration::from_secs(20), |c| {
+        c.ai_chat.pending_question.is_some()
+    })?;
+    controller.answer_pending_agent_question(
+        Some("auto".to_owned()),
+        BTreeMap::new(),
+        None,
+        false,
     )?;
 
     let start = Instant::now();
@@ -685,5 +719,372 @@ fn rate_limit_preserves_partial_vision_memory_and_resumes_without_pending_questi
     )?;
     assert!(controller2.ai_chat.pending_question.is_none());
     let _ = controller2.cancel_ai_prompt();
+    Ok(())
+}
+
+fn recv_runner_until<T>(
+    runner: &AgentSessionRunner,
+    timeout: Duration,
+    mut pred: impl FnMut(&AgentHostEvent) -> Option<T>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(ev) = runner.recv_event_timeout(Duration::from_millis(100)) {
+            if let Some(found) = pred(&ev) {
+                return Ok(found);
+            }
+            if let AgentHostEvent::AgentError {
+                code,
+                message,
+                recoverable: false,
+            } = ev
+            {
+                return Err(format!("fatal agent error [{code}]: {message}").into());
+            }
+        }
+    }
+    Err("timed out waiting for AgentHostEvent".into())
+}
+
+fn build_skip_thinking_mock_provider(
+    seen_redacted: Arc<AtomicBool>,
+    seen_skip: Arc<AtomicBool>,
+) -> Arc<MockAiProvider> {
+    use sea_movie_creator::ai::provider::AiThinkingBlock;
+
+    Arc::new(MockAiProvider::with_agent_handler(move |req| {
+        if req.messages.len() <= 2 {
+            return Ok(AiAgentTurnResponse {
+                text: None,
+                thinking_blocks: vec![
+                    AiThinkingBlock {
+                        thinking: "確認事項を整理".to_owned(),
+                        signature: "sig_step1".to_owned(),
+                        redacted_data: None,
+                    },
+                    AiThinkingBlock {
+                        thinking: String::new(),
+                        signature: String::new(),
+                        redacted_data: Some("opaque_redacted_1".to_owned()),
+                    },
+                ],
+                tool_calls: vec![AiToolCall {
+                    id: "ask_1".to_owned(),
+                    name: "ask_user".to_owned(),
+                    arguments: json!({
+                        "title": "方向性確認",
+                        "message": "字幕色を選びますか？",
+                        "allow_skip": true
+                    }),
+                    thought_signature: Some("gem_sig_ask".to_owned()),
+                }],
+                model: "mock-v1".to_owned(),
+                finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
+            });
+        }
+        for msg in &req.messages {
+            if let AiTurnMessage::Assistant {
+                thinking_blocks, ..
+            } = msg
+                && thinking_blocks
+                    .iter()
+                    .any(|b| b.redacted_data.as_deref() == Some("opaque_redacted_1"))
+            {
+                seen_redacted.store(true, Ordering::Release);
+            }
+            if let AiTurnMessage::ToolResult { content_json, .. } = msg
+                && content_json.contains("\"skipped\":true")
+            {
+                seen_skip.store(true, Ordering::Release);
+            }
+        }
+        Ok(AiAgentTurnResponse {
+            text: Some("おまかせ設定で確認完了しました（変更なし）。".to_owned()),
+            thinking_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            model: "mock-v1".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            usage: None,
+        })
+    }))
+}
+
+#[test]
+fn director_preserves_thinking_blocks_and_handles_ask_user_skip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let seen_second_turn_has_redacted = Arc::new(AtomicBool::new(false));
+    let seen_skip_reply = Arc::new(AtomicBool::new(false));
+    let provider_skip = build_skip_thinking_mock_provider(
+        Arc::clone(&seen_second_turn_has_redacted),
+        Arc::clone(&seen_skip_reply),
+    );
+
+    let runner1 = AgentSessionRunner::start(AgentSessionStartConfig {
+        plugin: director,
+        session_id: "sess_thinking_skip".to_owned(),
+        goal: "全体の相談だけ".to_owned(),
+        resume: false,
+        attached_folders: Vec::new(),
+        attached_clips: Vec::new(),
+        base_document: ProjectDocument::new("ThinkingTest"),
+        timeline_summary: "{}".to_owned(),
+        agent_memory: json!({}),
+        provider: provider_skip,
+        provider_kind: AiProviderKind::Mock,
+        model_name: "mock-v1".to_owned(),
+        thinking_level: AiThinkingLevel::High,
+        approval_mode: AiApprovalMode::Autopilot,
+        runtime_settings: AgentRuntimeSettings::default(),
+        tool_registry: None,
+        extra_extensions: Vec::new(),
+        project_dir: None,
+    })?;
+
+    let mut ask_ok_on_skip = false;
+    let _proposal1 = recv_runner_until(&runner1, Duration::from_secs(10), |ev| match ev {
+        AgentHostEvent::AskUser { request_id, .. } => {
+            let _ = runner1.send_user_answer(
+                request_id.clone(),
+                sea_agent_protocol::AgentUserAnswerPayload {
+                    choice_id: None,
+                    field_values: BTreeMap::new(),
+                    free_text: None,
+                    skipped: true,
+                },
+            );
+            None
+        }
+        AgentHostEvent::ToolActivity {
+            tool_name,
+            ok,
+            summary,
+            ..
+        } if tool_name == "ask_user" && summary == "skipped" => {
+            ask_ok_on_skip = *ok;
+            None
+        }
+        AgentHostEvent::Proposal {
+            summary_markdown, ..
+        } => Some(summary_markdown.clone()),
+        _ => None,
+    })?;
+    assert!(ask_ok_on_skip);
+    assert!(seen_second_turn_has_redacted.load(Ordering::Acquire));
+    assert!(seen_skip_reply.load(Ordering::Acquire));
+    runner1.shutdown();
+    Ok(())
+}
+
+fn build_audit_stop_doc(img_path: &Path) -> Result<ProjectDocument, Box<dyn std::error::Error>> {
+    use sea_movie_creator::core::ids::{AssetId, ClipId, LayerId};
+    use sea_movie_creator::core::time::{FrameCount, FrameIndex};
+    use sea_movie_creator::media::visual_properties::VisualProperties;
+    use sea_movie_creator::timeline::document::{
+        Asset, AssetKind, AssetPath, AssetStatus, Clip, ClipKind, Layer,
+    };
+
+    let mut doc = ProjectDocument::new("AuditStopTest");
+    let asset_id = AssetId::new("a1")?;
+    doc.assets.push(Asset {
+        id: asset_id.clone(),
+        name: "sample.png".to_owned(),
+        path: AssetPath::new(None, Some(img_path.to_string_lossy().into_owned())),
+        kind: AssetKind::Image {
+            width: 320,
+            height: 240,
+        },
+        status: AssetStatus::Available,
+    });
+    let mut layer = Layer::new(LayerId::new("photos")?, "Photos");
+    layer.clips.push(Clip {
+        id: ClipId::new("c1")?,
+        name: "sample".to_owned(),
+        timeline_start: FrameIndex(0),
+        duration: FrameCount::new(120)?,
+        effect_offset_frames: 0,
+        effect_duration_frames: None,
+        midpoints: Vec::new(),
+        kind: ClipKind::Image {
+            asset_id,
+            visual: VisualProperties::default(),
+        },
+    });
+    doc.layers.push(layer);
+    Ok(doc)
+}
+
+#[test]
+fn director_stops_safely_on_audit_vision_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    use sea_movie_creator::ai::provider::AiError;
+
+    let guard = TempDirGuard::new("audit_stop")?;
+    let img_path = guard.0.join("sample.png");
+    write_test_png(&img_path, 320, 240)?;
+    let doc = build_audit_stop_doc(&img_path)?;
+
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let call_counter = Arc::new(AtomicUsize::new(0));
+    let call_counter_clone = Arc::clone(&call_counter);
+    let provider_vision_err = Arc::new(MockAiProvider::with_agent_handler(move |req| {
+        if req.response_json_schema.is_some() {
+            return Err(AiError::PluginError(
+                "vision_unsupported: model does not support image input".to_owned(),
+            ));
+        }
+        let idx = call_counter_clone.fetch_add(1, Ordering::AcqRel);
+        if idx == 0 {
+            Ok(AiAgentTurnResponse {
+                text: None,
+                thinking_blocks: Vec::new(),
+                tool_calls: vec![AiToolCall {
+                    id: "audit_1".to_owned(),
+                    name: "audit_timeline_slides".to_owned(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }],
+                model: "mock-text-only".to_owned(),
+                finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
+            })
+        } else {
+            Ok(AiAgentTurnResponse {
+                text: Some("選択中のモデルが画像入力非対応のため安全停止しました。".to_owned()),
+                thinking_blocks: Vec::new(),
+                tool_calls: Vec::new(),
+                model: "mock-text-only".to_owned(),
+                finish_reason: Some("stop".to_owned()),
+                usage: None,
+            })
+        }
+    }));
+
+    let runner2 = AgentSessionRunner::start(AgentSessionStartConfig {
+        plugin: director,
+        session_id: "sess_audit_safe_stop".to_owned(),
+        goal: "写真の字幕と向きを直して".to_owned(),
+        resume: false,
+        attached_folders: Vec::new(),
+        attached_clips: Vec::new(),
+        base_document: doc,
+        timeline_summary: "{}".to_owned(),
+        agent_memory: json!({}),
+        provider: provider_vision_err,
+        provider_kind: AiProviderKind::Mock,
+        model_name: "mock-text-only".to_owned(),
+        thinking_level: AiThinkingLevel::Auto,
+        approval_mode: AiApprovalMode::Autopilot,
+        runtime_settings: AgentRuntimeSettings::default(),
+        tool_registry: None,
+        extra_extensions: Vec::new(),
+        project_dir: None,
+    })?;
+    let summary2 = recv_runner_until(&runner2, Duration::from_secs(10), |ev| {
+        if let AgentHostEvent::Proposal {
+            summary_markdown, ..
+        } = ev
+        {
+            Some(summary_markdown.clone())
+        } else {
+            None
+        }
+    })?;
+    // try_queue_self_repair が発火しないため LLM 呼び出しは 2 回で終了し、0 件警告も付かない
+    assert_eq!(call_counter.load(Ordering::Acquire), 2);
+    assert!(!summary2.contains("タイムラインへの変更は行われませんでした"));
+    runner2.shutdown();
+    Ok(())
+}
+
+#[test]
+fn director_stops_safely_when_provider_lacks_vision_capability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let guard = TempDirGuard::new("audit_static_no_vision")?;
+    let img_path = guard.0.join("sample.png");
+    write_test_png(&img_path, 320, 240)?;
+    let doc_static = build_audit_stop_doc(&img_path)?;
+
+    let reg = AgentPluginRegistry::discover_default();
+    let director = reg
+        .find_by_id("sea.agent.director")
+        .cloned()
+        .ok_or("sea.agent.director plugin manifest missing")?;
+
+    let static_counter = Arc::new(AtomicUsize::new(0));
+    let static_counter_clone = Arc::clone(&static_counter);
+    let provider_static_no_vision = Arc::new(
+        MockAiProvider::with_agent_handler(move |_req| {
+            let idx = static_counter_clone.fetch_add(1, Ordering::AcqRel);
+            if idx == 0 {
+                Ok(AiAgentTurnResponse {
+                    text: None,
+                    thinking_blocks: Vec::new(),
+                    tool_calls: vec![AiToolCall {
+                        id: "audit_static_1".to_owned(),
+                        name: "audit_timeline_slides".to_owned(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }],
+                    model: "mock-no-vision".to_owned(),
+                    finish_reason: Some("tool_calls".to_owned()),
+                    usage: None,
+                })
+            } else {
+                Ok(AiAgentTurnResponse {
+                    text: Some("画像非対応のため安全停止しました。".to_owned()),
+                    thinking_blocks: Vec::new(),
+                    tool_calls: Vec::new(),
+                    model: "mock-no-vision".to_owned(),
+                    finish_reason: Some("stop".to_owned()),
+                    usage: None,
+                })
+            }
+        })
+        .with_capabilities(false, true),
+    );
+    let runner3 = AgentSessionRunner::start(AgentSessionStartConfig {
+        plugin: director,
+        session_id: "sess_audit_static_no_vision".to_owned(),
+        goal: "写真の向きを直して".to_owned(),
+        resume: false,
+        attached_folders: Vec::new(),
+        attached_clips: Vec::new(),
+        base_document: doc_static,
+        timeline_summary: "{}".to_owned(),
+        agent_memory: json!({}),
+        provider: provider_static_no_vision,
+        provider_kind: AiProviderKind::Mock,
+        model_name: "mock-no-vision".to_owned(),
+        thinking_level: AiThinkingLevel::Auto,
+        approval_mode: AiApprovalMode::Autopilot,
+        runtime_settings: AgentRuntimeSettings::default(),
+        tool_registry: None,
+        extra_extensions: Vec::new(),
+        project_dir: None,
+    })?;
+    let summary3 = recv_runner_until(&runner3, Duration::from_secs(10), |ev| {
+        if let AgentHostEvent::Proposal {
+            summary_markdown, ..
+        } = ev
+        {
+            Some(summary_markdown.clone())
+        } else {
+            None
+        }
+    })?;
+    assert_eq!(static_counter.load(Ordering::Acquire), 2);
+    assert!(!summary3.contains("タイムラインへの変更は行われませんでした"));
+    runner3.shutdown();
     Ok(())
 }

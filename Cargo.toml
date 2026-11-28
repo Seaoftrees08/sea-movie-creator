@@ -73,7 +73,7 @@ workspace = true
 bytemuck = { version = "1.25", features = ["derive"] }
 cosmic-text = "0.19"
 cpal = "0.18.2"
-gpui-kit = "0.9.1"
+gpui-kit = { version = "0.9.1", features = ["tree-sitter"] }
 image = "0.25"
 keyring = "4.2.0"
 matroska-demuxer = "0.8.1"

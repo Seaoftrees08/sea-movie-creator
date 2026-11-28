@@ -47,3 +47,6 @@
 | 012 | 自律エージェントプラグイン基盤＆構成コンパイラ設計書 | Implemented | [`completed/012-agentic-plugin-architecture.md`](completed/012-agentic-plugin-architecture.md) |
 | 013 | AI チャット UI 改修・VS Code 風設定画面・起動時状態復元・モデル管理・トークン残量表示設計書 | Implemented | [`completed/013-ai-ui-settings-and-usage.md`](completed/013-ai-ui-settings-and-usage.md) |
 | 014 | AI チャット継続性修正・作業中／完了状態の可視化・選択＆コピー対応設計書 | Implemented | [`completed/014-ai-chat-reliability-status-and-copy.md`](completed/014-ai-chat-reliability-status-and-copy.md) |
+| 015 | AI 実行中アクティビティ・思考ストリーム可視化＆質問早期表示設計書 | Implemented | [`completed/015-ai-activity-ui-and-early-ask.md`](completed/015-ai-activity-ui-and-early-ask.md) |
+| 016 | 追加編集時の写真・字幕クロス監査、EXIF 向き自動補正、CLI Vision 対応＆画像トークン圧縮設計書 | Implemented | [`completed/016-ai-vision-audit-exif-and-token-compression.md`](completed/016-ai-vision-audit-exif-and-token-compression.md) |
+| 017 | エディタ UX 改善設計書（タイムライン再生位置追随・プレビュー画面外カラー＆境界・JSON 設定ハイライト） | Implemented | [`completed/017-editor-ux-timeline-follow-preview-backdrop-json-hl.md`](completed/017-editor-ux-timeline-follow-backdrop-json-hl.md) |

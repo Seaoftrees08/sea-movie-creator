@@ -12,7 +12,7 @@ use std::process::Command;
 
 use gpui_kit::base::{Disableable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{EditorState, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -75,8 +75,8 @@ pub struct AiSettingsModalState {
     pub custom_model_supports_thinking: bool,
     /// ユーザー設定予算上限 (USD) 入力欄。
     pub budget_usd_input: Entity<InputState>,
-    /// `{ } JSON` 生編集テキストエリア。
-    pub json_editor: Entity<TextareaState>,
+    /// `{ } JSON` 直接編集コードエディタ状態（`tree-sitter` JSON ハイライト対応）。
+    pub json_editor: Entity<EditorState>,
     /// 操作結果のフィードバック (`(is_error, message)`)。
     pub feedback: Option<(bool, String)>,
 }
@@ -128,6 +128,7 @@ pub fn render_ai_settings_modal_overlay(
         .border_1()
         .border_color(rgba(0x4755_69ff))
         .shadow_lg()
+        .overflow_hidden()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -250,15 +251,27 @@ fn render_gui_body(
         .w_full()
         .h(px(470.))
         .min_h(px(0.))
+        .items_start()
         .gap_3()
+        .overflow_hidden()
         .child(render_modal_sidebar(modal, cx))
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .h_full()
                 .min_h(px(0.))
-                .overflow_y_scrollbar()
-                .child(v_flex().w_full().gap_2p5().pr_2().child(tab_content)),
+                .overflow_hidden()
+                .child(
+                    div().size_full().overflow_y_scrollbar().child(
+                        v_flex()
+                            .w_full()
+                            .min_w(px(0.))
+                            .gap_2p5()
+                            .pr_2()
+                            .child(tab_content),
+                    ),
+                ),
         )
         .into_any_element()
 }
@@ -277,6 +290,7 @@ fn render_modal_sidebar(
     ];
     let mut col = v_flex()
         .w(px(164.))
+        .h_full()
         .flex_shrink_0()
         .gap_1()
         .pr_2()
@@ -305,7 +319,7 @@ pub(super) fn render_provider_pills(
     id_prefix: &'static str,
     cx: &mut Context<SeaEditorWindow>,
 ) -> AnyElement {
-    let mut row = h_flex().w_full().gap_1().flex_wrap();
+    let mut row = h_flex().w_full().min_w(px(0.)).gap_1().flex_wrap();
     for (idx, kind) in AiProviderKind::ui_selectable_providers()
         .into_iter()
         .enumerate()

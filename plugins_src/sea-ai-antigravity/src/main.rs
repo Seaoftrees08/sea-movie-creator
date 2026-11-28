@@ -22,14 +22,44 @@ fn apply_background_process_flags(cmd: &mut Command) {
 }
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(test)]
-use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
-    format_conversation_history_section, is_empty_json_value,
+    AcpImageInput, AcpSessionUpdateEvent, ChildKillGuard, HistoryMessage, MAX_AI_NDJSON_LINE_BYTES,
+    MAX_HISTORY_PROMPT_BYTES, acp_supports_image_prompt, build_acp_prompt_content_blocks,
+    build_acp_server_request_deny_response, extract_acp_update_event,
+    format_conversation_history_section, is_empty_json_value, read_ndjson_line_limited,
+    spawn_stderr_drain, truncate_utf8_chars, validate_acp_images,
 };
+#[cfg(test)]
+use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+const STDERR_DRAIN_CAP_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct PluginRunError {
+    code: &'static str,
+    message: String,
+}
+
+impl PluginRunError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn exec(message: impl Into<String>) -> Self {
+        Self::new("execution_failed", message)
+    }
+}
+
+impl From<String> for PluginRunError {
+    fn from(message: String) -> Self {
+        Self::exec(message)
+    }
+}
 
 static SANDBOX_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -81,6 +111,7 @@ struct CallParams {
     thinking_level: Option<String>,
     external_cli: Option<String>,
     external_args: Vec<String>,
+    images: Vec<AcpImageInput>,
 }
 
 fn emit_event(event: &Value) {
@@ -241,7 +272,7 @@ fn build_agy_prompt_text(params: &CallParams) -> String {
     ];
     if !is_empty_json_value(&params.command_schema_json) {
         sections.push(format!(
-            "# EditCommand JSON Schema\n{}",
+            "# Required Output JSON Schema\n{}",
             params.command_schema_json
         ));
     }
@@ -259,17 +290,19 @@ fn build_agy_prompt_text(params: &CallParams) -> String {
 
 fn build_session_prompt_request(id: u64, session_id: &str, params: &CallParams) -> Value {
     let prompt_text = build_agy_prompt_text(params);
+    let blocks = build_acp_prompt_content_blocks(&prompt_text, &params.images);
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": prompt_text }]
+            "prompt": blocks
         }
     })
 }
 
+#[cfg(test)]
 fn extract_acp_message_delta(msg: &Value) -> Option<String> {
     if msg["method"].as_str() != Some("session/update") {
         return None;
@@ -277,28 +310,54 @@ fn extract_acp_message_delta(msg: &Value) -> Option<String> {
     extract_acp_update_message_delta(&msg["params"])
 }
 
-fn build_permission_deny_response(id: &Value, params: &Value) -> Value {
-    let reject_id = params["options"].as_array().and_then(|opts| {
-        opts.iter().find_map(|opt| {
-            let kind = opt["kind"].as_str()?;
-            if kind == "reject_once" || kind == "reject_always" {
-                opt["optionId"].as_str().map(ToOwned::to_owned)
-            } else {
-                None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpStreamPhase {
+    Waiting,
+    Thinking,
+    Responding,
+}
+
+fn format_acp_activity_label(title: &str, status: Option<&str>) -> String {
+    match status {
+        Some(st) => format!("{title} ({st})"),
+        None => title.to_owned(),
+    }
+}
+
+fn process_acp_update_msg(
+    msg: &Value,
+    phase: &mut AcpStreamPhase,
+    streamed: &mut String,
+    emit: &mut dyn FnMut(Value),
+) -> bool {
+    if msg["method"].as_str() != Some("session/update") {
+        return false;
+    }
+    match extract_acp_update_event(&msg["params"]) {
+        Some(AcpSessionUpdateEvent::ThoughtDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Thinking {
+                *phase = AcpStreamPhase::Thinking;
+                emit(json!({ "event": "status", "message": "思考中..." }));
             }
-        })
-    });
-
-    let outcome = match reject_id {
-        Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
-        None => json!({ "outcome": "cancelled" }),
-    };
-
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": { "outcome": outcome }
-    })
+            emit(json!({ "event": "thought", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::MessageDelta(chunk)) => {
+            if *phase != AcpStreamPhase::Responding {
+                *phase = AcpStreamPhase::Responding;
+                emit(json!({ "event": "status", "message": "応答を生成中..." }));
+            }
+            streamed.push_str(&chunk);
+            emit(json!({ "event": "delta", "text": chunk }));
+            true
+        }
+        Some(AcpSessionUpdateEvent::ToolActivity { title, status }) => {
+            let label = format_acp_activity_label(&title, status.as_deref());
+            emit(json!({ "event": "activity", "label": label }));
+            true
+        }
+        None => false,
+    }
 }
 
 fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), String> {
@@ -310,24 +369,8 @@ fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), Str
 }
 
 fn handle_server_request(stdin: &mut ChildStdin, msg: &Value) -> Result<bool, String> {
-    let Some(req_id) = msg.get("id").filter(|v| !v.is_null()) else {
+    let Some(reply) = build_acp_server_request_deny_response(msg) else {
         return Ok(false);
-    };
-    let Some(method) = msg["method"].as_str() else {
-        return Ok(false);
-    };
-
-    let reply = if method == "session/request_permission" {
-        build_permission_deny_response(req_id, &msg["params"])
-    } else {
-        json!({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {
-                "code": -32601,
-                "message": "method not supported by sea-movie-creator ACP host"
-            }
-        })
     };
     write_jsonrpc_line(stdin, &reply)?;
     Ok(true)
@@ -349,30 +392,30 @@ fn read_acp_until_response<R: BufRead>(
     expected_id: u64,
     streamed: &mut String,
 ) -> Result<Value, String> {
-    let mut line = String::new();
+    let mut phase = AcpStreamPhase::Waiting;
     loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|err| format!("Antigravity ACP stdout 読取エラー: {err}"))?;
-        if read == 0 {
+        let Some(line) = read_ndjson_line_limited(reader, MAX_AI_NDJSON_LINE_BYTES)
+            .map_err(|err| format!("Antigravity ACP stdout 読取エラー: {err}"))?
+        else {
             return Err(format!(
                 "Antigravity ACP (`agy acp`) が id={expected_id} 応答前に終了しました"
             ));
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let msg: Value = serde_json::from_str(trimmed)
-            .map_err(|err| format!("Antigravity ACP JSON 解析エラー: {err} (line: {trimmed})"))?;
+        let msg: Value = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "Antigravity ACP JSON 解析エラー: {err} (line: {})",
+                truncate_utf8_chars(trimmed, 200)
+            )
+        })?;
 
         if handle_server_request(stdin, &msg)? {
             continue;
         }
-        if let Some(chunk) = extract_acp_message_delta(&msg) {
-            streamed.push_str(&chunk);
-            emit_event(&json!({ "event": "delta", "text": chunk }));
+        if process_acp_update_msg(&msg, &mut phase, streamed, &mut |ev| emit_event(&ev)) {
             continue;
         }
         if msg["id"].as_u64() == Some(expected_id) {
@@ -548,15 +591,29 @@ struct AcpConversationOutcome {
     usage: Option<Value>,
 }
 
+fn ensure_acp_vision_supported(
+    init_resp: &Value,
+    images: &[AcpImageInput],
+) -> Result<(), PluginRunError> {
+    if !images.is_empty() && acp_supports_image_prompt(init_resp) == Some(false) {
+        return Err(PluginRunError::new(
+            "vision_unsupported",
+            "接続先の ACP エージェントは画像入力 (promptCapabilities.image) に非対応です",
+        ));
+    }
+    Ok(())
+}
+
 fn execute_acp_conversation(
     reader: &mut BufReader<std::process::ChildStdout>,
     stdin: &mut ChildStdin,
     sandbox_cwd: &Path,
     params: &CallParams,
     streamed: &mut String,
-) -> Result<AcpConversationOutcome, String> {
+) -> Result<AcpConversationOutcome, PluginRunError> {
     write_jsonrpc_line(stdin, &build_initialize_request(1))?;
-    let _init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
+    let init_resp = read_acp_until_response(reader, stdin, 1, streamed)?;
+    ensure_acp_vision_supported(&init_resp, &params.images)?;
 
     write_jsonrpc_line(stdin, &build_session_new_request(2, sandbox_cwd))?;
     let session_resp = read_acp_until_response(reader, stdin, 2, streamed)?;
@@ -593,6 +650,10 @@ fn execute_acp_conversation(
         next_id += 1;
     }
 
+    emit_event(&json!({
+        "event": "status",
+        "message": "プロンプトを送信して応答待機中...",
+    }));
     write_jsonrpc_line(
         stdin,
         &build_session_prompt_request(next_id, &session_id, params),
@@ -613,37 +674,34 @@ fn execute_acp_conversation(
     })
 }
 
-fn run_list_models(params: &CallParams) -> Result<(), String> {
-    let agy_bin = resolve_agy_cli(params.external_cli.as_deref()).map_err(|msg| {
-        emit_event(&json!({
-            "event": "error",
-            "code": "missing_external_cli",
-            "message": msg,
-        }));
-        msg
-    })?;
+fn run_list_models(params: &CallParams) -> Result<(), PluginRunError> {
+    let agy_bin = resolve_agy_cli(params.external_cli.as_deref())
+        .map_err(|msg| PluginRunError::new("missing_external_cli", msg))?;
 
     let sandbox_dir = TempSandboxDir::create()?;
     let args = build_agy_acp_args(&params.external_args);
     let mut cmd = Command::new(&agy_bin);
     apply_background_process_flags(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .args(&args)
         .current_dir(sandbox_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("`agy acp` 起動に失敗しました: {err}"))?;
+        .map_err(|err| PluginRunError::exec(format!("`agy acp` 起動に失敗しました: {err}")))?;
+    // sandbox_dir の Drop より先に子プロセスを終了・解放されるよう guard を後ろで宣言する
+    let mut guard = ChildKillGuard::new(child);
+    let stderr_handle = guard
+        .take_stderr()
+        .map(|stderr| spawn_stderr_drain(stderr, STDERR_DRAIN_CAP_BYTES));
 
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "`agy acp` stdin パイプ取得失敗".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "`agy acp` stdout パイプ取得失敗".to_owned())?;
+    let mut child_stdin = guard
+        .take_stdin()
+        .ok_or_else(|| PluginRunError::exec("`agy acp` stdin パイプ取得失敗"))?;
+    let stdout = guard
+        .take_stdout()
+        .ok_or_else(|| PluginRunError::exec("`agy acp` stdout パイプ取得失敗"))?;
     let mut reader = BufReader::new(stdout);
     let mut streamed = String::new();
 
@@ -657,28 +715,38 @@ fn run_list_models(params: &CallParams) -> Result<(), String> {
         read_acp_until_response(&mut reader, &mut child_stdin, 2, &mut streamed)
     })();
     drop(child_stdin);
+    drop(reader);
 
     if probe_res.is_err() {
-        let _ = child.kill();
+        guard.kill_and_wait();
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let status = if probe_res.is_ok() {
+        Some(
+            guard
+                .wait_status()
+                .map_err(|err| PluginRunError::exec(format!("`agy acp` 終了待機エラー: {err}")))?,
+        )
+    } else {
+        None
+    };
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     let session_resp = match probe_res {
         Ok(resp) => resp,
         Err(err) => {
             if stderr.is_empty() {
-                return Err(err);
+                return Err(PluginRunError::exec(err));
             }
-            return Err(format!("{err} ({stderr})"));
+            return Err(PluginRunError::exec(format!("{err} ({stderr})")));
         }
     };
-    if !output.status.success() {
-        return Err(format!(
-            "`agy acp` モデル取得が終了コード {} で失敗しました: {stderr}",
-            output.status
-        ));
+    if let Some(st) = status
+        && !st.success()
+    {
+        return Err(PluginRunError::exec(format!(
+            "`agy acp` モデル取得が終了コード {st} で失敗しました: {stderr}"
+        )));
     }
 
     let models = extract_models_from_session_new(&session_resp);
@@ -689,15 +757,12 @@ fn run_list_models(params: &CallParams) -> Result<(), String> {
     Ok(())
 }
 
-fn run_request(params: &CallParams) -> Result<(), String> {
-    let agy_bin = resolve_agy_cli(params.external_cli.as_deref()).map_err(|msg| {
-        emit_event(&json!({
-            "event": "error",
-            "code": "missing_external_cli",
-            "message": msg,
-        }));
-        msg
-    })?;
+fn run_request(params: &CallParams) -> Result<(), PluginRunError> {
+    if !params.images.is_empty() {
+        validate_acp_images(&params.images)?;
+    }
+    let agy_bin = resolve_agy_cli(params.external_cli.as_deref())
+        .map_err(|msg| PluginRunError::new("missing_external_cli", msg))?;
 
     let sandbox_dir = TempSandboxDir::create()?;
     let args = build_agy_acp_args(&params.external_args);
@@ -709,23 +774,25 @@ fn run_request(params: &CallParams) -> Result<(), String> {
 
     let mut cmd = Command::new(&agy_bin);
     apply_background_process_flags(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .args(&args)
         .current_dir(sandbox_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("`agy acp` 起動に失敗しました: {err}"))?;
+        .map_err(|err| PluginRunError::exec(format!("`agy acp` 起動に失敗しました: {err}")))?;
+    let mut guard = ChildKillGuard::new(child);
+    let stderr_handle = guard
+        .take_stderr()
+        .map(|stderr| spawn_stderr_drain(stderr, STDERR_DRAIN_CAP_BYTES));
 
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "`agy acp` stdin パイプ取得失敗".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "`agy acp` stdout パイプ取得失敗".to_owned())?;
+    let mut child_stdin = guard
+        .take_stdin()
+        .ok_or_else(|| PluginRunError::exec("`agy acp` stdin パイプ取得失敗"))?;
+    let stdout = guard
+        .take_stdout()
+        .ok_or_else(|| PluginRunError::exec("`agy acp` stdout パイプ取得失敗"))?;
     let mut reader = BufReader::new(stdout);
     let mut streamed = String::new();
 
@@ -737,27 +804,40 @@ fn run_request(params: &CallParams) -> Result<(), String> {
         &mut streamed,
     );
     drop(child_stdin);
+    drop(reader);
 
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("`agy acp` 終了待機エラー: {err}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if conv_res.is_err() {
+        guard.kill_and_wait();
+    }
+    let status = if conv_res.is_ok() {
+        Some(
+            guard
+                .wait_status()
+                .map_err(|err| PluginRunError::exec(format!("`agy acp` 終了待機エラー: {err}")))?,
+        )
+    } else {
+        None
+    };
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     let outcome = match conv_res {
         Ok(res) => res,
-        Err(err) => {
-            if stderr.is_empty() {
-                return Err(err);
+        Err(mut err) => {
+            if !stderr.is_empty() {
+                err.message = format!("{} ({stderr})", err.message);
             }
-            return Err(format!("{err} ({stderr})"));
+            return Err(err);
         }
     };
 
-    if !output.status.success() {
-        return Err(format!(
-            "`agy acp` が終了コード {} で失敗しました: {stderr}",
-            output.status
-        ));
+    if let Some(st) = status
+        && !st.success()
+    {
+        return Err(PluginRunError::exec(format!(
+            "`agy acp` が終了コード {st} で失敗しました: {stderr}"
+        )));
     }
 
     let raw_text = if streamed.is_empty() {
@@ -800,7 +880,7 @@ fn main() -> ExitCode {
         _ => run_request(&req.params),
     };
     if let Err(err) = res {
-        emit_event(&json!({ "event": "error", "code": "execution_failed", "message": err }));
+        emit_event(&json!({ "event": "error", "code": err.code, "message": err.message }));
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -878,28 +958,39 @@ mod tests {
     }
 
     #[test]
-    fn build_permission_deny_response_prefers_reject_option_and_falls_back_to_cancelled() {
-        let with_reject = build_permission_deny_response(
-            &json!(99),
-            &json!({
+    fn build_permission_deny_response_prefers_reject_option_and_falls_back_to_cancelled()
+    -> Result<(), &'static str> {
+        let with_reject = build_acp_server_request_deny_response(&json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
                 "options": [
                     { "optionId": "allow_once", "kind": "allow_once" },
                     { "optionId": "reject_once", "kind": "reject_once" }
                 ]
-            }),
-        );
+            }
+        }))
+        .ok_or("deny response")?;
         assert_eq!(with_reject["id"], json!(99));
         assert_eq!(
             with_reject["result"]["outcome"],
             json!({ "outcome": "selected", "optionId": "reject_once" })
         );
 
-        let fallback = build_permission_deny_response(&json!("req-2"), &json!({ "options": [] }));
+        let fallback = build_acp_server_request_deny_response(&json!({
+            "jsonrpc": "2.0",
+            "id": "req-2",
+            "method": "session/request_permission",
+            "params": { "options": [] }
+        }))
+        .ok_or("deny response")?;
         assert_eq!(fallback["id"], json!("req-2"));
         assert_eq!(
             fallback["result"]["outcome"],
             json!({ "outcome": "cancelled" })
         );
+        Ok(())
     }
 
     #[test]
@@ -1041,5 +1132,94 @@ mod tests {
         assert!(normal_section.contains("直近の依頼"));
         assert!(normal_section.contains("...(earlier messages omitted)..."));
         assert!(!normal_section.contains("古い指示"));
+    }
+
+    #[test]
+    fn process_acp_update_msg_transitions_phases_without_leaking_thoughts_to_stream() {
+        let mut phase = AcpStreamPhase::Waiting;
+        let mut streamed = String::new();
+        let mut events = Vec::new();
+
+        let thought = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "内部思考テキスト" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &thought,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(streamed, "");
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "{\"type\":\"undo\"}" }
+                }
+            }
+        });
+        assert!(process_acp_update_msg(
+            &msg,
+            &mut phase,
+            &mut streamed,
+            &mut |v| events.push(v),
+        ));
+        assert_eq!(streamed, "{\"type\":\"undo\"}");
+        assert_eq!(
+            events[0],
+            json!({ "event": "status", "message": "思考中..." })
+        );
+        assert_eq!(
+            events[1],
+            json!({ "event": "thought", "text": "内部思考テキスト" })
+        );
+        assert_eq!(
+            events[2],
+            json!({ "event": "status", "message": "応答を生成中..." })
+        );
+        assert_eq!(
+            events[3],
+            json!({ "event": "delta", "text": "{\"type\":\"undo\"}" })
+        );
+    }
+
+    #[test]
+    fn prompt_request_embeds_images_and_rejects_false_prompt_capabilities() {
+        let params = CallParams {
+            system_prompt: "SYS".to_owned(),
+            user_prompt: "check image".to_owned(),
+            images: vec![AcpImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            }],
+            ..CallParams::default()
+        };
+        let req = build_session_prompt_request(3, "s1", &params);
+        let prompt_arr = req["params"]["prompt"].as_array().expect("prompt array");
+        assert_eq!(prompt_arr.len(), 2);
+        assert_eq!(prompt_arr[1]["type"], json!("image"));
+        assert_eq!(prompt_arr[1]["mimeType"], json!("image/jpeg"));
+        assert_eq!(prompt_arr[1]["data"], json!("AQID"));
+
+        let unsupported_init = json!({
+            "result": { "agentCapabilities": { "promptCapabilities": { "image": false } } }
+        });
+        let err = match ensure_acp_vision_supported(&unsupported_init, &params.images) {
+            Ok(()) => panic!("unexpected ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "vision_unsupported");
     }
 }

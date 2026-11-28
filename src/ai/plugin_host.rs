@@ -3,23 +3,32 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
-#[cfg(test)]
-use sea_ai_protocol::ORIGINAL_INSTRUCTION_MARKER;
 use sea_ai_protocol::{
-    HistoryMessage, MAX_HISTORY_PROMPT_BYTES, extract_acp_update_message_delta,
-    format_conversation_history_section, is_empty_json_value,
+    AcpImageInput, AcpSessionUpdateEvent, ChildKillGuard, HistoryMessage, MAX_AI_NDJSON_LINE_BYTES,
+    MAX_HISTORY_PROMPT_BYTES, acp_supports_image_prompt, build_acp_prompt_content_blocks,
+    build_acp_server_request_deny_response, extract_acp_update_event,
+    format_conversation_history_section, is_empty_json_value, read_ndjson_line_limited,
+    spawn_stderr_drain, truncate_utf8_chars, validate_acp_images,
 };
+#[cfg(test)]
+use sea_ai_protocol::{ORIGINAL_INSTRUCTION_MARKER, extract_acp_update_message_delta};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+const PLUGIN_STDERR_DRAIN_CAP_BYTES: usize = 64 * 1024;
+
 use crate::ai::provider::{
-    AiChatMessage, AiError, AiProvider, AiRequest, AiResponse, AiRole, AiStreamEvent,
-    AiThinkingLevel, AiTokenUsage,
+    AiAgentTurnRequest, AiAgentTurnResponse, AiChatMessage, AiError, AiProvider, AiRequest,
+    AiResponse, AiRole, AiStreamEvent, AiThinkingLevel, AiTokenUsage,
+    build_fallback_legacy_request, parse_fallback_agent_response,
 };
 use crate::ai::settings::ProbedModelEntry;
 use crate::core::PluginAiHints;
@@ -50,6 +59,17 @@ pub struct AiPluginProfile {
     pub args: Vec<String>,
 }
 
+/// `ai-plugin.json` が宣言する外部 AI プラグインの静的能力フラグ。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiPluginCapabilities {
+    /// 画像（マルチモーダル）入力に対応しているか。
+    pub vision: bool,
+}
+
+/// 外部 AI プラグイン呼び出しへ添付する画像入力（[`AcpImageInput`] の再エクスポート）。
+pub type AiPluginImageInput = AcpImageInput;
+
 /// `plugins/ai/<id>/ai-plugin.json` のマニフェスト定義。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiPluginManifest {
@@ -72,6 +92,9 @@ pub struct AiPluginManifest {
     /// プラグインが内部で呼び出す既定外部 CLI ヒント（任意）。
     #[serde(default)]
     pub requires_external_cli: Option<String>,
+    /// 静的能力宣言（`vision` 対応有無等）。
+    #[serde(default)]
+    pub capabilities: AiPluginCapabilities,
     /// 選択可能なプロファイル一覧（`ACP` 用など）。
     #[serde(default)]
     pub profiles: Vec<AiPluginProfile>,
@@ -168,6 +191,9 @@ pub struct AiPluginCallParams {
     /// 外部 CLI 向けの追加引数上書き。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_args: Vec<String>,
+    /// Vision 対応プラグインへ渡す Base64 画像配列（空時は省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<AiPluginImageInput>,
 }
 
 /// `"method": "list_models"` により AI プラグインから取得された利用可能モデル／CLI 情報。
@@ -226,6 +252,16 @@ pub enum AiPluginHostEvent {
     Status {
         /// 表示用状態メッセージ。
         message: String,
+    },
+    /// 思考過程テキストチャンク。
+    Thought {
+        /// 追記思考テキスト。
+        text: String,
+    },
+    /// 作業アクティビティラベル。
+    Activity {
+        /// 表示ラベル。
+        label: String,
     },
     /// 部分生成テキストチャンク。
     Delta {
@@ -396,6 +432,7 @@ pub struct AiPluginProvider {
     executable_path: PathBuf,
     args: Vec<String>,
     protocol: AiPluginProtocol,
+    supports_vision: bool,
     model_override: Option<String>,
     thinking_level_override: Option<String>,
     external_cli_override: Option<String>,
@@ -413,6 +450,7 @@ impl AiPluginProvider {
             executable_path,
             args: plugin.manifest.args.clone(),
             protocol: plugin.manifest.protocol,
+            supports_vision: plugin.manifest.capabilities.vision,
             model_override: None,
             thinking_level_override: None,
             external_cli_override: None,
@@ -475,13 +513,17 @@ impl AiPluginProvider {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|err| {
+        let child = cmd.spawn().map_err(|err| {
             AiError::PluginError(format!(
                 "failed to spawn AI plugin `{}` for list_models ({}): {err}",
                 self.plugin_id,
                 self.executable_path.display()
             ))
         })?;
+        let mut guard = ChildKillGuard::new(child);
+        let stderr_handle = guard
+            .take_stderr()
+            .map(|stderr| spawn_stderr_drain(stderr, PLUGIN_STDERR_DRAIN_CAP_BYTES));
 
         let envelope = AiPluginRequestEnvelope {
             protocol: "sea_ai_v1".to_owned(),
@@ -495,31 +537,33 @@ impl AiPluginProvider {
         let payload = serde_json::to_string(&envelope).map_err(|err| {
             AiError::ParseFailed(format!("list_models request serialize error: {err}"))
         })?;
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = guard.take_stdin() {
             writeln!(stdin, "{payload}")?;
             stdin.flush()?;
         }
 
-        let Some(stdout) = child.stdout.take() else {
+        let Some(stdout) = guard.take_stdout() else {
             return Err(AiError::PluginError(
                 "AI plugin stdout pipe unavailable".to_owned(),
             ));
         };
         let mut noop = |_ev: AiStreamEvent| {};
-        let output = read_sea_ai_v1_events(&self.plugin_id, stdout, &mut child, &mut noop)?;
+        let output = read_sea_ai_v1_events(&self.plugin_id, stdout, &mut guard, None, &mut noop)?;
 
-        let status = child.wait_with_output()?;
-        if !status.status.success() {
-            let stderr_text = String::from_utf8_lossy(&status.stderr).trim().to_owned();
+        let status = guard.wait_status()?;
+        let stderr_text = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if !status.success() {
             let msg = if stderr_text.is_empty() {
                 format!(
-                    "AI plugin `{}` list_models exited with {}",
-                    self.plugin_id, status.status
+                    "AI plugin `{}` list_models exited with {status}",
+                    self.plugin_id
                 )
             } else {
                 format!(
-                    "AI plugin `{}` list_models exited with {}: {stderr_text}",
-                    self.plugin_id, status.status
+                    "AI plugin `{}` list_models exited with {status}: {stderr_text}",
+                    self.plugin_id
                 )
             };
             return Err(AiError::PluginError(msg));
@@ -531,8 +575,16 @@ impl AiPluginProvider {
     fn run_sea_ai_v1(
         &self,
         request: &AiRequest,
+        images: &[AiPluginImageInput],
+        cancel_flag: Option<&Arc<AtomicBool>>,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(AiError::Cancelled);
+        }
+        if !images.is_empty() {
+            validate_acp_images(images).map_err(AiError::PluginError)?;
+        }
         let mut cmd = Command::new(&self.executable_path);
         sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
@@ -543,13 +595,17 @@ impl AiPluginProvider {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|err| {
+        let child = cmd.spawn().map_err(|err| {
             AiError::PluginError(format!(
                 "failed to spawn AI plugin `{}` ({}): {err}",
                 self.plugin_id,
                 self.executable_path.display()
             ))
         })?;
+        let mut guard = ChildKillGuard::new(child);
+        let stderr_handle = guard
+            .take_stderr()
+            .map(|stderr| spawn_stderr_drain(stderr, PLUGIN_STDERR_DRAIN_CAP_BYTES));
 
         let envelope = AiPluginRequestEnvelope {
             protocol: "sea_ai_v1".to_owned(),
@@ -565,40 +621,39 @@ impl AiPluginProvider {
                 thinking_level: self.thinking_level_override.clone(),
                 external_cli: self.external_cli_override.clone(),
                 external_args: self.external_args_override.clone(),
+                images: images.to_vec(),
             },
         };
         let payload = serde_json::to_string(&envelope).map_err(|err| {
             AiError::ParseFailed(format!("plugin request serialize error: {err}"))
         })?;
 
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = guard.take_stdin() {
             writeln!(stdin, "{payload}")?;
             stdin.flush()?;
         }
 
-        let Some(stdout) = child.stdout.take() else {
+        let Some(stdout) = guard.take_stdout() else {
             return Err(AiError::PluginError(
                 "AI plugin stdout pipe unavailable".to_owned(),
             ));
         };
-        let sea_out = read_sea_ai_v1_events(&self.plugin_id, stdout, &mut child, on_event)?;
+        let sea_out =
+            read_sea_ai_v1_events(&self.plugin_id, stdout, &mut guard, cancel_flag, on_event)?;
         let streamed_text = sea_out.streamed_text;
         let final_response = sea_out.final_response;
 
-        let output_status = child.wait_with_output()?;
-        if !output_status.status.success() {
-            let stderr_text = String::from_utf8_lossy(&output_status.stderr)
-                .trim()
-                .to_owned();
+        let output_status = guard.wait_status()?;
+        let stderr_text = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if !output_status.success() {
             let msg = if stderr_text.is_empty() {
-                format!(
-                    "AI plugin `{}` exited with {}",
-                    self.plugin_id, output_status.status
-                )
+                format!("AI plugin `{}` exited with {output_status}", self.plugin_id)
             } else {
                 format!(
-                    "AI plugin `{}` exited with {}: {stderr_text}",
-                    self.plugin_id, output_status.status
+                    "AI plugin `{}` exited with {output_status}: {stderr_text}",
+                    self.plugin_id
                 )
             };
             on_event(AiStreamEvent::Failed(msg.clone()));
@@ -620,8 +675,16 @@ impl AiPluginProvider {
     fn run_direct_acp_stdio(
         &self,
         request: &AiRequest,
+        images: &[AiPluginImageInput],
+        cancel_flag: Option<&Arc<AtomicBool>>,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(AiError::Cancelled);
+        }
+        if !images.is_empty() {
+            validate_acp_images(images).map_err(AiError::PluginError)?;
+        }
         let mut cmd = Command::new(&self.executable_path);
         sea_export_protocol::apply_background_process_flags(&mut cmd);
         cmd.args(&self.args)
@@ -632,70 +695,61 @@ impl AiPluginProvider {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|err| {
+        let child = cmd.spawn().map_err(|err| {
             AiError::PluginError(format!(
                 "failed to spawn ACP agent `{}`: {err}",
                 self.plugin_id
             ))
         })?;
-        let mut stdin = child
-            .stdin
-            .take()
+        let mut guard = ChildKillGuard::new(child);
+        let stderr_handle = guard
+            .take_stderr()
+            .map(|stderr| spawn_stderr_drain(stderr, PLUGIN_STDERR_DRAIN_CAP_BYTES));
+        let mut stdin = guard
+            .take_stdin()
             .ok_or_else(|| AiError::PluginError("ACP stdin unavailable".to_owned()))?;
-        let stdout = child
-            .stdout
-            .take()
+        let stdout = guard
+            .take_stdout()
             .ok_or_else(|| AiError::PluginError("ACP stdout unavailable".to_owned()))?;
-        let mut reader = BufReader::new(stdout);
+        let line_rx = spawn_limited_ndjson_reader(stdout);
 
-        send_acp_jsonrpc_line(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {},
-                    "clientInfo": { "name": "sea-movie-creator", "version": env!("CARGO_PKG_VERSION") }
-                }
-            }),
-        )?;
-        let _init_res = read_acp_until_id(&mut reader, 1, on_event)?;
-
-        let cwd = env::current_dir().map_or_else(|_| ".".to_owned(), |p| p.display().to_string());
-        send_acp_jsonrpc_line(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/new",
-                "params": { "cwd": cwd, "mcpServers": [] }
-            }),
-        )?;
-        let sess_res = read_acp_until_id(&mut reader, 2, on_event)?;
-        let session_id = sess_res["result"]["sessionId"]
-            .as_str()
-            .unwrap_or("default-session")
-            .to_owned();
-
-        let prompt_body = build_direct_acp_prompt_body(request);
-        send_acp_jsonrpc_line(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": prompt_body }]
-                }
-            }),
-        )?;
+        let mut io = AcpSessionIo {
+            line_rx: &line_rx,
+            stdin: &mut stdin,
+            guard: &mut guard,
+        };
+        let conv_res = run_direct_acp_session(&mut io, request, images, cancel_flag, on_event);
         drop(stdin);
+        drop(line_rx);
 
-        let prompt_res = read_acp_until_id_collecting(&mut reader, 3, on_event)?;
-        let _ = child.wait();
+        let prompt_res = match conv_res {
+            Ok(res) => res,
+            Err(err) => {
+                guard.kill_and_wait();
+                let _ = stderr_handle.and_then(|h| h.join().ok());
+                if !matches!(err, AiError::Cancelled) {
+                    on_event(AiStreamEvent::Failed(err.to_string()));
+                }
+                return Err(err);
+            }
+        };
+
+        let status = guard.wait_status()?;
+        let stderr_text = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if !status.success() {
+            let msg = if stderr_text.is_empty() {
+                format!("ACP agent `{}` exited with {status}", self.plugin_id)
+            } else {
+                format!(
+                    "ACP agent `{}` exited with {status}: {stderr_text}",
+                    self.plugin_id
+                )
+            };
+            on_event(AiStreamEvent::Failed(msg.clone()));
+            return Err(AiError::PluginError(msg));
+        }
         let final_text = if prompt_res.collected_text.is_empty() {
             prompt_res.response["result"]["text"]
                 .as_str()
@@ -707,11 +761,108 @@ impl AiPluginProvider {
         let response = AiResponse {
             raw_text: final_text,
             model: self.plugin_id.clone(),
-            usage: None,
+            usage: extract_direct_acp_usage(&prompt_res.response),
         };
         on_event(AiStreamEvent::Completed(response.clone()));
         Ok(response)
     }
+}
+
+fn spawn_limited_ndjson_reader(
+    stdout: std::process::ChildStdout,
+) -> mpsc::Receiver<Result<Option<String>, String>> {
+    let (tx, rx) = mpsc::sync_channel::<Result<Option<String>, String>>(64);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_ndjson_line_limited(&mut reader, MAX_AI_NDJSON_LINE_BYTES) {
+                Ok(Some(line)) => {
+                    if tx.send(Ok(Some(line))).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Ok(None));
+                    break;
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+struct AcpSessionIo<'a> {
+    line_rx: &'a mpsc::Receiver<Result<Option<String>, String>>,
+    stdin: &'a mut std::process::ChildStdin,
+    guard: &'a mut ChildKillGuard,
+}
+
+fn run_direct_acp_session(
+    io: &mut AcpSessionIo<'_>,
+    request: &AiRequest,
+    images: &[AiPluginImageInput],
+    cancel_flag: Option<&Arc<AtomicBool>>,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<AcpCollectedResult, AiError> {
+    send_acp_jsonrpc_line(
+        io.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": { "name": "sea-movie-creator", "version": env!("CARGO_PKG_VERSION") }
+            }
+        }),
+    )?;
+    let init_res = read_acp_until_id(io.line_rx, io.stdin, 1, io.guard, cancel_flag, on_event)?;
+    if !images.is_empty() && acp_supports_image_prompt(&init_res) == Some(false) {
+        return Err(AiError::PluginError(
+            "vision_unsupported: ACP agent reported promptCapabilities.image = false".to_owned(),
+        ));
+    }
+
+    let cwd = env::current_dir().map_or_else(|_| ".".to_owned(), |p| p.display().to_string());
+    send_acp_jsonrpc_line(
+        io.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": { "cwd": cwd, "mcpServers": [] }
+        }),
+    )?;
+    let sess_res = read_acp_until_id(io.line_rx, io.stdin, 2, io.guard, cancel_flag, on_event)?;
+    let session_id = sess_res["result"]["sessionId"]
+        .as_str()
+        .unwrap_or("default-session")
+        .to_owned();
+
+    let prompt_body = build_direct_acp_prompt_body(request);
+    let prompt_blocks = build_acp_prompt_content_blocks(&prompt_body, images);
+    on_event(AiStreamEvent::Status(
+        "プロンプトを送信して応答待機中...".to_owned(),
+    ));
+    send_acp_jsonrpc_line(
+        io.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": prompt_blocks
+            }
+        }),
+    )?;
+
+    read_acp_until_id_collecting(io.line_rx, io.stdin, 3, io.guard, cancel_flag, on_event)
 }
 
 impl AiProvider for AiPluginProvider {
@@ -723,15 +874,54 @@ impl AiProvider for AiPluginProvider {
         &self.display_name
     }
 
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     fn send_streaming(
         &self,
         request: &AiRequest,
         on_event: &mut dyn FnMut(AiStreamEvent),
     ) -> Result<AiResponse, AiError> {
         match self.protocol {
-            AiPluginProtocol::SeaAiV1 => self.run_sea_ai_v1(request, on_event),
-            AiPluginProtocol::AcpStdio => self.run_direct_acp_stdio(request, on_event),
+            AiPluginProtocol::SeaAiV1 => self.run_sea_ai_v1(request, &[], None, on_event),
+            AiPluginProtocol::AcpStdio => self.run_direct_acp_stdio(request, &[], None, on_event),
         }
+    }
+
+    fn send_agent_turn(
+        &self,
+        request: &AiAgentTurnRequest,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        self.send_agent_turn_cancellable(request, None, on_event)
+    }
+
+    fn send_agent_turn_cancellable(
+        &self,
+        request: &AiAgentTurnRequest,
+        cancel_flag: Option<&Arc<AtomicBool>>,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        let (legacy_req, raw_images) = build_fallback_legacy_request(request, self.supports_vision);
+        let images: Vec<AiPluginImageInput> = raw_images
+            .into_iter()
+            .map(|(mime_type, base64_data)| AiPluginImageInput {
+                mime_type,
+                base64_data,
+            })
+            .collect();
+        let resp = match self.protocol {
+            AiPluginProtocol::SeaAiV1 => {
+                self.run_sea_ai_v1(&legacy_req, &images, cancel_flag, on_event)?
+            }
+            AiPluginProtocol::AcpStdio => {
+                self.run_direct_acp_stdio(&legacy_req, &images, cancel_flag, on_event)?
+            }
+        };
+        let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
+        parsed.usage = resp.usage;
+        Ok(parsed)
     }
 }
 
@@ -741,31 +931,90 @@ struct SeaAiV1EventsOutput {
     discovered_models: Vec<DiscoveredAiModel>,
 }
 
+fn parse_sea_ai_v1_event_line(
+    plugin_id: &str,
+    trimmed: &str,
+) -> Result<Option<AiPluginHostEvent>, AiError> {
+    let raw_val: Value = serde_json::from_str(trimmed).map_err(|err| {
+        AiError::ParseFailed(format!(
+            "AI plugin `{plugin_id}` emitted invalid NDJSON: {err} (line: {})",
+            truncate_utf8_chars(trimmed, 200)
+        ))
+    })?;
+    let Some(kind) = raw_val
+        .get("event")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Err(AiError::ParseFailed(format!(
+            "AI plugin `{plugin_id}` emitted NDJSON missing `event` field (line: {})",
+            truncate_utf8_chars(trimmed, 200)
+        )));
+    };
+    if !matches!(
+        kind.as_str(),
+        "status" | "thought" | "activity" | "delta" | "models" | "completed" | "error"
+    ) {
+        return Ok(None);
+    }
+    let event: AiPluginHostEvent = serde_json::from_value(raw_val).map_err(|err| {
+        AiError::ParseFailed(format!(
+            "AI plugin `{plugin_id}` emitted malformed `{kind}` event: {err} (line: {})",
+            truncate_utf8_chars(trimmed, 200)
+        ))
+    })?;
+    Ok(Some(event))
+}
+
 fn read_sea_ai_v1_events(
     plugin_id: &str,
     stdout: std::process::ChildStdout,
-    child: &mut std::process::Child,
+    guard: &mut ChildKillGuard,
+    cancel_flag: Option<&Arc<AtomicBool>>,
     on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<SeaAiV1EventsOutput, AiError> {
-    let reader = BufReader::new(stdout);
+    let rx = spawn_limited_ndjson_reader(stdout);
+
     let mut streamed_text = String::new();
     let mut final_response: Option<AiResponse> = None;
     let mut discovered_models: Vec<DiscoveredAiModel> = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            drop(rx);
+            guard.kill_and_wait();
+            return Err(AiError::Cancelled);
+        }
+        let line = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Err(err)) => {
+                drop(rx);
+                guard.kill_and_wait();
+                return Err(AiError::ParseFailed(format!(
+                    "AI plugin `{plugin_id}` stdout read failed: {err}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let event: AiPluginHostEvent = serde_json::from_str(trimmed).map_err(|err| {
-            AiError::ParseFailed(format!(
-                "AI plugin `{plugin_id}` emitted invalid NDJSON: {err} (line: {trimmed})"
-            ))
-        })?;
+        let Some(event) = parse_sea_ai_v1_event_line(plugin_id, trimmed)? else {
+            continue;
+        };
         match event {
             AiPluginHostEvent::Status { message } => {
                 on_event(AiStreamEvent::Status(message));
+            }
+            AiPluginHostEvent::Thought { text } => {
+                on_event(AiStreamEvent::ThoughtDelta(text));
+            }
+            AiPluginHostEvent::Activity { label } => {
+                on_event(AiStreamEvent::ActivityHint(label));
             }
             AiPluginHostEvent::Delta { text } => {
                 streamed_text.push_str(&text);
@@ -791,8 +1040,14 @@ fn read_sea_ai_v1_events(
                 });
             }
             AiPluginHostEvent::Error { code, message } => {
-                let _ = child.wait();
-                let err_text = format!("[{code}] {message}");
+                drop(rx);
+                let _ = guard.wait_bounded_or_kill(Duration::from_millis(500));
+                let err_text =
+                    if code == "vision_unsupported" && message.starts_with("vision_unsupported:") {
+                        message
+                    } else {
+                        format!("[{code}] {message}")
+                    };
                 on_event(AiStreamEvent::Failed(err_text.clone()));
                 return Err(AiError::PluginError(err_text));
             }
@@ -810,6 +1065,13 @@ struct AcpCollectedResult {
     collected_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectAcpPhase {
+    Waiting,
+    Thinking,
+    Responding,
+}
+
 fn send_acp_jsonrpc_line(stdin: &mut std::process::ChildStdin, msg: &Value) -> Result<(), AiError> {
     let encoded = serde_json::to_string(msg)
         .map_err(|err| AiError::ParseFailed(format!("ACP encode error: {err}")))?;
@@ -818,40 +1080,86 @@ fn send_acp_jsonrpc_line(stdin: &mut std::process::ChildStdin, msg: &Value) -> R
     Ok(())
 }
 
-fn read_acp_until_id<R: BufRead>(
-    reader: &mut R,
+fn read_acp_until_id(
+    line_rx: &mpsc::Receiver<Result<Option<String>, String>>,
+    stdin: &mut std::process::ChildStdin,
     expected_id: u64,
+    guard: &mut ChildKillGuard,
+    cancel_flag: Option<&Arc<AtomicBool>>,
     on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<Value, AiError> {
-    Ok(read_acp_until_id_collecting(reader, expected_id, on_event)?.response)
+    Ok(
+        read_acp_until_id_collecting(line_rx, stdin, expected_id, guard, cancel_flag, on_event)?
+            .response,
+    )
 }
 
-fn read_acp_until_id_collecting<R: BufRead>(
-    reader: &mut R,
+fn read_acp_until_id_collecting(
+    line_rx: &mpsc::Receiver<Result<Option<String>, String>>,
+    stdin: &mut std::process::ChildStdin,
     expected_id: u64,
+    guard: &mut ChildKillGuard,
+    cancel_flag: Option<&Arc<AtomicBool>>,
     on_event: &mut dyn FnMut(AiStreamEvent),
 ) -> Result<AcpCollectedResult, AiError> {
-    let mut line = String::new();
     let mut collected = String::new();
+    let mut phase = DirectAcpPhase::Waiting;
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(AiError::PluginError(format!(
-                "ACP agent closed stream before response id={expected_id}"
-            )));
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            guard.kill_and_wait();
+            return Err(AiError::Cancelled);
         }
+        let line = match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AiError::PluginError(format!(
+                    "ACP agent closed stream before response id={expected_id}"
+                )));
+            }
+            Ok(Err(err)) => {
+                return Err(AiError::ParseFailed(format!(
+                    "ACP stdout read failed: {err}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let msg: Value = serde_json::from_str(trimmed)
             .map_err(|err| AiError::ParseFailed(format!("ACP JSON parse error: {err}")))?;
+        if let Some(reply) = build_acp_server_request_deny_response(&msg) {
+            send_acp_jsonrpc_line(stdin, &reply)?;
+            continue;
+        }
         if msg["method"].as_str() == Some("session/update")
-            && let Some(delta) = extract_acp_update_delta(&msg["params"])
+            && let Some(ev) = extract_acp_update_event(&msg["params"])
         {
-            collected.push_str(&delta);
-            on_event(AiStreamEvent::DeltaText(delta));
+            match ev {
+                AcpSessionUpdateEvent::ThoughtDelta(thought) => {
+                    if phase != DirectAcpPhase::Thinking {
+                        phase = DirectAcpPhase::Thinking;
+                        on_event(AiStreamEvent::Status("思考中...".to_owned()));
+                    }
+                    on_event(AiStreamEvent::ThoughtDelta(thought));
+                }
+                AcpSessionUpdateEvent::MessageDelta(delta) => {
+                    if phase != DirectAcpPhase::Responding {
+                        phase = DirectAcpPhase::Responding;
+                        on_event(AiStreamEvent::Status("応答を生成中...".to_owned()));
+                    }
+                    collected.push_str(&delta);
+                    on_event(AiStreamEvent::DeltaText(delta));
+                }
+                AcpSessionUpdateEvent::ToolActivity { title, status } => {
+                    let label = match status.as_deref() {
+                        Some(st) => format!("{title} ({st})"),
+                        None => title,
+                    };
+                    on_event(AiStreamEvent::ActivityHint(label));
+                }
+            }
             continue;
         }
         if msg["id"].as_u64() == Some(expected_id) {
@@ -866,6 +1174,38 @@ fn read_acp_until_id_collecting<R: BufRead>(
     }
 }
 
+fn extract_direct_acp_usage(prompt_resp: &Value) -> Option<AiTokenUsage> {
+    let usage = prompt_resp["result"].get("usage")?.as_object()?;
+    let input_tokens = usage
+        .get("inputTokens")
+        .or_else(|| usage.get("input_tokens"))
+        .or_else(|| usage.get("promptTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("outputTokens")
+        .or_else(|| usage.get("output_tokens"))
+        .or_else(|| usage.get("completionTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("totalTokens")
+        .or_else(|| usage.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(AiTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cost_usd: None,
+        is_estimated: false,
+    })
+}
+
+#[cfg(test)]
 fn extract_acp_update_delta(params: &Value) -> Option<String> {
     extract_acp_update_message_delta(params)
 }
@@ -894,7 +1234,7 @@ fn build_direct_acp_prompt_body(request: &AiRequest) -> String {
     let mut sections = vec![request.system_prompt.clone()];
     if !is_empty_json_value(&request.command_schema_json) {
         sections.push(format!(
-            "# EditCommand JSON Schema\n{}",
+            "# Required Output JSON Schema\n{}",
             request.command_schema_json
         ));
     }
@@ -1133,5 +1473,78 @@ mod tests {
             extract_acp_update_delta(&msg).as_deref(),
             Some("字幕を更新しました")
         );
+    }
+
+    #[test]
+    fn sea_ai_v1_two_stage_parser_handles_thought_activity_and_skips_unknown_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(parse_sea_ai_v1_event_line("p", r#"{"event":"future_unknown","x":1}"#)?.is_none());
+
+        let thought = parse_sea_ai_v1_event_line("p", r#"{"event":"thought","text":"分析中"}"#)?;
+        assert!(matches!(
+            thought,
+            Some(AiPluginHostEvent::Thought { text }) if text == "分析中"
+        ));
+
+        let activity =
+            parse_sea_ai_v1_event_line("p", r#"{"event":"activity","label":"Inspecting"}"#)?;
+        assert!(matches!(
+            activity,
+            Some(AiPluginHostEvent::Activity { label }) if label == "Inspecting"
+        ));
+        assert!(parse_sea_ai_v1_event_line("p", r#"{"type":"error"}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_capabilities_vision_and_acp_image_helpers_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDirGuard::create("vision-cap")?;
+        let ai_dir = dir.0.join("agy");
+        fs::create_dir_all(&ai_dir)?;
+        let exe_name = if std::env::consts::EXE_SUFFIX.is_empty() {
+            "agy-stub".to_owned()
+        } else {
+            format!("agy-stub{}", std::env::consts::EXE_SUFFIX)
+        };
+        fs::write(ai_dir.join(&exe_name), b"stub")?;
+        fs::write(
+            ai_dir.join("ai-plugin.json"),
+            r#"{"schema_version":1,"id":"test.ai.vision","name":"Vision CLI","version":"0.1.0","entrypoint":"agy-stub","capabilities":{"vision":true}}"#,
+        )?;
+        let reg = AiPluginRegistry::discover_in_dirs(std::slice::from_ref(&dir.0));
+        let provider = reg.resolve_provider("test.ai.vision")?;
+        assert!(provider.supports_vision());
+
+        let too_many: Vec<AiPluginImageInput> = (0..13)
+            .map(|_| AiPluginImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            })
+            .collect();
+        assert!(validate_acp_images(&too_many).is_err());
+
+        let oversized = vec![AiPluginImageInput {
+            mime_type: "image/jpeg".to_owned(),
+            base64_data: "A".repeat(sea_ai_protocol::MAX_PLUGIN_VISION_BASE64_BYTES + 1),
+        }];
+        assert!(validate_acp_images(&oversized).is_err());
+
+        let unsupported_init = json!({
+            "result": { "agentCapabilities": { "promptCapabilities": { "image": false } } }
+        });
+        assert_eq!(acp_supports_image_prompt(&unsupported_init), Some(false));
+        let blocks = build_acp_prompt_content_blocks(
+            "analyze",
+            &[AiPluginImageInput {
+                mime_type: "image/jpeg".to_owned(),
+                base64_data: "AQID".to_owned(),
+            }],
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], json!("image"));
+        assert_eq!(blocks[1]["mimeType"], json!("image/jpeg"));
+        assert_eq!(blocks[1]["data"], json!("AQID"));
+        Ok(())
     }
 }

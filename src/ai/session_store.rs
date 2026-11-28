@@ -55,6 +55,54 @@ pub enum AiTurnBadge {
     Error,
 }
 
+/// アクティビティステップの実行状態。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiActivityStepStatus {
+    /// 実行中。
+    #[default]
+    Running,
+    /// 成功完了。
+    Done,
+    /// 失敗。
+    Failed,
+    /// キャンセルにより中断。
+    Cancelled,
+}
+
+/// 1 つのエージェント処理ステップ表示レコード（UI・セッション保存共通）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiActivityStep {
+    /// 同一ターン内で一意な識別子（`ToolStarted` と `ToolActivity` の突き合わせ用）。
+    pub id: String,
+    /// VS Code 風の動詞カテゴリ（例: `"Analyzed"`, `"Editing"`, `"Checked"`, `"Verified"`, `"Asking"`）。
+    pub verb: String,
+    /// 対象名（例: `"タイムライン構成"`, `"タイムライン編集 (18件)"`）。
+    pub target: String,
+    /// 任意の補足情報（例: `"38 clips"`, `"0.2s"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// ステップ実行状態。
+    pub status: AiActivityStepStatus,
+    /// 実行所要ミリ秒（完了時のみ、Manual 承認待ち時間は除外）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// ターン完了時に履歴へ残す折りたたみ可能アクティビティ要約。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiTurnActivitySummary {
+    /// 合計作業時間（秒）。
+    pub worked_secs: u64,
+    /// 記録されたステップ一覧。
+    pub steps: Vec<AiActivityStep>,
+    /// 思考または解析サマリの抜粋（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_excerpt: Option<String>,
+}
+
 /// 永続化されるチャットメッセージ 1 件分。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredChatTurn {
@@ -68,6 +116,9 @@ pub struct StoredChatTurn {
     /// 完了・停止・エラー状態を示す任意バッジ（旧セッション JSON 互換）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_badge: Option<AiTurnBadge>,
+    /// 完了したターンの折りたたみアクティビティログ（旧セッション JSON 互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_log: Option<AiTurnActivitySummary>,
 }
 
 /// セッション再開時にも再表示できる保留中 `ask_user` 質問カードのスナップショット。
@@ -605,6 +656,7 @@ mod tests {
                 text: "お願いします".to_owned(),
                 timestamp_unix_secs: 100,
                 status_badge: None,
+                activity_log: None,
             }],
             pending_question: None,
             agent_memory: json!({"analyzed_count": 12}),
@@ -636,6 +688,7 @@ mod tests {
             min_llm_interval_ms: 400,
             vision_batch_size: 8,
             vision_max_edge_px: 512,
+            ..AgentRuntimeSettings::default()
         };
         store.save_runtime_settings(&settings)?;
         assert_eq!(store.load_runtime_settings()?, settings);
@@ -693,19 +746,33 @@ mod tests {
         assert!(usage.has_known_cost);
         assert!((usage.cost_usd - 0.012).abs() < 1e-8);
 
-        // status_badge 欠落の旧ターン JSON も後方互換で読み込め、付与時は保持されること
+        // status_badge / activity_log 欠落の旧ターン JSON も後方互換で読み込め、付与時は保持されること
         let legacy_turn: StoredChatTurn =
             serde_json::from_str(r#"{"role":"assistant","text":"完了","timestamp_unix_secs":10}"#)?;
         assert_eq!(legacy_turn.status_badge, None);
+        assert_eq!(legacy_turn.activity_log, None);
         let badged_turn = StoredChatTurn {
             role: AiRole::Assistant,
             text: "適用しました".to_owned(),
             timestamp_unix_secs: 11,
             status_badge: Some(AiTurnBadge::Applied),
+            activity_log: Some(AiTurnActivitySummary {
+                worked_secs: 72,
+                steps: vec![AiActivityStep {
+                    id: "c1".to_owned(),
+                    verb: "Analyzed".to_owned(),
+                    target: "タイムライン構成".to_owned(),
+                    detail: Some("38 clips".to_owned()),
+                    status: AiActivityStepStatus::Done,
+                    duration_ms: Some(12),
+                }],
+                thought_excerpt: Some("構成を確認しました".to_owned()),
+            }),
         };
         let roundtrip: StoredChatTurn =
             serde_json::from_str(&serde_json::to_string(&badged_turn)?)?;
         assert_eq!(roundtrip.status_badge, Some(AiTurnBadge::Applied));
+        assert_eq!(roundtrip.activity_log, badged_turn.activity_log);
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 //! 現在のタイムライン状態からコンパクトな JSON 要約と `schemars` 駆動スキーマを構築するモジュール。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,7 @@ use crate::timeline::document::{
     Asset, AssetKind, AssetStatus, AudioProperties, Clip, ClipKind, ProjectDocument,
     TimelineLengthMode,
 };
+use crate::timeline::serialization::resolve_existing_asset_path;
 
 /// AI プロンプトへ渡す素材要約。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +222,302 @@ pub struct TimelineContextSummary {
     /// `@ファイル名` メンションおよびタイムライン添付で明示された注目対象詳細。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub referenced_targets: Vec<ReferencedTargetDetail>,
+}
+
+/// 画像クリップの時間区間に重なる 1 件の字幕クリップ要約。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlappingSubtitleSummary {
+    /// 字幕クリップ ID。
+    pub clip_id: String,
+    /// 所属レイヤー ID。
+    pub layer_id: String,
+    /// 字幕本文。
+    pub text: String,
+    /// 開始フレーム番号。
+    pub timeline_start_frame: u64,
+    /// 終了フレーム番号（排他的）。
+    pub timeline_end_frame: u64,
+    /// スライドと実際に重なっているフレーム数。
+    #[serde(default)]
+    pub overlap_frames: u64,
+}
+
+/// タイムライン上の画像クリップと全重複字幕を 1 スライド単位にまとめたクロス監査用要約。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineSlidePairSummary {
+    /// タイムライン時系列順の 1-based スライド番号。
+    pub slide_index: usize,
+    /// 画像クリップ ID。
+    pub image_clip_id: String,
+    /// 所属レイヤー ID。
+    pub image_layer_id: String,
+    /// 参照アセット ID。
+    pub asset_id: String,
+    /// 画像ファイルの実体または登録パス文字列（取得可能な場合）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_path: Option<String>,
+    /// 正立基準の元画像解像度 `[width, height]`（取得可能な場合）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_dimensions: Option<[u32; 2]>,
+    /// 画像クリップ開始フレーム。
+    pub timeline_start_frame: u64,
+    /// 画像クリップ終了フレーム（排他的）。
+    pub timeline_end_frame: u64,
+    /// 現在のタイムライン上で評価された時計回り回転角（度）。
+    pub current_rotation_deg: f64,
+    /// 回転角パラメータがアニメーション（非固定値）であるか。
+    pub rotation_is_animated: bool,
+    /// 現在のタイムライン上で評価された X 拡大率。
+    pub current_scale_x: f64,
+    /// 現在のタイムライン上で評価された Y 拡大率。
+    pub current_scale_y: f64,
+    /// 拡大率 (`scale_x` または `scale_y`) がアニメーション（非固定値）であるか。
+    pub scale_is_animated: bool,
+    /// 主スライドが `cover` スケール基準で配置されているか（例: 単独 Backdrop）。
+    #[serde(default)]
+    pub is_cover_scaled: bool,
+    /// 縦写真向けに背面レイヤーへ同時配置された Backdrop クリップ ID 一覧。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companion_backdrop_clip_ids: Vec<String>,
+    /// 画像クリップと重なる字幕クリップ一覧（クロスフェード端の微少重なり除外）。
+    pub overlapping_subtitles: Vec<OverlappingSubtitleSummary>,
+}
+
+/// タイムライン上の全可視画像クリップを時系列順に収集し、各画像と重複字幕のペア一覧を構築する。
+///
+/// 非表示レイヤー (`!layer.visible`) は除外し、縦写真向けに同一区間の背面レイヤーへ配置された
+/// Backdrop クリップは重複監査を避けるため主スライドの `companion_backdrop_clip_ids` へまとめる。
+#[must_use]
+pub fn build_timeline_slide_pairs(
+    doc: &ProjectDocument,
+    project_dir: Option<&Path>,
+) -> Vec<TimelineSlidePairSummary> {
+    let asset_dims: HashMap<&str, [u32; 2]> = doc
+        .assets
+        .iter()
+        .filter_map(|asset| match asset.kind {
+            AssetKind::Image { width, height } => Some((asset.id.as_str(), [width, height])),
+            _ => None,
+        })
+        .collect();
+    let asset_paths: HashMap<&str, String> = doc
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            let resolved = resolve_existing_asset_path(&asset.path, project_dir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| asset.path.absolute.clone())
+                .or_else(|| asset.path.relative.clone())?;
+            Some((asset.id.as_str(), resolved))
+        })
+        .collect();
+
+    let (subtitle_entries, mut image_entries) = collect_visible_slide_entries(doc);
+    image_entries.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.layer_idx.cmp(&b.layer_idx))
+            .then_with(|| a.clip.id.as_str().cmp(b.clip.id.as_str()))
+    });
+
+    let backdrop_map = group_companion_backdrops(&image_entries);
+
+    image_entries
+        .into_iter()
+        .filter(|entry| {
+            !backdrop_map
+                .hidden_backdrop_ids
+                .contains(entry.clip.id.as_str())
+        })
+        .enumerate()
+        .map(|(idx, entry)| {
+            let companion_ids = backdrop_map
+                .primary_to_backdrops
+                .get(entry.clip.id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            build_slide_pair_item(
+                idx + 1,
+                &entry,
+                &asset_paths,
+                &asset_dims,
+                &subtitle_entries,
+                companion_ids,
+            )
+        })
+        .collect()
+}
+
+struct VisibleImageSlideEntry<'a> {
+    start: u64,
+    end: u64,
+    layer_idx: usize,
+    clip: &'a Clip,
+    layer_id: &'a str,
+    asset_id: &'a str,
+    visual: &'a VisualProperties,
+    rotation_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+    opacity: f64,
+}
+
+struct GroupedBackdrops {
+    hidden_backdrop_ids: HashSet<String>,
+    primary_to_backdrops: HashMap<String, Vec<String>>,
+}
+
+fn collect_visible_slide_entries(
+    doc: &ProjectDocument,
+) -> (
+    Vec<OverlappingSubtitleSummary>,
+    Vec<VisibleImageSlideEntry<'_>>,
+) {
+    let mut subtitle_entries = Vec::new();
+    let mut image_entries = Vec::new();
+    for (layer_idx, layer) in doc.layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
+        for clip in &layer.clips {
+            let start = clip.timeline_start.get();
+            let end = start.saturating_add(clip.duration.get());
+            match &clip.kind {
+                ClipKind::Subtitle(sub) => {
+                    subtitle_entries.push(OverlappingSubtitleSummary {
+                        clip_id: clip.id.as_str().to_owned(),
+                        layer_id: layer.id.as_str().to_owned(),
+                        text: sub.text.clone(),
+                        timeline_start_frame: start,
+                        timeline_end_frame: end,
+                        overlap_frames: 0,
+                    });
+                }
+                ClipKind::Image { asset_id, visual } => {
+                    let mid = FrameIndex::new(start.saturating_add(clip.duration.get() / 2));
+                    let eval = visual.evaluate(eval_context_clamped(doc, clip, mid)).ok();
+                    image_entries.push(VisibleImageSlideEntry {
+                        start,
+                        end,
+                        layer_idx,
+                        clip,
+                        layer_id: layer.id.as_str(),
+                        asset_id: asset_id.as_str(),
+                        visual,
+                        rotation_deg: eval.map_or(0.0, |v| v.rotation_deg),
+                        scale_x: eval.map_or(1.0, |v| v.scale_x),
+                        scale_y: eval.map_or(1.0, |v| v.scale_y),
+                        opacity: eval.map_or(1.0, |v| v.opacity),
+                    });
+                }
+                ClipKind::Video { .. } | ClipKind::Audio { .. } => {}
+            }
+        }
+    }
+    subtitle_entries.sort_by(|a, b| {
+        a.timeline_start_frame
+            .cmp(&b.timeline_start_frame)
+            .then_with(|| a.clip_id.cmp(&b.clip_id))
+    });
+    (subtitle_entries, image_entries)
+}
+
+fn group_companion_backdrops(entries: &[VisibleImageSlideEntry<'_>]) -> GroupedBackdrops {
+    let mut hidden = HashSet::new();
+    let mut mapping: HashMap<String, Vec<String>> = HashMap::new();
+    for (bg_idx, bg) in entries.iter().enumerate() {
+        let is_backdrop_candidate = bg.clip.name.starts_with("Backdrop ") || bg.opacity < 0.75;
+        if !is_backdrop_candidate {
+            continue;
+        }
+        let Some(fg) = entries.iter().enumerate().find(|(fg_idx, fg)| {
+            *fg_idx != bg_idx
+                && fg.asset_id == bg.asset_id
+                && fg.layer_idx > bg.layer_idx
+                && intervals_match_or_strongly_overlap(bg.start, bg.end, fg.start, fg.end)
+                && !fg.clip.name.starts_with("Backdrop ")
+        }) else {
+            continue;
+        };
+        hidden.insert(bg.clip.id.as_str().to_owned());
+        mapping
+            .entry(fg.1.clip.id.as_str().to_owned())
+            .or_default()
+            .push(bg.clip.id.as_str().to_owned());
+    }
+    GroupedBackdrops {
+        hidden_backdrop_ids: hidden,
+        primary_to_backdrops: mapping,
+    }
+}
+
+fn intervals_match_or_strongly_overlap(s1: u64, e1: u64, s2: u64, e2: u64) -> bool {
+    let ov_start = s1.max(s2);
+    let ov_end = e1.min(e2);
+    if ov_start >= ov_end {
+        return false;
+    }
+    let ov = ov_end - ov_start;
+    let min_dur = e1.saturating_sub(s1).min(e2.saturating_sub(s2)).max(1);
+    ov.saturating_mul(100) >= min_dur.saturating_mul(80)
+}
+
+fn build_slide_pair_item(
+    slide_index: usize,
+    entry: &VisibleImageSlideEntry<'_>,
+    asset_paths: &HashMap<&str, String>,
+    asset_dims: &HashMap<&str, [u32; 2]>,
+    subtitle_entries: &[OverlappingSubtitleSummary],
+    companion_backdrop_clip_ids: Vec<String>,
+) -> TimelineSlidePairSummary {
+    let slide_dur = entry.end.saturating_sub(entry.start).max(1);
+    let overlapping_subtitles = subtitle_entries
+        .iter()
+        .filter_map(|sub| {
+            let ov_start = entry.start.max(sub.timeline_start_frame);
+            let ov_end = entry.end.min(sub.timeline_end_frame);
+            if ov_start >= ov_end {
+                return None;
+            }
+            let overlap_frames = ov_end - ov_start;
+            let sub_dur = sub
+                .timeline_end_frame
+                .saturating_sub(sub.timeline_start_frame)
+                .max(1);
+            // クロスフェード境界の数フレーム接触だけで誤って別スライドの字幕を拾わないよう除外
+            let is_edge_bleed = overlap_frames.saturating_mul(100) < slide_dur.saturating_mul(15)
+                && overlap_frames.saturating_mul(100) < sub_dur.saturating_mul(30);
+            if is_edge_bleed {
+                return None;
+            }
+            let mut item = sub.clone();
+            item.overlap_frames = overlap_frames;
+            Some(item)
+        })
+        .collect();
+
+    TimelineSlidePairSummary {
+        slide_index,
+        image_clip_id: entry.clip.id.as_str().to_owned(),
+        image_layer_id: entry.layer_id.to_owned(),
+        asset_id: entry.asset_id.to_owned(),
+        asset_path: asset_paths.get(entry.asset_id).cloned(),
+        asset_dimensions: asset_dims.get(entry.asset_id).copied(),
+        timeline_start_frame: entry.start,
+        timeline_end_frame: entry.end,
+        current_rotation_deg: entry.rotation_deg,
+        rotation_is_animated: !matches!(
+            entry.visual.rotation_deg,
+            AnimatedParameter::Constant { .. }
+        ),
+        current_scale_x: entry.scale_x,
+        current_scale_y: entry.scale_y,
+        scale_is_animated: !matches!(entry.visual.scale_x, AnimatedParameter::Constant { .. })
+            || !matches!(entry.visual.scale_y, AnimatedParameter::Constant { .. }),
+        is_cover_scaled: entry.clip.name.starts_with("Backdrop "),
+        companion_backdrop_clip_ids,
+        overlapping_subtitles,
+    }
 }
 
 /// ドキュメントから AI 向けのコンパクト要約構造体を生成する。
@@ -1034,6 +1332,202 @@ mod tests {
             .map(|a| a.gain_db)
             .ok_or("missing audio")?;
         assert!((gain - (-6.0)).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn build_timeline_slide_pairs_collects_all_overlapping_subtitles_and_animation_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::animation::{EasingCurve, ExtrapolationMode, Keyframe};
+        use crate::core::ids::AssetId;
+        use crate::core::time::FrameCount;
+        use crate::media::visual_properties::SubtitleProperties;
+        use crate::timeline::document::{AssetPath, Layer};
+
+        let mut doc = ProjectDocument::new("SlidePairs");
+        let a1 = AssetId::new("a_sakura")?;
+        doc.assets.push(Asset {
+            id: a1.clone(),
+            name: "sakura.jpg".to_owned(),
+            path: AssetPath::new(None, Some("C:/photos/sakura.jpg".to_owned())),
+            kind: AssetKind::Image {
+                width: 1200,
+                height: 800,
+            },
+            status: AssetStatus::Available,
+        });
+
+        let mut img_layer = Layer::new(LayerId::new("L_IMG")?, "Photos");
+        img_layer.clips.push(Clip {
+            id: ClipId::new("C_IMG1")?,
+            name: "sakura.jpg".to_owned(),
+            timeline_start: FrameIndex::new(60),
+            duration: FrameCount::new(180)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: a1,
+                visual: VisualProperties {
+                    scale_x: AnimatedParameter::Keyframes {
+                        keyframes: vec![
+                            Keyframe::with_easing(0, 1.0, EasingCurve::Linear),
+                            Keyframe::new(179, 1.08),
+                        ],
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                    scale_y: AnimatedParameter::Keyframes {
+                        keyframes: vec![
+                            Keyframe::with_easing(0, 1.0, EasingCurve::Linear),
+                            Keyframe::new(179, 1.08),
+                        ],
+                        extrapolation: ExtrapolationMode::Clamp,
+                    },
+                    rotation_deg: AnimatedParameter::constant(90.0),
+                    ..VisualProperties::default()
+                },
+            },
+        });
+        let mut sub_layer = Layer::new(LayerId::new("L_SUB")?, "Subtitles");
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_YEAR")?,
+            name: "Year".to_owned(),
+            timeline_start: FrameIndex::new(60),
+            duration: FrameCount::new(180)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("2023年")),
+        });
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_MAIN")?,
+            name: "Main".to_owned(),
+            timeline_start: FrameIndex::new(100),
+            duration: FrameCount::new(100)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("りんご飴がおいしかった")),
+        });
+        doc.layers.push(img_layer);
+        doc.layers.push(sub_layer);
+
+        let pairs = build_timeline_slide_pairs(&doc, None);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].slide_index, 1);
+        assert_eq!(pairs[0].asset_dimensions, Some([1200, 800]));
+        assert!((pairs[0].current_rotation_deg - 90.0).abs() < 1e-9);
+        assert!(!pairs[0].rotation_is_animated);
+        assert!(pairs[0].scale_is_animated);
+        assert_eq!(pairs[0].overlapping_subtitles.len(), 2);
+        assert_eq!(pairs[0].overlapping_subtitles[0].text, "2023年");
+        assert_eq!(
+            pairs[0].overlapping_subtitles[1].text,
+            "りんご飴がおいしかった"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_timeline_slide_pairs_skips_hidden_layers_groups_backdrops_and_filters_fade_bleed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::ids::AssetId;
+        use crate::core::time::FrameCount;
+        use crate::media::visual_properties::SubtitleProperties;
+        use crate::timeline::document::{AssetPath, Layer};
+
+        let mut doc = ProjectDocument::new("BackdropAndHidden");
+        let a1 = AssetId::new("a_portrait")?;
+        doc.assets.push(Asset {
+            id: a1.clone(),
+            name: "portrait.jpg".to_owned(),
+            path: AssetPath::new(None, Some("C:/photos/portrait.jpg".to_owned())),
+            kind: AssetKind::Image {
+                width: 800,
+                height: 1200,
+            },
+            status: AssetStatus::Available,
+        });
+
+        let mut bg_layer = Layer::new(LayerId::new("L_BG")?, "Backdrop");
+        bg_layer.clips.push(Clip {
+            id: ClipId::new("C_BG")?,
+            name: "Backdrop 1".to_owned(),
+            timeline_start: FrameIndex::new(0),
+            duration: FrameCount::new(200)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: a1.clone(),
+                visual: VisualProperties {
+                    opacity: AnimatedParameter::constant(0.38),
+                    ..VisualProperties::default()
+                },
+            },
+        });
+        let mut fg_layer = Layer::new(LayerId::new("L_FG")?, "Photos");
+        fg_layer.clips.push(Clip {
+            id: ClipId::new("C_FG")?,
+            name: "Slide #1".to_owned(),
+            timeline_start: FrameIndex::new(0),
+            duration: FrameCount::new(200)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: a1.clone(),
+                visual: VisualProperties::default(),
+            },
+        });
+        let mut hidden_layer = Layer::new(LayerId::new("L_HID")?, "Hidden");
+        hidden_layer.visible = false;
+        hidden_layer.clips.push(Clip {
+            id: ClipId::new("C_HID")?,
+            name: "Hidden".to_owned(),
+            timeline_start: FrameIndex::new(0),
+            duration: FrameCount::new(200)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Image {
+                asset_id: a1,
+                visual: VisualProperties::default(),
+            },
+        });
+        let mut sub_layer = Layer::new(LayerId::new("L_SUB")?, "Subtitles");
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_MAIN")?,
+            name: "Main".to_owned(),
+            timeline_start: FrameIndex::new(0),
+            duration: FrameCount::new(200)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("メイン字幕")),
+        });
+        // 末尾 10f だけ重なる次スライド字幕（10/200 = 5% < 15% かつ 10/100 = 10% < 30%）は除外される
+        sub_layer.clips.push(Clip {
+            id: ClipId::new("S_NEXT_FADE")?,
+            name: "NextFade".to_owned(),
+            timeline_start: FrameIndex::new(190),
+            duration: FrameCount::new(100)?,
+            effect_offset_frames: 0,
+            effect_duration_frames: None,
+            midpoints: Vec::new(),
+            kind: ClipKind::Subtitle(SubtitleProperties::new("次スライド字幕")),
+        });
+        doc.layers.push(bg_layer);
+        doc.layers.push(fg_layer);
+        doc.layers.push(hidden_layer);
+        doc.layers.push(sub_layer);
+
+        let pairs = build_timeline_slide_pairs(&doc, None);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].image_clip_id, "C_FG");
+        assert_eq!(pairs[0].companion_backdrop_clip_ids, vec!["C_BG"]);
+        assert_eq!(pairs[0].overlapping_subtitles.len(), 1);
+        assert_eq!(pairs[0].overlapping_subtitles[0].clip_id, "S_MAIN");
         Ok(())
     }
 }

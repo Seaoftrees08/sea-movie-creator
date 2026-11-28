@@ -1,8 +1,16 @@
 //! `sea-movie-creator` 本体と AI CLI プラグイン（`sea-ai-antigravity` / `sea-ai-acp`）で共有する
 //! 会話履歴フォーマット・多段圧縮・ACP チャンク抽出ヘルパー。
 
+use std::io::{self, BufRead, Read};
+
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+/// 外部 AI プラグインの NDJSON 1 行あたり最大バイト数（16 MiB）。
+pub const MAX_AI_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 許可する画像 MIME タイプ。
+const ALLOWED_ACP_IMAGE_MIMES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 /// `# Conversation History` セクションの最大バイト数（`128 KiB`）。
 pub const MAX_HISTORY_PROMPT_BYTES: usize = 128 * 1024;
@@ -12,6 +20,289 @@ pub const PINNED_INSTRUCTION_MAX_BYTES: usize = 64 * 1024;
 
 /// 自律エージェントの元指示を識別・ピン留めするための先頭マーカー。
 pub const ORIGINAL_INSTRUCTION_MARKER: &str = "# Original User Instruction";
+
+/// 外部 AI プラグインの 1 呼び出しあたり許可する最大画像枚数。
+pub const MAX_PLUGIN_VISION_IMAGES: usize = 12;
+
+/// 外部 AI プラグインの 1 呼び出しあたり許可する画像 Base64 データ合計上限（8 MiB）。
+pub const MAX_PLUGIN_VISION_BASE64_BYTES: usize = 8 * 1024 * 1024;
+
+/// 外部 AI プラグインおよび ACP `session/prompt` へ渡す画像入力パート。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcpImageInput {
+    /// 画像 MIME タイプ（例: `"image/jpeg"`）。
+    pub mime_type: String,
+    /// Base64 エンコード済み画像バイト列。
+    pub base64_data: String,
+}
+
+/// 外部プラグインへ送信する画像配列の枚数・サイズ・MIME 形式・必須項目の妥当性を検証する。
+///
+/// # Errors
+///
+/// 枚数上限・合計サイズ上限超過・非許可 MIME・または `mime_type` / `base64_data` が空の場合にエラー文字列を返す。
+pub fn validate_acp_images(images: &[AcpImageInput]) -> Result<(), String> {
+    if images.len() > MAX_PLUGIN_VISION_IMAGES {
+        return Err(format!(
+            "plugin vision image count {} exceeds limit {MAX_PLUGIN_VISION_IMAGES}",
+            images.len()
+        ));
+    }
+    let mut total_bytes = 0_usize;
+    for (idx, img) in images.iter().enumerate() {
+        let mime = img.mime_type.trim().to_ascii_lowercase();
+        if mime.is_empty() || img.base64_data.trim().is_empty() {
+            return Err(format!(
+                "plugin vision image[{idx}] has empty mime_type or base64_data"
+            ));
+        }
+        if !ALLOWED_ACP_IMAGE_MIMES.contains(&mime.as_str()) {
+            return Err(format!(
+                "plugin vision image[{idx}] has unsupported mime_type `{mime}`"
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(img.base64_data.len());
+    }
+    if total_bytes > MAX_PLUGIN_VISION_BASE64_BYTES {
+        return Err(format!(
+            "plugin vision total base64 size {total_bytes} bytes exceeds limit {MAX_PLUGIN_VISION_BASE64_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// ACP `initialize` 応答から画像入力対応 (`promptCapabilities.image`) を読み取る。
+///
+/// `promptCapabilities` オブジェクト自体が存在し `image` キーが省略された場合は
+/// ACP 仕様の既定値 `false` に従って `Some(false)` を返し、`promptCapabilities` 自体が無い場合は `None` を返す。
+#[must_use]
+pub fn acp_supports_image_prompt(init_resp: &Value) -> Option<bool> {
+    let prompt_caps = init_resp["result"]["agentCapabilities"]
+        .get("promptCapabilities")
+        .or_else(|| init_resp["result"]["capabilities"].get("promptCapabilities"))
+        .and_then(Value::as_object)?;
+    Some(
+        prompt_caps
+            .get("image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+/// 上限バイト数付きで NDJSON の 1 行を読み取る。
+///
+/// UTF-8 デコード前にバイト長上限を検証し、マルチバイト文字分断時も `InvalidData`（サイズ超過）として扱う。
+///
+/// # Errors
+///
+/// I/O 失敗、上限超過、または不正 UTF-8 時に `io::Error` を返す。
+pub fn read_ndjson_line_limited<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
+    let read = reader.by_ref().take(limit).read_until(b'\n', &mut buf)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if read > max_bytes && !buf.ends_with(b"\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("NDJSON line exceeded max size ({max_bytes} bytes)"),
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// 子プロセスの異常終了・早期エラー脱出時にも確実に `kill()` + `wait()` で回収するガード。
+pub struct ChildKillGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildKillGuard {
+    /// 子プロセスをラップして回収ガードを作成する。
+    #[must_use]
+    pub const fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// 子プロセスの `stdin` を取り出す。
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut().and_then(|c| c.stdin.take())
+    }
+
+    /// 子プロセスの `stdout` を取り出す。
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    /// 子プロセスの `stderr` を取り出す。
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut().and_then(|c| c.stderr.take())
+    }
+
+    /// 正常完了後に終了ステータスを待機して消費する。
+    ///
+    /// # Errors
+    ///
+    /// 子プロセス待機失敗時に `io::Error` を返す。
+    pub fn wait_status(&mut self) -> io::Result<std::process::ExitStatus> {
+        let Some(mut child) = self.child.take() else {
+            return Err(io::Error::other("child process already consumed"));
+        };
+        child.wait()
+    }
+
+    /// 短時間（`timeout`）終了を待ち、未終了なら `kill()` + `wait()` で確実に回収する。
+    ///
+    /// # Errors
+    ///
+    /// `try_wait` / `kill` / `wait` 失敗時に `io::Error` を返す。
+    pub fn wait_bounded_or_kill(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let Some(mut child) = self.child.take() else {
+            return Err(io::Error::other("child process already consumed"));
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return child.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    return child.wait();
+                }
+            }
+        }
+    }
+
+    /// 即座に `kill()` + `wait()` を実行する。
+    pub fn kill_and_wait(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if matches!(child.try_wait(), Ok(None) | Err(_)) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ChildKillGuard {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+/// Windows 匿名パイプ (4 KiB) でのデッドロックを防ぐため、別スレッドで `stderr` を上限付きでドレインする。
+#[must_use]
+pub fn spawn_stderr_drain(
+    mut stderr: std::process::ChildStderr,
+    max_bytes: usize,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut collected = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if collected.len() < max_bytes {
+                        let remain = max_bytes - collected.len();
+                        collected.extend_from_slice(&buf[..n.min(remain)]);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&collected).trim().to_owned()
+    })
+}
+
+/// 文字数上限で文字列を安全に省略する（UTF-8 文字境界安全）。
+#[must_use]
+pub fn truncate_utf8_chars(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+/// ACP サーバー発 JSON-RPC リクエスト（`session/request_permission` 等）に対する拒否応答を構築する。
+///
+/// リクエストでなければ `None` を返す（通知・レスポンスは対象外）。
+#[must_use]
+pub fn build_acp_server_request_deny_response(msg: &Value) -> Option<Value> {
+    let req_id = msg.get("id").filter(|v| !v.is_null())?;
+    let method = msg["method"].as_str()?;
+    if method == "session/request_permission" {
+        let outcome = build_acp_permission_deny_outcome(&msg["params"]);
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "outcome": outcome
+            }
+        }));
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32601,
+            "message": "method not supported by sea-movie-creator ACP host"
+        }
+    }))
+}
+
+fn build_acp_permission_deny_outcome(params: &Value) -> Value {
+    if let Some(options) = params["options"].as_array()
+        && let Some(reject_opt) = options.iter().find(|opt| {
+            matches!(
+                opt["kind"].as_str(),
+                Some("reject_once" | "reject_always" | "deny" | "cancel")
+            )
+        })
+        && let Some(option_id) = reject_opt["optionId"]
+            .as_str()
+            .or_else(|| reject_opt["id"].as_str())
+    {
+        return json!({
+            "outcome": "selected",
+            "optionId": option_id,
+        });
+    }
+    json!({ "outcome": "cancelled" })
+}
+
+/// ACP `session/prompt` 用の `prompt` コンテンツブロック配列を構築する。
+#[must_use]
+pub fn build_acp_prompt_content_blocks(prompt_text: &str, images: &[AcpImageInput]) -> Vec<Value> {
+    let mut blocks = Vec::with_capacity(1 + images.len());
+    blocks.push(serde_json::json!({
+        "type": "text",
+        "text": prompt_text,
+    }));
+    for img in images {
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "mimeType": img.mime_type,
+            "data": img.base64_data,
+        }));
+    }
+    blocks
+}
 
 const HISTORY_HEADER: &str = "# Conversation History\n";
 const OMITTED_MARKER: &str = "...(earlier messages omitted)...";
@@ -32,22 +323,74 @@ pub fn is_empty_json_value(val: &Value) -> bool {
     val.is_null() || val.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
-/// ACP `session/update` の `params` から `agent_message_chunk` テキストのみを抽出する。
-///
-/// `agent_thought_chunk` や `tool_call` 等は混入防止のため `None` を返す。
-#[must_use]
-pub fn extract_acp_update_message_delta(params: &Value) -> Option<String> {
-    let update = params.get("update").unwrap_or(params);
-    if let Some(kind) = update["sessionUpdate"].as_str()
-        && kind != "agent_message_chunk"
-    {
-        return None;
-    }
+/// ACP `session/update` から抽出した構造化イベント。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpSessionUpdateEvent {
+    /// 本文チャンク（`agent_message_chunk` または種別省略時）。
+    MessageDelta(String),
+    /// 思考過程チャンク（`agent_thought_chunk`）。
+    ThoughtDelta(String),
+    /// 外部ツール実行状況（`tool_call` / `tool_call_update`）。
+    ToolActivity {
+        /// 表示用タイトル・コマンド概要。
+        title: String,
+        /// 状態（例: `"pending"`, `"in_progress"`, `"completed"`, `"failed"`）。
+        status: Option<String>,
+    },
+}
+
+fn extract_update_text(update: &Value) -> Option<String> {
     update["content"]["text"]
         .as_str()
         .or_else(|| update["text"].as_str())
         .or_else(|| update["delta"].as_str())
         .map(ToOwned::to_owned)
+}
+
+fn extract_tool_activity_title(update: &Value) -> Option<String> {
+    update["title"]
+        .as_str()
+        .or_else(|| update["content"]["text"].as_str())
+        .or_else(|| update["kind"].as_str())
+        .or_else(|| update["toolCallId"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// ACP `session/update` の `params` を本文・思考・ツール活動へ分類して抽出する。
+#[must_use]
+pub fn extract_acp_update_event(params: &Value) -> Option<AcpSessionUpdateEvent> {
+    let update = params.get("update").unwrap_or(params);
+    match update["sessionUpdate"].as_str() {
+        Some("agent_thought_chunk") => extract_update_text(update)
+            .filter(|s| !s.is_empty())
+            .map(AcpSessionUpdateEvent::ThoughtDelta),
+        Some("tool_call" | "tool_call_update") => {
+            let title = extract_tool_activity_title(update)?;
+            let status = update["status"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            Some(AcpSessionUpdateEvent::ToolActivity { title, status })
+        }
+        Some("agent_message_chunk") | None => extract_update_text(update)
+            .filter(|s| !s.is_empty())
+            .map(AcpSessionUpdateEvent::MessageDelta),
+        Some(_) => None,
+    }
+}
+
+/// ACP `session/update` の `params` から `agent_message_chunk` テキストのみを抽出する。
+///
+/// `agent_thought_chunk` や `tool_call` 等は混入防止のため `None` を返す。
+#[must_use]
+pub fn extract_acp_update_message_delta(params: &Value) -> Option<String> {
+    match extract_acp_update_event(params) {
+        Some(AcpSessionUpdateEvent::MessageDelta(text)) => Some(text),
+        _ => None,
+    }
 }
 
 fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
@@ -409,5 +752,74 @@ mod tests {
             extract_acp_update_message_delta(&msg).as_deref(),
             Some("完了しました。")
         );
+        assert_eq!(
+            extract_acp_update_event(&thought),
+            Some(AcpSessionUpdateEvent::ThoughtDelta("thinking".to_owned()))
+        );
+        assert_eq!(
+            extract_acp_update_event(&tool),
+            Some(AcpSessionUpdateEvent::ToolActivity {
+                title: "running tool".to_owned(),
+                status: None,
+            })
+        );
+        let named_tool = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "Inspecting timeline",
+                "status": "in_progress"
+            }
+        });
+        assert_eq!(
+            extract_acp_update_event(&named_tool),
+            Some(AcpSessionUpdateEvent::ToolActivity {
+                title: "Inspecting timeline".to_owned(),
+                status: Some("in_progress".to_owned()),
+            })
+        );
+
+        let empty_msg = json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "" }
+            }
+        });
+        assert_eq!(extract_acp_update_event(&empty_msg), None);
+    }
+
+    #[test]
+    fn acp_helpers_validate_mime_prompt_caps_ndjson_limit_and_server_deny() -> io::Result<()> {
+        // MIME チェック
+        let bad_mime = [AcpImageInput {
+            mime_type: "image/svg+xml".to_owned(),
+            base64_data: "abc".to_owned(),
+        }];
+        assert!(validate_acp_images(&bad_mime).is_err());
+
+        // promptCapabilities 存在時に image 省略なら false
+        let caps_omitted = serde_json::json!({
+            "result": { "agentCapabilities": { "promptCapabilities": {} } }
+        });
+        assert_eq!(acp_supports_image_prompt(&caps_omitted), Some(false));
+        let no_caps = serde_json::json!({ "result": {} });
+        assert_eq!(acp_supports_image_prompt(&no_caps), None);
+
+        // server permission deny
+        let perm_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/request_permission",
+            "params": { "options": [{ "kind": "reject_once", "optionId": "deny-1" }] }
+        });
+        let deny = build_acp_server_request_deny_response(&perm_req)
+            .ok_or_else(|| io::Error::other("deny response"))?;
+        assert_eq!(deny["result"]["outcome"]["optionId"], "deny-1");
+
+        // NDJSON 行長上限
+        let mut cursor = io::Cursor::new(b"{\"ok\":true}\n{\"too\":\"long_payload\"}\n");
+        let l1 = read_ndjson_line_limited(&mut cursor, 16)?;
+        assert_eq!(l1.as_deref(), Some("{\"ok\":true}\n"));
+        assert!(read_ndjson_line_limited(&mut cursor, 16).is_err());
+        Ok(())
     }
 }

@@ -56,6 +56,67 @@ fn render_turn_message_text(msg: &AiTurnMessage) -> String {
     }
 }
 
+fn build_continuity_mock_provider(
+    captured_ref: Arc<Mutex<Vec<AiAgentTurnRequest>>>,
+    step_ref: Arc<AtomicUsize>,
+) -> Arc<MockAiProvider> {
+    Arc::new(MockAiProvider::with_agent_handler(move |req| {
+        if let Ok(mut guard) = captured_ref.lock() {
+            guard.push(req.clone());
+        }
+        let step = step_ref.fetch_add(1, Ordering::SeqCst);
+        match step {
+            0 => Ok(AiAgentTurnResponse {
+                text: None,
+                thinking_blocks: Vec::new(),
+                tool_calls: vec![
+                    AiToolCall {
+                        id: "c1".to_owned(),
+                        name: "get_timeline_summary".to_owned(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                    AiToolCall {
+                        id: "c2".to_owned(),
+                        name: "get_capabilities".to_owned(),
+                        arguments: json!({ "include_schemas": true }),
+                        thought_signature: None,
+                    },
+                ],
+                model: "mock-continuity-v1".to_owned(),
+                finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
+            }),
+            1 => Ok(AiAgentTurnResponse {
+                text: None,
+                thinking_blocks: Vec::new(),
+                tool_calls: vec![AiToolCall {
+                    id: "c3".to_owned(),
+                    name: "apply_draft_edit_command".to_owned(),
+                    arguments: json!({
+                        "command": {
+                            "type": "set_project_meta",
+                            "name": "Continuity Verified Movie"
+                        }
+                    }),
+                    thought_signature: None,
+                }],
+                model: "mock-continuity-v1".to_owned(),
+                finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
+            }),
+            _ => Ok(AiAgentTurnResponse {
+                text: Some("タイトルを変更して完了しました。".to_owned()),
+                thinking_blocks: Vec::new(),
+                tool_calls: Vec::new(),
+                model: "mock-continuity-v1".to_owned(),
+                finish_reason: Some("stop".to_owned()),
+                usage: None,
+            }),
+        }
+    }))
+}
+
 #[test]
 fn followup_preserves_original_instruction_across_tool_calls_and_updates_memory()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -69,59 +130,9 @@ fn followup_preserves_original_instruction_across_tool_calls_and_updates_memory(
     }
 
     let captured_requests: Arc<Mutex<Vec<AiAgentTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let captured_ref = Arc::clone(&captured_requests);
     let step_counter = Arc::new(AtomicUsize::new(0));
-    let step_ref = Arc::clone(&step_counter);
-
-    let provider = Arc::new(MockAiProvider::with_agent_handler(move |req| {
-        if let Ok(mut guard) = captured_ref.lock() {
-            guard.push(req.clone());
-        }
-        let step = step_ref.fetch_add(1, Ordering::SeqCst);
-        match step {
-            0 => Ok(AiAgentTurnResponse {
-                text: None,
-                tool_calls: vec![
-                    AiToolCall {
-                        id: "c1".to_owned(),
-                        name: "get_timeline_summary".to_owned(),
-                        arguments: json!({}),
-                    },
-                    AiToolCall {
-                        id: "c2".to_owned(),
-                        name: "get_capabilities".to_owned(),
-                        arguments: json!({ "include_schemas": true }),
-                    },
-                ],
-                model: "mock-continuity-v1".to_owned(),
-                finish_reason: Some("tool_calls".to_owned()),
-                usage: None,
-            }),
-            1 => Ok(AiAgentTurnResponse {
-                text: None,
-                tool_calls: vec![AiToolCall {
-                    id: "c3".to_owned(),
-                    name: "apply_draft_edit_command".to_owned(),
-                    arguments: json!({
-                        "command": {
-                            "type": "set_project_meta",
-                            "name": "Continuity Verified Movie"
-                        }
-                    }),
-                }],
-                model: "mock-continuity-v1".to_owned(),
-                finish_reason: Some("tool_calls".to_owned()),
-                usage: None,
-            }),
-            _ => Ok(AiAgentTurnResponse {
-                text: Some("タイトルを変更して完了しました。".to_owned()),
-                tool_calls: Vec::new(),
-                model: "mock-continuity-v1".to_owned(),
-                finish_reason: Some("stop".to_owned()),
-                usage: None,
-            }),
-        }
-    }));
+    let provider =
+        build_continuity_mock_provider(Arc::clone(&captured_requests), Arc::clone(&step_counter));
 
     let mut controller = AppController::new();
     controller.ai_chat.selected_provider = AiProviderKind::Mock;
@@ -192,6 +203,7 @@ fn noop_edit_request_triggers_single_self_repair_and_reports_zero_changes()
                     "検証が完了しました。\n```json\n{\"type\":\"batch\",\"commands\":[]}\n```"
                         .to_owned(),
                 ),
+                thinking_blocks: Vec::new(),
                 tool_calls: Vec::new(),
                 model: "mock-noop-v1".to_owned(),
                 finish_reason: Some("stop".to_owned()),
@@ -200,6 +212,7 @@ fn noop_edit_request_triggers_single_self_repair_and_reports_zero_changes()
         }
         Ok(AiAgentTurnResponse {
             text: Some("対象クリップが見つかりませんでした。".to_owned()),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             model: "mock-noop-v1".to_owned(),
             finish_reason: Some("stop".to_owned()),

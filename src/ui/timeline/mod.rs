@@ -300,24 +300,7 @@ fn render_header_controls(
                         this.open_timeline_length_modal(window, cx);
                     }),
                 ))
-                .child(header_pill(
-                    "tl-follow-toggle",
-                    tr("timeline.follow"),
-                    controller.follow_selected_on_seek,
-                    cx.listener(|this, _, _, cx| {
-                        this.controller.toggle_follow_selected_on_seek();
-                        cx.notify();
-                    }),
-                ))
-                .child(header_pill(
-                    "tl-snap-toggle",
-                    tr("timeline.snap"),
-                    controller.snap_config.enabled,
-                    cx.listener(|this, _, _, cx| {
-                        this.controller.toggle_snap_enabled();
-                        cx.notify();
-                    }),
-                ))
+                .child(render_follow_and_snap_pills(controller, cx))
                 .child(header_pill(
                     "tl-density-cycle",
                     density_label,
@@ -340,6 +323,62 @@ fn render_header_controls(
                 )),
         )
         .child(render_compact_status(controller))
+}
+
+fn render_follow_and_snap_pills(
+    controller: &AppController,
+    cx: &mut Context<SeaEditorWindow>,
+) -> impl IntoElement + use<> {
+    h_flex()
+        .gap(px(6.))
+        .items_center()
+        .child(header_pill(
+            "tl-follow-playhead-mode",
+            playhead_follow_label(controller),
+            controller.playhead_follow_mode
+                != crate::ui::editor_prefs::TimelinePlayheadFollowMode::Off
+                && !controller.playhead_follow_paused_by_manual_scroll,
+            cx.listener(|this, _, _, cx| {
+                this.controller.on_playhead_follow_button_click();
+                this.reload_app_menus(cx);
+                cx.notify();
+            }),
+        ))
+        .child(header_pill(
+            "tl-follow-toggle",
+            tr("timeline.follow_clip"),
+            controller.follow_selected_on_seek,
+            cx.listener(|this, _, _, cx| {
+                this.controller.toggle_follow_selected_on_seek();
+                this.reload_app_menus(cx);
+                cx.notify();
+            }),
+        ))
+        .child(header_pill(
+            "tl-snap-toggle",
+            tr("timeline.snap"),
+            controller.snap_config.enabled,
+            cx.listener(|this, _, _, cx| {
+                this.controller.toggle_snap_enabled();
+                cx.notify();
+            }),
+        ))
+}
+
+fn playhead_follow_label(controller: &AppController) -> String {
+    use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
+    let base = match controller.playhead_follow_mode {
+        TimelinePlayheadFollowMode::Page => tr("timeline.follow_playhead_page"),
+        TimelinePlayheadFollowMode::Center => tr("timeline.follow_playhead_center"),
+        TimelinePlayheadFollowMode::Off => tr("timeline.follow_playhead_off"),
+    };
+    if controller.playhead_follow_paused_by_manual_scroll
+        && controller.playhead_follow_mode != TimelinePlayheadFollowMode::Off
+    {
+        format!("{base} {}", tr("timeline.follow_playhead_paused_suffix"))
+    } else {
+        base
+    }
 }
 
 fn header_pill(
@@ -535,6 +574,7 @@ fn render_h_scrollbar(
                         let frac = (local_x / viewport_w).clamp(0.0, 1.0);
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let next_scroll = ((content_frames as f32) * frac).round() as u64;
+                        this.controller.mark_timeline_manual_scroll();
                         this.controller.timeline_scroll_x_frames = next_scroll;
                         this.controller.timeline_gesture =
                             Some(TimelinePointerGesture::HScrollbar {
@@ -617,6 +657,7 @@ pub fn handle_timeline_scroll_wheel(
         dy,
         this.controller.timeline_px_per_frame,
     ) {
+        this.controller.mark_timeline_manual_scroll();
         this.controller.timeline_scroll_x_frames = next_scroll;
     }
     this.timeline_scroll
@@ -728,7 +769,7 @@ fn route_gesture_mouse_move(
                 this.controller.timeline_scroll_x_frames,
                 ppf,
             );
-            this.controller.seek_to_frame(FrameIndex::new(frame));
+            this.controller.scrub_to_frame(FrameIndex::new(frame));
             this.mark_sliders_dirty();
             this.sync_sliders_now(window, cx);
         }
@@ -757,6 +798,7 @@ fn route_gesture_mouse_move(
             let d_frames =
                 ((dx / track_width_px.max(1.0)) * (*content_frames as f32)).round() as i64;
             let next = i64::try_from(*origin_scroll_frames).unwrap_or(0) + d_frames;
+            this.controller.mark_timeline_manual_scroll();
             this.controller.timeline_scroll_x_frames = u64::try_from(next.max(0)).unwrap_or(0);
         }
         _ => {}
@@ -866,9 +908,10 @@ pub fn handle_timeline_window_mouse_up(
                 this.controller.status_message = format!("総尺変更失敗: {err}");
             }
         }
-        TimelinePointerGesture::RulerScrub
-        | TimelinePointerGesture::ZoomBar { .. }
-        | TimelinePointerGesture::HScrollbar { .. } => {}
+        TimelinePointerGesture::RulerScrub => {
+            this.controller.playhead_follow_paused_by_manual_scroll = false;
+        }
+        TimelinePointerGesture::ZoomBar { .. } | TimelinePointerGesture::HScrollbar { .. } => {}
     }
 
     this.controller.inspector.invalidate_sync();

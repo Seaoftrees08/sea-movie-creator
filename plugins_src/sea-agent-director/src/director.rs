@@ -11,12 +11,12 @@ use std::ops::ControlFlow;
 
 use sea_agent_protocol::{
     AgentAskChoice, AgentAskField, AgentAskFieldKind, AgentLlmMessage, AgentLlmToolCall,
-    AgentToHostMessage, AgentUserAnswerPayload,
+    AgentThinkingBlock, AgentToHostMessage, AgentToolSpec, AgentUserAnswerPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::protocol_io::{AgentTransport, RpcError};
+use crate::protocol_io::{AgentLlmReply, AgentTransport, RpcError};
 
 const MAX_DYNAMIC_TOOL_STEPS: u32 = 12;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -268,7 +268,8 @@ fn run_folder_story_workflow(
     attached_folders: &[String],
     attached_clips: &[String],
 ) -> Result<(), RpcError> {
-    ingest_folders_and_vision(session, transport, goal, attached_folders)?;
+    // ステップ 1: フォルダ走査のみ先に実施し、件数把握後にすぐ希望確認カードを提示する
+    scan_attached_folders(session, transport, attached_folders)?;
 
     if session.memory.analyzed_images.is_empty() {
         transport.send_error(
@@ -279,20 +280,26 @@ fn run_folder_story_workflow(
         return Ok(());
     }
 
-    // ステップ 3: リッチ対話質問カードでタイトル・尺・雰囲気を確認
-    transport.status("構成と字幕の希望を確認中...", Some(3), Some(4));
+    // ステップ 2 (前倒し): リッチ対話質問カードでタイトル・尺・雰囲気を確認（リトライ時は再利用）
     let suggested_duration = parse_target_duration_seconds(goal);
-    let user_answer = ask_movie_preferences_card(session, transport, suggested_duration)?;
-    session.memory.user_preferences = Some(json!({
-        "choice_id": user_answer.choice_id,
-        "field_values": user_answer.field_values,
-        "free_text": user_answer.free_text,
-        "skipped": user_answer.skipped,
-        "requested_duration_seconds": extract_preferred_duration(&user_answer, suggested_duration),
-    }));
+    if session.memory.user_preferences.is_none() {
+        transport.status("2/4 構成と字幕の希望を確認中...", Some(2), Some(4));
+        let user_answer = ask_movie_preferences_card(session, transport, suggested_duration)?;
+        session.memory.user_preferences = Some(json!({
+            "choice_id": user_answer.choice_id,
+            "field_values": user_answer.field_values,
+            "free_text": user_answer.free_text,
+            "skipped": user_answer.skipped,
+            "requested_duration_seconds": extract_preferred_duration(&user_answer, suggested_duration),
+        }));
+    }
+
+    // ステップ 3: ユーザー希望を統合したヒントを使って Vision 解析バッチを実行
+    let vision_hint = build_vision_theme_hint(goal, session.memory.user_preferences.as_ref());
+    let vision_warning = run_vision_analysis_batches(session, transport, &vision_hint, true)?;
 
     // ステップ 4: MovieBlueprint 生成＋最大 3 回自律修正＋Proposal 送出
-    transport.status("タイムライン構成案を設計・検証中...", Some(4), Some(4));
+    transport.status("4/4 タイムライン構成案を設計・検証中...", Some(4), Some(4));
     let (blueprint_val, compile_summary, command_val, model_summary) =
         synthesize_and_compile_blueprint(session, transport, goal, attached_clips)?;
 
@@ -301,6 +308,7 @@ fn run_folder_story_workflow(
         &blueprint_val,
         &compile_summary,
         model_summary.as_deref(),
+        vision_warning.as_deref(),
         &session.memory,
     );
     let memory_patch = serde_json::to_value(&session.memory).unwrap_or(Value::Null);
@@ -320,6 +328,20 @@ fn ingest_folders_and_vision(
     session: &mut DirectorSession,
     transport: &mut AgentTransport<'_>,
     goal_hint: &str,
+    attached_folders: &[String],
+) -> Result<(), RpcError> {
+    scan_attached_folders(session, transport, attached_folders)?;
+    if session.memory.analyzed_images.is_empty() {
+        return Ok(());
+    }
+    let vision_hint = build_vision_theme_hint(goal_hint, session.memory.user_preferences.as_ref());
+    let _ = run_vision_analysis_batches(session, transport, &vision_hint, false)?;
+    Ok(())
+}
+
+fn scan_attached_folders(
+    session: &mut DirectorSession,
+    transport: &mut AgentTransport<'_>,
     attached_folders: &[String],
 ) -> Result<(), RpcError> {
     transport.status(
@@ -360,15 +382,56 @@ fn ingest_folders_and_vision(
             session.memory.analyzed_images.push(item);
         }
     }
+    Ok(())
+}
 
-    run_vision_analysis_batches(session, transport, goal_hint)
+/// ユーザーの初期目標と確認カード回答を結合し、Vision 解析向けのテーマヒント文字列を生成する。
+#[must_use]
+pub fn build_vision_theme_hint(goal: &str, user_preferences: Option<&Value>) -> String {
+    let mut parts = Vec::new();
+    let trimmed_goal = goal.trim();
+    if !trimmed_goal.is_empty() {
+        parts.push(trimmed_goal.to_owned());
+    }
+    if let Some(pref) = user_preferences
+        && pref.get("skipped").and_then(Value::as_bool) != Some(true)
+    {
+        if let Some(title) = pref
+            .get("field_values")
+            .and_then(|fv| fv.get("title"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("タイトル希望: {title}"));
+        }
+        if let Some(tone) = pref
+            .get("field_values")
+            .and_then(|fv| fv.get("tone_or_notes"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("雰囲気・構成希望: {tone}"));
+        }
+        if let Some(free) = pref
+            .get("free_text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(format!("補足メモ: {free}"));
+        }
+    }
+    parts.join(" / ")
 }
 
 fn run_vision_analysis_batches(
     session: &mut DirectorSession,
     transport: &mut AgentTransport<'_>,
     goal_hint: &str,
-) -> Result<(), RpcError> {
+    is_initial_flow: bool,
+) -> Result<Option<String>, RpcError> {
     // 未 Vision 解析画像のみをバッチ解析してセッション記憶へ蓄積
     let pending_indices: Vec<usize> = session
         .memory
@@ -379,14 +442,21 @@ fn run_vision_analysis_batches(
         .map(|(idx, _)| idx)
         .collect();
 
+    let (step_num, step_total) = if is_initial_flow {
+        (Some(3), Some(4))
+    } else {
+        (None, None)
+    };
+    let mut vision_warning: Option<String> = None;
     let total_pending = pending_indices.len();
-    let chunk_size = 6_usize;
+    // ホスト側の inspect_images_vision 上限（100 枚）単位で委譲し、コンタクトシート／バッチ分割はホスト側設定へ任せる
+    let chunk_size = 100_usize;
     for (chunk_idx, idx_chunk) in pending_indices.chunks(chunk_size).enumerate() {
         let done_count = (chunk_idx * chunk_size).min(total_pending);
         transport.status(
-            format!("2/4 写真を解析して情景・字幕案を作成中 ({done_count}/{total_pending})..."),
-            Some(2),
-            Some(4),
+            format!("3/4 写真を解析して情景・字幕案を作成中 ({done_count}/{total_pending})..."),
+            step_num,
+            step_total,
         );
         let paths: Vec<String> = idx_chunk
             .iter()
@@ -401,6 +471,13 @@ fn run_vision_analysis_batches(
             }),
         ) {
             Ok(res) => {
+                if let Some(warning) = res.get("warning").and_then(Value::as_str)
+                    && !warning.trim().is_empty()
+                {
+                    let owned = warning.trim().to_owned();
+                    transport.status(&owned, step_num, step_total);
+                    vision_warning = Some(owned);
+                }
                 apply_vision_results_to_memory(
                     &mut session.memory.analyzed_images,
                     idx_chunk,
@@ -423,6 +500,9 @@ fn run_vision_analysis_batches(
             }
             Err(RpcError::Remote(msg)) if is_vision_unsupported_error(&msg) => {
                 // Vision 非対応エラー時は残りの画像をすべて EXIF/フォルダ/ファイル名メタデータで補完して続行
+                let warn = "現在の AI モデル／プラグインは画像入力に非対応のため、ファイル名・EXIF に基づく仮字幕で続行します（設定で Vision 対応モデルへ切替後に再解析できます）。".to_owned();
+                transport.status(&warn, step_num, step_total);
+                vision_warning = Some(warn);
                 populate_exif_fallback_for_indices(
                     &mut session.memory.analyzed_images,
                     &pending_indices[done_count..],
@@ -432,12 +512,13 @@ fn run_vision_analysis_batches(
             Err(other) => return Err(other),
         }
     }
-    Ok(())
+    Ok(vision_warning)
 }
 
 fn is_vision_unsupported_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    [
+    let explicit_kw = [
+        "vision_unsupported",
         "does not support vision",
         "vision not supported",
         "vision is not supported",
@@ -445,10 +526,28 @@ fn is_vision_unsupported_error(msg: &str) -> bool {
         "image input not supported",
         "multimodal not supported",
         "not a vision model",
-        "not supported",
     ]
     .iter()
-    .any(|kw| lower.contains(kw))
+    .any(|kw| lower.contains(kw));
+    if explicit_kw {
+        return true;
+    }
+    let mentions_vision_media = [
+        "vision",
+        "image",
+        "images",
+        "multimodal",
+        "visual",
+        "image_url",
+        "inline_data",
+        "media_type",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    mentions_vision_media
+        && ["does not support", "not supported", "unknown variant"]
+            .iter()
+            .any(|kw| lower.contains(kw))
 }
 
 fn populate_exif_fallback_for_indices(images: &mut [AnalyzedImageMeta], indices: &[usize]) {
@@ -474,7 +573,8 @@ fn populate_exif_fallback_for_indices(images: &mut [AnalyzedImageMeta], indices:
         slot.suggested_subtitle = format!("大切なひととき ({stem}{date_suffix})");
         "warm".clone_into(&mut slot.mood);
         "zoom_in".clone_into(&mut slot.recommended_motion);
-        slot.vision_analyzed = true;
+        // フォールバック仮字幕は Vision 解析完了扱いとせず、プロバイダ切替後の再解析を可能にする
+        slot.vision_analyzed = false;
     }
 }
 
@@ -603,8 +703,12 @@ fn apply_vision_results_to_memory(
     tool_res: &Value,
 ) {
     let is_partial = tool_res.get("partial").and_then(Value::as_bool) == Some(true);
+    let used_vision = tool_res
+        .get("used_vision")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let Some(arr) = tool_res.get("analyses").and_then(Value::as_array) else {
-        if !is_partial {
+        if !is_partial && used_vision {
             for &idx in target_indices {
                 if let Some(slot) = images.get_mut(idx) {
                     slot.vision_analyzed = true;
@@ -637,7 +741,9 @@ fn apply_vision_results_to_memory(
             if let Some(s) = item.get("recommended_motion").and_then(Value::as_str) {
                 s.clone_into(&mut slot.recommended_motion);
             }
-            slot.vision_analyzed = true;
+            if used_vision {
+                slot.vision_analyzed = true;
+            }
         }
     }
 }
@@ -653,7 +759,7 @@ fn ask_movie_preferences_card(
     let default_sec = suggested_duration_sec.round().max(10.0) as u64;
 
     let msg = format!(
-        "写真 {img_count} 枚の解析と BGM 候補 {bgm_count} 曲の確認が完了しました。\nお名前や全体の雰囲気など希望があれば入力してください（「おまかせ」またはスキップも可能です）。"
+        "写真 {img_count} 枚と BGM 候補 {bgm_count} 曲が見つかりました。\nお名前や全体の雰囲気など希望があれば入力してください（「おまかせ」またはスキップも可能です）。"
     );
     transport.ask_user(
         "ムービー構成の希望を確認",
@@ -736,6 +842,7 @@ fn synthesize_and_compile_blueprint(
         role: "user".to_owned(),
         text: media_summary,
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     }];
@@ -743,14 +850,14 @@ fn synthesize_and_compile_blueprint(
     // 最大 3 回まで検証エラーを LLM へフィードバックし自律修正する
     let mut last_error = String::new();
     for attempt in 0..4_u8 {
-        let (raw_text, _) =
+        let reply: AgentLlmReply =
             transport.llm_chat(Some(system_prompt), &messages, &[], blueprint_schema, true)?;
         match try_compile_llm_blueprint_reply(
             session,
             transport,
             target_duration,
             attempt,
-            raw_text,
+            reply,
             &mut messages,
         ) {
             Ok(res) => return Ok(res),
@@ -790,9 +897,11 @@ fn try_compile_llm_blueprint_reply(
     transport: &mut AgentTransport<'_>,
     target_duration: f64,
     attempt: u8,
-    raw_text: String,
+    reply: AgentLlmReply,
     messages: &mut Vec<AgentLlmMessage>,
 ) -> Result<(Value, Value, Value, Option<String>), RpcError> {
+    let raw_text = reply.text;
+    let thinking_blocks = reply.thinking_blocks;
     let candidate_raw = extract_first_json_object(&raw_text)
         .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
 
@@ -805,6 +914,7 @@ fn try_compile_llm_blueprint_reply(
         append_correction_feedback(
             messages,
             raw_text,
+            thinking_blocks,
             "Your previous reply was not a valid JSON object. Return ONLY a raw JSON object matching the MovieBlueprint schema.".to_owned(),
         );
         return Err(RpcError::Remote(err_msg));
@@ -827,6 +937,7 @@ fn try_compile_llm_blueprint_reply(
             append_correction_feedback(
                 messages,
                 serde_json::to_string(&blueprint_val).unwrap_or_default(),
+                thinking_blocks,
                 format!(
                     "Validation failed when compiling your MovieBlueprint: {err_msg}\nFix the JSON and output the corrected MovieBlueprint JSON only."
                 ),
@@ -840,12 +951,14 @@ fn try_compile_llm_blueprint_reply(
 fn append_correction_feedback(
     messages: &mut Vec<AgentLlmMessage>,
     assistant_text: String,
+    thinking_blocks: Vec<AgentThinkingBlock>,
     feedback_text: String,
 ) {
     messages.push(AgentLlmMessage {
         role: "assistant".to_owned(),
         text: assistant_text,
         image_paths: Vec::new(),
+        thinking_blocks,
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -853,6 +966,7 @@ fn append_correction_feedback(
         role: "user".to_owned(),
         text: feedback_text,
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1054,6 +1168,7 @@ fn format_blueprint_proposal_markdown(
     blueprint: &Value,
     compile_res: &Value,
     model_notes: Option<&str>,
+    vision_warning: Option<&str>,
     memory: &DirectorMemory,
 ) -> String {
     let summary = compile_res.get("summary").unwrap_or(&Value::Null);
@@ -1086,13 +1201,22 @@ fn format_blueprint_proposal_markdown(
         .and_then(Value::as_str)
         .unwrap_or("ムービー構成案");
 
-    let mut md = format!(
-        "### {title}\n\
-         - **総尺**: {secs:.2} 秒（{frames} フレーム）\n\
-         - **写真スライド**: {slides} 枚（A/B クロスフェード＋縦長背面額縁 {backdrops} 枚）\n\
-         - **字幕・タイトル**: {subtitles} 件 / **BGM セグメント**: {bgm_segments} 件\n\
-         - **解析キャッシュ済み画像**: {} 枚",
-        memory.analyzed_images.len()
+    let mut md = String::new();
+    if let Some(warn) = vision_warning.map(str::trim).filter(|s| !s.is_empty()) {
+        md.push_str("> ⚠ ");
+        md.push_str(warn);
+        md.push_str("\n\n");
+    }
+    let _ = std::fmt::Write::write_fmt(
+        &mut md,
+        format_args!(
+            "### {title}\n\
+             - **総尺**: {secs:.2} 秒（{frames} フレーム）\n\
+             - **写真スライド**: {slides} 枚（A/B クロスフェード＋縦長背面額縁 {backdrops} 枚）\n\
+             - **字幕・タイトル**: {subtitles} 件 / **BGM セグメント**: {bgm_segments} 件\n\
+             - **解析キャッシュ済み画像**: {} 枚",
+            memory.analyzed_images.len()
+        ),
     );
     if let Some(notes) = model_notes.map(str::trim).filter(|s| !s.is_empty()) {
         md.push_str("\n\n");
@@ -1161,6 +1285,7 @@ fn build_initial_dynamic_messages(
             role: "user".to_owned(),
             text: format!("# Session Context\n{session_context}"),
             image_paths: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         },
@@ -1168,6 +1293,7 @@ fn build_initial_dynamic_messages(
             role: "user".to_owned(),
             text: instruction_text,
             image_paths: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         },
@@ -1180,6 +1306,77 @@ fn check_draft_has_pending_changes(transport: &mut AgentTransport<'_>) -> Result
         Err(RpcError::Remote(_)) => Ok(false),
         Err(other) => Err(other),
     }
+}
+
+/// `run_dynamic_tool_loop` へ内蔵公開する対話質問仮想ツール `ask_user` の仕様を返す。
+#[must_use]
+pub fn builtin_ask_user_tool_spec() -> AgentToolSpec {
+    AgentToolSpec {
+        name: "ask_user".to_owned(),
+        description: "確認や選択が必要な場合、巨大な編集コマンドを構築する前に即座にユーザーへ対話カードを表示して回答を得る。".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["title", "message"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "カードの見出し（例: 写真の入替・回転対象の確認）"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "確認内容の説明文"
+                },
+                "choices": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "label"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "description": { "type": "string" },
+                            "is_primary": { "type": "boolean" }
+                        }
+                    }
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "label"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["text", "textarea", "number"],
+                                "default": "text"
+                            },
+                            "placeholder": { "type": "string" },
+                            "default_value": { "type": "string" }
+                        }
+                    }
+                },
+                "allow_skip": {
+                    "type": "boolean",
+                    "default": true
+                }
+            }
+        }),
+        safety_class: "read_only".to_owned(),
+        source: "builtin".to_owned(),
+    }
+}
+
+/// ホスト提供ツール一覧へ重複なく仮想ツール `ask_user` を付加した LLM 用ツール一覧を構築する。
+#[must_use]
+pub fn build_dynamic_tools_with_ask_user(host_tools: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
+    let mut out = Vec::with_capacity(host_tools.len() + 1);
+    out.extend(host_tools.iter().cloned());
+    if !out.iter().any(|t| t.name == "ask_user") {
+        out.push(builtin_ask_user_tool_spec());
+    }
+    out
 }
 
 /// フォローアップ微調整・フォルダなし依頼・将来追加ツール呼び出しを統一処理する自律ツールループ。
@@ -1197,15 +1394,23 @@ fn run_dynamic_tool_loop(
         updated_blueprint: None,
         messages: build_initial_dynamic_messages(session, prompt, attached_clips),
         self_repair_attempted: false,
+        user_declined_or_cancelled_edit: false,
+        blocked_by_vision_unsupported: false,
     };
     let mut final_text = String::new();
     let mut completed_by_model = false;
 
     for step in 0..MAX_DYNAMIC_TOOL_STEPS {
-        let (text, tool_calls) = match transport.llm_chat(
+        // 最終ステップで ask_user を許すと回答を受領しても次の LLM ターンが回らないため除外する
+        let tools_for_llm = if step + 1 < MAX_DYNAMIC_TOOL_STEPS {
+            build_dynamic_tools_with_ask_user(&state.tools_snapshot)
+        } else {
+            state.tools_snapshot.clone()
+        };
+        let reply: AgentLlmReply = match transport.llm_chat(
             Some(&system_prompt),
             &state.messages,
-            &state.tools_snapshot,
+            &tools_for_llm,
             None,
             false,
         ) {
@@ -1218,9 +1423,14 @@ fn run_dynamic_tool_loop(
             }
             Err(other) => return Err(other),
         };
+        let AgentLlmReply {
+            text,
+            tool_calls,
+            thinking_blocks,
+        } = reply;
 
         if tool_calls.is_empty() {
-            if try_queue_self_repair(transport, prompt, &text, step, &mut state)? {
+            if try_queue_self_repair(transport, prompt, &text, thinking_blocks, step, &mut state)? {
                 continue;
             }
             final_text = text;
@@ -1232,13 +1442,12 @@ fn run_dynamic_tool_loop(
             role: "assistant".to_owned(),
             text,
             image_paths: Vec::new(),
+            thinking_blocks,
             tool_calls: tool_calls.clone(),
             tool_call_id: None,
         });
 
-        for call in tool_calls {
-            execute_single_dynamic_tool_call(session, transport, step, call, &mut state)?;
-        }
+        dispatch_dynamic_tool_calls(session, transport, step, tool_calls, &mut state)?;
     }
 
     if !completed_by_model {
@@ -1258,7 +1467,9 @@ fn run_dynamic_tool_loop(
     }
 
     // DraftSandbox に変更が蓄積されているか検証し Proposal として送出
-    let expect_timeline_edit = state.self_repair_attempted || has_edit_intent(prompt);
+    let expect_timeline_edit = !state.user_declined_or_cancelled_edit
+        && !state.blocked_by_vision_unsupported
+        && (state.self_repair_attempted || has_edit_intent(prompt));
     finalize_dynamic_proposal(
         session,
         transport,
@@ -1269,14 +1480,50 @@ fn run_dynamic_tool_loop(
     )
 }
 
+/// 1 ステップ内でモデルが要求したツール呼び出し群（`ask_user` 排他制御を含む）を実行する。
+fn dispatch_dynamic_tool_calls(
+    session: &mut DirectorSession,
+    transport: &mut AgentTransport<'_>,
+    step: u32,
+    tool_calls: Vec<AgentLlmToolCall>,
+    state: &mut DynamicToolLoopState,
+) -> Result<(), RpcError> {
+    if let Some(ask_pos) = tool_calls.iter().position(|c| c.name == "ask_user") {
+        if step + 1 >= MAX_DYNAMIC_TOOL_STEPS {
+            for call in tool_calls {
+                push_skipped_tool_result(&mut state.messages, call.id);
+            }
+        } else {
+            // 同一ターン内に ask_user と他のツール呼び出しが混在する場合は、
+            // ask_user のみ実行し他はスキップ結果を返して確認後の誤編集を防ぐ。
+            for (idx, call) in tool_calls.into_iter().enumerate() {
+                if idx == ask_pos {
+                    execute_builtin_ask_user_tool(transport, step, call, state)?;
+                } else {
+                    push_skipped_tool_result(&mut state.messages, call.id);
+                }
+            }
+        }
+    } else {
+        for call in tool_calls {
+            execute_single_dynamic_tool_call(session, transport, step, call, state)?;
+        }
+    }
+    Ok(())
+}
+
 /// ツール未呼出で完了しようとした編集依頼に対して 1 回だけ自己修復プロンプトを積む。
 fn try_queue_self_repair(
     transport: &mut AgentTransport<'_>,
     prompt: &str,
     text: &str,
+    thinking_blocks: Vec<sea_agent_protocol::AgentThinkingBlock>,
     step: u32,
     state: &mut DynamicToolLoopState,
 ) -> Result<bool, RpcError> {
+    if state.user_declined_or_cancelled_edit || state.blocked_by_vision_unsupported {
+        return Ok(false);
+    }
     let has_remaining_steps = step + 1 < MAX_DYNAMIC_TOOL_STEPS;
     let repair_candidate = !state.self_repair_attempted
         && has_remaining_steps
@@ -1299,6 +1546,7 @@ fn try_queue_self_repair(
         role: "assistant".to_owned(),
         text: text.to_owned(),
         image_paths: Vec::new(),
+        thinking_blocks,
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1310,6 +1558,7 @@ fn try_queue_self_repair(
                本当に変更が不要な場合のみ、その理由を日本語で説明してください。"
             .to_owned(),
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1321,6 +1570,207 @@ struct DynamicToolLoopState {
     updated_blueprint: Option<Value>,
     messages: Vec<AgentLlmMessage>,
     self_repair_attempted: bool,
+    user_declined_or_cancelled_edit: bool,
+    blocked_by_vision_unsupported: bool,
+}
+
+fn push_skipped_tool_result(messages: &mut Vec<AgentLlmMessage>, tool_call_id: String) {
+    messages.push(AgentLlmMessage {
+        role: "tool".to_owned(),
+        text: r#"{"skipped":true,"reason":"skipped because ask_user requires user confirmation first"}"#.to_owned(),
+        image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_call_id),
+    });
+}
+
+fn parse_ask_fields(args: &Value) -> Vec<AgentAskField> {
+    args.get("fields")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let obj = item.as_object()?;
+                    let id = obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(|| format!("field_{idx}"), ToOwned::to_owned);
+                    let label = obj
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_owned();
+                    let kind = match obj.get("kind").and_then(Value::as_str) {
+                        Some("textarea") => AgentAskFieldKind::Textarea,
+                        Some("number") => AgentAskFieldKind::Number,
+                        _ => AgentAskFieldKind::Text,
+                    };
+                    Some(AgentAskField {
+                        id,
+                        label,
+                        placeholder: obj
+                            .get("placeholder")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        default_value: obj
+                            .get("default_value")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        kind,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ask_choices(args: &Value) -> Vec<AgentAskChoice> {
+    args.get("choices")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let obj = item.as_object()?;
+                    let id = obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(|| format!("choice_{idx}"), ToOwned::to_owned);
+                    let label = obj
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_owned();
+                    Some(AgentAskChoice {
+                        id,
+                        label,
+                        description: obj
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        is_primary: obj
+                            .get("is_primary")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 仮想ツール `ask_user` の引数 JSON を UI カード構造へ安全に変換する。
+#[must_use]
+pub fn parse_ask_user_tool_args(
+    args: &Value,
+) -> (
+    String,
+    String,
+    Vec<AgentAskField>,
+    Vec<AgentAskChoice>,
+    bool,
+) {
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("確認事項")
+        .to_owned();
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("続行方法をご指定ください。")
+        .to_owned();
+    let allow_skip = args
+        .get("allow_skip")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    (
+        title,
+        message,
+        parse_ask_fields(args),
+        parse_ask_choices(args),
+        allow_skip,
+    )
+}
+
+/// `ask_user` 回答がユーザーによる編集中止・見送り・変更不要を示しているか判定する。
+#[must_use]
+pub fn is_user_declined_or_cancelled_answer(answer: &AgentUserAnswerPayload) -> bool {
+    const ASCII_CANCEL_WORDS: &[&str] = &["cancel", "abort", "decline", "no_change", "stop"];
+    const JA_CANCEL_KEYWORDS: &[&str] = &["中止", "キャンセル", "やめる", "変更しない", "変更不要"];
+    let matches_cancel_text = |raw: &str| {
+        let lower = raw.trim().to_ascii_lowercase();
+        ASCII_CANCEL_WORDS
+            .iter()
+            .any(|w| contains_ascii_word(&lower, w))
+            || JA_CANCEL_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    };
+
+    if !answer.skipped
+        && let Some(choice_id) = answer.choice_id.as_deref()
+    {
+        let lower = choice_id.trim().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "cancel" | "no_change" | "abort" | "none" | "decline" | "stop"
+        ) || matches_cancel_text(&lower)
+        {
+            return true;
+        }
+    }
+    if let Some(free) = answer.free_text.as_deref()
+        && matches_cancel_text(free)
+    {
+        return true;
+    }
+    false
+}
+
+fn execute_builtin_ask_user_tool(
+    transport: &mut AgentTransport<'_>,
+    step: u32,
+    call: AgentLlmToolCall,
+    state: &mut DynamicToolLoopState,
+) -> Result<(), RpcError> {
+    let (title, message, fields, choices, allow_skip) = parse_ask_user_tool_args(&call.arguments);
+    transport.status(
+        format!("ユーザーへ確認中: {title}"),
+        Some(step + 1),
+        Some(MAX_DYNAMIC_TOOL_STEPS),
+    );
+    let answer = transport.ask_user(title, message, fields, choices, allow_skip)?;
+    // 最新回答に基づいて編集中止フラグを更新する（再確認で承諾された場合にも解除できるよう上書き）
+    state.user_declined_or_cancelled_edit = is_user_declined_or_cancelled_answer(&answer);
+    let reply_json = json!({
+        "skipped": answer.skipped,
+        "choice_id": answer.choice_id,
+        "field_values": answer.field_values,
+        "free_text": answer.free_text,
+    });
+    state.messages.push(AgentLlmMessage {
+        role: "tool".to_owned(),
+        text: serde_json::to_string(&reply_json).unwrap_or_else(|_| "{}".to_owned()),
+        image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(call.id),
+    });
+    Ok(())
 }
 
 fn execute_single_dynamic_tool_call(
@@ -1334,6 +1784,7 @@ fn execute_single_dynamic_tool_call(
         id,
         name,
         mut arguments,
+        thought_signature: _,
     } = call;
     transport.status(
         format!("ツール実行中: {name} ..."),
@@ -1357,12 +1808,23 @@ fn execute_single_dynamic_tool_call(
 
     let raw_tool_reply = match transport.call_tool(&name, arguments) {
         Ok(val) => {
+            if name == "audit_timeline_slides"
+                && val.get("partial").and_then(Value::as_bool) == Some(true)
+                && val.get("error_code").and_then(Value::as_str) == Some("vision_unsupported")
+            {
+                state.blocked_by_vision_unsupported = true;
+            }
             if let Some(bp) = normalized_bp {
                 state.updated_blueprint = Some(bp);
             }
             serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_owned())
         }
-        Err(RpcError::Remote(err)) => json!({ "error": err }).to_string(),
+        Err(RpcError::Remote(err)) => {
+            if name == "audit_timeline_slides" && is_vision_unsupported_error(&err) {
+                state.blocked_by_vision_unsupported = true;
+            }
+            json!({ "error": err }).to_string()
+        }
         Err(other) => return Err(other),
     };
     if transport.available_tools != state.tools_snapshot {
@@ -1372,6 +1834,7 @@ fn execute_single_dynamic_tool_call(
         role: "tool".to_owned(),
         text: truncate_utf8_bytes(&raw_tool_reply, MAX_TOOL_OUTPUT_BYTES),
         image_paths: Vec::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: Some(id),
     });
@@ -1589,6 +2052,14 @@ fn build_followup_system_prompt(session: &DirectorSession) -> String {
          modify existing clips/subtitles via `apply_draft_edit_command`, or recompile the overall structure via `compile_movie_blueprint`.\n\
          CRITICAL: To modify the timeline, you MUST invoke `apply_draft_edit_command` or `compile_movie_blueprint` via tool calls. \
          Writing `EditCommand` or ```json blocks in plain text does NOT modify the timeline.\n\
+         CRITICAL: When user clarification or selection is needed before editing (e.g., ambiguous photo number, rotation angle, or confirmation), \
+         call the `ask_user` tool IMMEDIATELY and ALONE in that turn BEFORE generating edit commands or writing a long explanation.\n\
+         When asked to verify/fix mismatches between photos and subtitles OR to fix sideways/rotated photos, \
+         you MUST call `audit_timeline_slides` FIRST to inspect the actual images and all overlapping subtitles (never guess from filenames alone).\n\
+         When `audit_timeline_slides` returns `recommended_rotation_deg` and `recommended_scale_x_param` / `recommended_scale_y_param`, \
+         apply `RotationDeg` together with `ScaleX` and `ScaleY` `SetParameter` updates in the same `EditCommand::Batch` \
+         (when `companion_backdrop_updates` is non-empty, also apply each companion Backdrop's `recommended_rotation_deg` and `recommended_scale_x_param`/`recommended_scale_y_param` in that same `EditCommand::Batch`; \
+          when `rotation_is_animated == true` or `orientation_audit_skipped == \"animated_rotation\"`, do NOT overwrite animated `RotationDeg` with a constant).\n\
          When you need exact JSON parameter shapes for `SetParameter` (such as subtitle outline color/width or clip rotation), \
          call `get_capabilities` with `{{\"include_schemas\": true}}` to inspect the full `EditCommand` JSON Schema.\n\
          Keep exact target duration constraints when adjusting individual slides/endings.\n\
@@ -1961,6 +2432,51 @@ mod tests {
     }
 
     #[test]
+    fn decline_vision_and_backdrop_prompt_guards_work() {
+        // user decline / cancel 判定: skipped=true や部分一致キーワードで誤停止しない
+        let skipped_answer = AgentUserAnswerPayload {
+            choice_id: Some("skip".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: true,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&skipped_answer));
+
+        let word_boundary_ok = AgentUserAnswerPayload {
+            choice_id: None,
+            field_values: std::collections::BTreeMap::new(),
+            free_text: Some("stop_motion 演出にしてほしい".to_owned()),
+            skipped: false,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&word_boundary_ok));
+
+        let explicit_cancel = AgentUserAnswerPayload {
+            choice_id: None,
+            field_values: std::collections::BTreeMap::new(),
+            free_text: Some("やはり 中止 します".to_owned()),
+            skipped: false,
+        };
+        assert!(is_user_declined_or_cancelled_answer(&explicit_cancel));
+
+        // 無関係な "not supported" は Vision 非対応として扱わない
+        assert!(!is_vision_unsupported_error(
+            "temperature is not supported for this request"
+        ));
+        assert!(is_vision_unsupported_error(
+            "vision_unsupported: image input is not supported"
+        ));
+
+        // companion_backdrop_updates の同時更新指示がプロンプトに含まれること
+        let session = DirectorSession {
+            capabilities: Value::Null,
+            memory: DirectorMemory::default(),
+            timeline_summary: String::new(),
+        };
+        let followup = build_followup_system_prompt(&session);
+        assert!(followup.contains("companion_backdrop_updates"));
+    }
+
+    #[test]
     fn strip_empty_batch_json_blocks_removes_empty_batch_fences_only() {
         let raw =
             "確認しました。\n```json\n{\"type\": \"batch\", \"commands\": []}\n```\n以上です。";
@@ -1971,5 +2487,81 @@ mod tests {
 
         let keep_other = "例:\n```json\n{\"type\":\"set_project_meta\",\"name\":\"Demo\"}\n```";
         assert_eq!(strip_empty_batch_json_blocks(keep_other), keep_other);
+    }
+
+    #[test]
+    fn ask_user_builtin_tool_spec_and_answer_guards_work() {
+        let spec = builtin_ask_user_tool_spec();
+        assert_eq!(spec.name, "ask_user");
+        assert_eq!(spec.safety_class, "read_only");
+        assert!(
+            spec.input_schema["properties"]["fields"]["items"]["properties"]["kind"].is_object()
+        );
+
+        let merged = build_dynamic_tools_with_ask_user(&[spec]);
+        assert_eq!(merged.iter().filter(|t| t.name == "ask_user").count(), 1);
+
+        let (title, msg, fields, choices, allow_skip) = parse_ask_user_tool_args(&json!({
+            "title": "回転対象の確認",
+            "message": "どの写真を回転しますか？",
+            "fields": [{ "id": "target", "label": "番号", "kind": "number", "default_value": "3" }],
+            "choices": [{ "id": "cw90", "label": "時計回り90度", "is_primary": true }],
+            "allow_skip": false
+        }));
+        assert_eq!(title, "回転対象の確認");
+        assert_eq!(msg, "どの写真を回転しますか？");
+        assert!(!allow_skip);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].kind, AgentAskFieldKind::Number);
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].is_primary);
+
+        let declined = AgentUserAnswerPayload {
+            choice_id: Some("cancel".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: false,
+        };
+        assert!(is_user_declined_or_cancelled_answer(&declined));
+
+        let confirmed = AgentUserAnswerPayload {
+            choice_id: Some("cw90".to_owned()),
+            field_values: std::collections::BTreeMap::new(),
+            free_text: None,
+            skipped: false,
+        };
+        assert!(!is_user_declined_or_cancelled_answer(&confirmed));
+
+        let mut skipped_msgs = Vec::new();
+        push_skipped_tool_result(&mut skipped_msgs, "call_other".to_owned());
+        assert_eq!(skipped_msgs.len(), 1);
+        assert_eq!(skipped_msgs[0].role, "tool");
+        assert_eq!(skipped_msgs[0].tool_call_id.as_deref(), Some("call_other"));
+        assert!(skipped_msgs[0].text.contains("ask_user"));
+
+        let hint = build_vision_theme_hint(
+            "3分のプロフィールムービー",
+            Some(&json!({
+                "field_values": { "title": "太郎 & 花子", "tone_or_notes": "明るく感動的に" },
+                "free_text": "花見の写真を多めに"
+            })),
+        );
+        assert!(hint.contains("3分のプロフィールムービー"));
+        assert!(hint.contains("太郎 & 花子"));
+        assert!(hint.contains("明るく感動的に"));
+        assert!(hint.contains("花見の写真を多めに"));
+    }
+
+    #[test]
+    fn followup_system_prompt_guides_audit_timeline_slides_and_batch_scale_update() {
+        let session = DirectorSession {
+            capabilities: Value::Null,
+            memory: DirectorMemory::default(),
+            timeline_summary: String::new(),
+        };
+        let prompt = build_followup_system_prompt(&session);
+        assert!(prompt.contains("audit_timeline_slides"));
+        assert!(prompt.contains("recommended_rotation_deg"));
+        assert!(prompt.contains("recommended_scale_x_param"));
     }
 }

@@ -1,6 +1,7 @@
 //! AI チャットプロバイダの共通トレイト、設定種別、ストリーミングイベント、機密文字列型。
 
 use std::fmt;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -73,6 +74,9 @@ pub enum AiError {
     /// AI プラグイン／外部 CLI アダプタのエラー。
     #[error("AI plugin failed: {0}")]
     PluginError(String),
+    /// ユーザー操作等により AI 要求がキャンセルされた。
+    #[error("AI request cancelled")]
+    Cancelled,
     /// 入出力エラー。
     #[error("AI I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -934,6 +938,10 @@ pub struct AiResponse {
 pub enum AiStreamEvent {
     /// 接続中・待機中などの状態変化通知。
     Status(String),
+    /// 思考過程の逐次テキスト差分チャンク。
+    ThoughtDelta(String),
+    /// 外部ツール等の作業アクティビティヒント。
+    ActivityHint(String),
     /// 逐次生成されたテキスト差分チャンク。
     DeltaText(String),
     /// 全文受信完了。
@@ -973,6 +981,17 @@ impl AiApprovalMode {
     }
 }
 
+/// Vision バッチ解析時の画像パッキング方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionPackingMode {
+    /// 複数画像を番号バッジ付きグリッド 1 枚（コンタクトシート）へ統合して送信（既定）。
+    #[default]
+    ContactSheet,
+    /// 各画像を個別画像パートとして送信（従来方式）。
+    Individual,
+}
+
 /// エージェント実行時の安全制御・レート制限・Vision バッチ設定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRuntimeSettings {
@@ -982,12 +1001,27 @@ pub struct AgentRuntimeSettings {
     /// 外部 LLM 呼び出し間の最小待機時間（ミリ秒）。高頻度連続呼び出しによるアカウント制限対策用。
     #[serde(default)]
     pub min_llm_interval_ms: u64,
-    /// Vision バッチ解析で 1 リクエストに含める画像枚数。
+    /// Vision バッチ解析で 1 リクエストに含める画像枚数（`Individual` モード用）。
     #[serde(default = "default_vision_batch_size")]
     pub vision_batch_size: usize,
-    /// Vision 送信用サムネイルの長辺上限ピクセル数。
+    /// Vision 送信用サムネイルの長辺上限ピクセル数（`Individual` モード用）。
     #[serde(default = "default_vision_max_edge_px")]
     pub vision_max_edge_px: u32,
+    /// Vision バッチのパッキング方式（既定 `ContactSheet`）。
+    #[serde(default)]
+    pub vision_packing_mode: VisionPackingMode,
+    /// Vision 送信用 JPEG 品質 (`40..=90`、既定 `68`)。
+    #[serde(default = "default_vision_jpeg_quality")]
+    pub vision_jpeg_quality: u8,
+    /// コンタクトシートの横列数 (`1..=4`、既定 `3`)。
+    #[serde(default = "default_vision_contact_sheet_cols")]
+    pub vision_contact_sheet_cols: u8,
+    /// コンタクトシートの縦行数 (`1..=4`、既定 `2`)。
+    #[serde(default = "default_vision_contact_sheet_rows")]
+    pub vision_contact_sheet_rows: u8,
+    /// コンタクトシート各タイルの長辺上限ピクセル数 (`128..=1024`、既定 `320`)。
+    #[serde(default = "default_vision_contact_sheet_tile_px")]
+    pub vision_contact_sheet_tile_px: u32,
 }
 
 const fn default_vision_batch_size() -> usize {
@@ -998,6 +1032,22 @@ const fn default_vision_max_edge_px() -> u32 {
     512
 }
 
+const fn default_vision_jpeg_quality() -> u8 {
+    68
+}
+
+const fn default_vision_contact_sheet_cols() -> u8 {
+    3
+}
+
+const fn default_vision_contact_sheet_rows() -> u8 {
+    2
+}
+
+const fn default_vision_contact_sheet_tile_px() -> u32 {
+    320
+}
+
 impl Default for AgentRuntimeSettings {
     fn default() -> Self {
         Self {
@@ -1005,7 +1055,109 @@ impl Default for AgentRuntimeSettings {
             min_llm_interval_ms: 0,
             vision_batch_size: default_vision_batch_size(),
             vision_max_edge_px: default_vision_max_edge_px(),
+            vision_packing_mode: VisionPackingMode::default(),
+            vision_jpeg_quality: default_vision_jpeg_quality(),
+            vision_contact_sheet_cols: default_vision_contact_sheet_cols(),
+            vision_contact_sheet_rows: default_vision_contact_sheet_rows(),
+            vision_contact_sheet_tile_px: default_vision_contact_sheet_tile_px(),
         }
+    }
+}
+
+/// Vision 1 バッチあたり最小画像枚数 (`Individual` モード用)。
+pub const MIN_VISION_BATCH_SIZE: usize = 1;
+/// Vision 1 バッチあたり最大画像枚数 (`Individual` モード用)。
+pub const MAX_VISION_BATCH_SIZE: usize = 12;
+/// Vision 個別サムネイル長辺の最小ピクセル数。
+pub const MIN_VISION_MAX_EDGE_PX: u32 = 128;
+/// Vision 個別サムネイル長辺の最大ピクセル数。
+pub const MAX_VISION_MAX_EDGE_PX: u32 = 2048;
+/// Vision JPEG エンコード品質の最小値。
+pub const MIN_VISION_JPEG_QUALITY: u8 = 40;
+/// Vision JPEG エンコード品質の最大値。
+pub const MAX_VISION_JPEG_QUALITY: u8 = 90;
+/// コンタクトシート列・行数の最小値。
+pub const MIN_CONTACT_SHEET_DIM: u8 = 1;
+/// コンタクトシート列・行数の最大値。
+pub const MAX_CONTACT_SHEET_DIM: u8 = 4;
+/// コンタクトシート 1 タイルの最小長辺ピクセル数。
+pub const MIN_CONTACT_SHEET_TILE_PX: u32 = 128;
+/// コンタクトシート 1 タイルの最大長辺ピクセル数。
+pub const MAX_CONTACT_SHEET_TILE_PX: u32 = 1024;
+
+impl AgentRuntimeSettings {
+    /// すべての Vision / コンタクトシート設定を有効許容範囲へ丸めたコピーを返す。
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        Self {
+            max_steps_per_turn: self.max_steps_per_turn,
+            min_llm_interval_ms: self.min_llm_interval_ms,
+            vision_batch_size: self
+                .vision_batch_size
+                .clamp(MIN_VISION_BATCH_SIZE, MAX_VISION_BATCH_SIZE),
+            vision_max_edge_px: self
+                .vision_max_edge_px
+                .clamp(MIN_VISION_MAX_EDGE_PX, MAX_VISION_MAX_EDGE_PX),
+            vision_packing_mode: self.vision_packing_mode,
+            vision_jpeg_quality: self
+                .vision_jpeg_quality
+                .clamp(MIN_VISION_JPEG_QUALITY, MAX_VISION_JPEG_QUALITY),
+            vision_contact_sheet_cols: self
+                .vision_contact_sheet_cols
+                .clamp(MIN_CONTACT_SHEET_DIM, MAX_CONTACT_SHEET_DIM),
+            vision_contact_sheet_rows: self
+                .vision_contact_sheet_rows
+                .clamp(MIN_CONTACT_SHEET_DIM, MAX_CONTACT_SHEET_DIM),
+            vision_contact_sheet_tile_px: self
+                .vision_contact_sheet_tile_px
+                .clamp(MIN_CONTACT_SHEET_TILE_PX, MAX_CONTACT_SHEET_TILE_PX),
+        }
+    }
+
+    /// 明示保存や JSON 直接編集時に各設定値が許容範囲内か検証する。
+    ///
+    /// # Errors
+    ///
+    /// いずれかのフィールドが許可範囲外の場合。
+    pub fn validate(&self) -> Result<(), String> {
+        if !(MIN_VISION_BATCH_SIZE..=MAX_VISION_BATCH_SIZE).contains(&self.vision_batch_size) {
+            return Err(format!(
+                "runtime.vision_batch_size は {MIN_VISION_BATCH_SIZE}..={MAX_VISION_BATCH_SIZE} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_VISION_MAX_EDGE_PX..=MAX_VISION_MAX_EDGE_PX).contains(&self.vision_max_edge_px) {
+            return Err(format!(
+                "runtime.vision_max_edge_px は {MIN_VISION_MAX_EDGE_PX}..={MAX_VISION_MAX_EDGE_PX} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_VISION_JPEG_QUALITY..=MAX_VISION_JPEG_QUALITY).contains(&self.vision_jpeg_quality)
+        {
+            return Err(format!(
+                "runtime.vision_jpeg_quality は {MIN_VISION_JPEG_QUALITY}..={MAX_VISION_JPEG_QUALITY} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_DIM..=MAX_CONTACT_SHEET_DIM)
+            .contains(&self.vision_contact_sheet_cols)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_cols は {MIN_CONTACT_SHEET_DIM}..={MAX_CONTACT_SHEET_DIM} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_DIM..=MAX_CONTACT_SHEET_DIM)
+            .contains(&self.vision_contact_sheet_rows)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_rows は {MIN_CONTACT_SHEET_DIM}..={MAX_CONTACT_SHEET_DIM} の範囲で指定してください"
+            ));
+        }
+        if !(MIN_CONTACT_SHEET_TILE_PX..=MAX_CONTACT_SHEET_TILE_PX)
+            .contains(&self.vision_contact_sheet_tile_px)
+        {
+            return Err(format!(
+                "runtime.vision_contact_sheet_tile_px は {MIN_CONTACT_SHEET_TILE_PX}..={MAX_CONTACT_SHEET_TILE_PX} の範囲で指定してください"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1055,6 +1207,28 @@ pub struct AiToolDefinition {
     pub parameters_schema: serde_json::Value,
 }
 
+/// Anthropic 等がマルチターン Tool Use 時に再送を要求する署名付き思考ブロック。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThinkingBlock {
+    /// 思考テキスト本体。
+    #[serde(default)]
+    pub thinking: String,
+    /// プロバイダ発行の署名文字列。
+    #[serde(default)]
+    pub signature: String,
+    /// Anthropic `redacted_thinking` ブロックの生データ（任意・後方互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_data: Option<String>,
+}
+
+impl AiThinkingBlock {
+    /// Anthropic API へ再送可能な有効 `thinking` / `redacted_thinking` ブロックかを返す。
+    #[must_use]
+    pub fn is_valid_anthropic(&self) -> bool {
+        !self.signature.is_empty() || self.redacted_data.as_deref().is_some_and(|d| !d.is_empty())
+    }
+}
+
 /// LLM 応答から抽出された 1 件のツール呼び出し要求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiToolCall {
@@ -1065,6 +1239,9 @@ pub struct AiToolCall {
     /// ツール引数 JSON。
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Gemini 3/4 等が返すツール呼び出し思考署名（任意）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// マルチターン・ツール実行を含むエージェント推論用メッセージ。
@@ -1086,6 +1263,9 @@ pub enum AiTurnMessage {
         /// 応答テキスト（ツール呼び出しのみ時は `None`）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// モデルが返した署名付き思考ブロック群（任意）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<AiThinkingBlock>,
         /// 要求されたツール呼び出し一覧。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<AiToolCall>,
@@ -1167,6 +1347,9 @@ pub struct AiAgentTurnResponse {
     /// テキスト応答（存在する場合）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// モデルが返した署名付き思考ブロック群（任意）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<AiThinkingBlock>,
     /// モデルが要求したツール呼び出し一覧。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AiToolCall>,
@@ -1235,6 +1418,23 @@ pub trait AiProvider: Send + Sync {
     ) -> Result<AiAgentTurnResponse, AiError> {
         fallback_agent_turn_via_streaming(self, request, on_event)
     }
+
+    /// キャンセルフラグ付きでマルチモーダル・ツール呼び出し対応のエージェントターンを実行する。
+    ///
+    /// # Errors
+    ///
+    /// 認証情報欠如・キャンセル・通信失敗・応答解析エラー時に [`AiError`] を返す。
+    fn send_agent_turn_cancellable(
+        &self,
+        request: &AiAgentTurnRequest,
+        cancel_flag: Option<&Arc<AtomicBool>>,
+        on_event: &mut dyn FnMut(AiStreamEvent),
+    ) -> Result<AiAgentTurnResponse, AiError> {
+        if cancel_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(AiError::Cancelled);
+        }
+        self.send_agent_turn(request, on_event)
+    }
 }
 
 /// バイト列を標準 Base64（RFC 4648 パディング付き）文字列へエンコードする。
@@ -1286,15 +1486,17 @@ pub(crate) fn format_tools_fallback_instructions(tools: &[AiToolDefinition]) -> 
     )
 }
 
-fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
-    provider: &P,
+/// マルチモーダルエージェント要求からレガシーテキスト形式の [`AiRequest`] と添付画像一覧を抽出する。
+#[must_use]
+pub(crate) fn build_fallback_legacy_request(
     request: &AiAgentTurnRequest,
-    on_event: &mut dyn FnMut(AiStreamEvent),
-) -> Result<AiAgentTurnResponse, AiError> {
+    extract_images: bool,
+) -> (AiRequest, Vec<(String, String)>) {
     let mut sys = request.system_prompt.clone();
     sys.push_str(&format_tools_fallback_instructions(&request.tools));
 
-    let (history, last_user_prompt) = split_fallback_messages_and_prompt(&request.messages);
+    let (history, last_user_prompt, images) =
+        split_fallback_messages_and_prompt(&request.messages, extract_images);
 
     let legacy_req = AiRequest {
         system_prompt: sys,
@@ -1307,13 +1509,26 @@ fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
         user_prompt: last_user_prompt,
         stream: true,
     };
+    (legacy_req, images)
+}
+
+fn fallback_agent_turn_via_streaming<P: AiProvider + ?Sized>(
+    provider: &P,
+    request: &AiAgentTurnRequest,
+    on_event: &mut dyn FnMut(AiStreamEvent),
+) -> Result<AiAgentTurnResponse, AiError> {
+    let (legacy_req, _) = build_fallback_legacy_request(request, false);
     let resp = provider.send_streaming(&legacy_req, on_event)?;
     let mut parsed = parse_fallback_agent_response(&resp.raw_text, &resp.model);
     parsed.usage = resp.usage;
     Ok(parsed)
 }
 
-fn split_fallback_messages_and_prompt(messages: &[AiTurnMessage]) -> (Vec<AiChatMessage>, String) {
+fn split_fallback_messages_and_prompt(
+    messages: &[AiTurnMessage],
+    extract_images: bool,
+) -> (Vec<AiChatMessage>, String, Vec<(String, String)>) {
+    let mut extracted_images = Vec::new();
     // 末尾に ToolResult が複数連続する場合は全件を user_prompt 側へ集約し、history と分断されないようにする。
     let trailing_tool_start = messages
         .iter()
@@ -1324,13 +1539,14 @@ fn split_fallback_messages_and_prompt(messages: &[AiTurnMessage]) -> (Vec<AiChat
         let history = messages[..trailing_tool_start]
             .iter()
             .map(|msg| {
-                let (role, content) = render_turn_message_as_text(msg);
+                // 履歴側メッセージからは画像を回収しないため、フォールバック注記を必ず残す
+                let (role, content, _) = render_turn_message_as_text(msg, false);
                 AiChatMessage { role, content }
             })
             .collect();
         let tool_results = messages[trailing_tool_start..]
             .iter()
-            .map(|msg| render_turn_message_as_text(msg).1)
+            .map(|msg| render_turn_message_as_text(msg, false).1)
             .collect::<Vec<_>>()
             .join("\n\n");
         let prompt = format!(
@@ -1339,16 +1555,20 @@ fn split_fallback_messages_and_prompt(messages: &[AiTurnMessage]) -> (Vec<AiChat
              Only provide a final Japanese summary after all required edits are applied.\n\n\
              {tool_results}"
         );
-        return (history, prompt);
+        return (history, prompt, extracted_images);
     }
 
     let mut history = Vec::new();
     let mut last_user_prompt = String::new();
     for (idx, msg) in messages.iter().enumerate() {
         let is_last = idx + 1 == messages.len();
-        let (role, content) = render_turn_message_as_text(msg);
+        let should_extract = extract_images && is_last && matches!(msg, AiTurnMessage::User { .. });
+        let (role, content, imgs) = render_turn_message_as_text(msg, should_extract);
         if is_last && role == AiRole::User {
             last_user_prompt = content;
+            if should_extract {
+                extracted_images.extend(imgs);
+            }
         } else {
             history.push(AiChatMessage { role, content });
         }
@@ -1356,37 +1576,55 @@ fn split_fallback_messages_and_prompt(messages: &[AiTurnMessage]) -> (Vec<AiChat
     if last_user_prompt.is_empty() {
         "Continue based on the conversation history above.".clone_into(&mut last_user_prompt);
     }
-    (history, last_user_prompt)
+    (history, last_user_prompt, extracted_images)
 }
 
-fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
+fn render_turn_message_as_text(
+    msg: &AiTurnMessage,
+    omit_fallback_note_when_extracted: bool,
+) -> (AiRole, String, Vec<(String, String)>) {
     match msg {
-        AiTurnMessage::System { text } => (AiRole::System, text.clone()),
+        AiTurnMessage::System { text } => (AiRole::System, text.clone(), Vec::new()),
         AiTurnMessage::User { parts } => {
             let mut texts = Vec::new();
+            let mut images = Vec::new();
             let mut img_count = 0_usize;
             for part in parts {
                 match part {
                     AiContentPart::Text { text } => texts.push(text.clone()),
-                    AiContentPart::ImageData { .. } => img_count += 1,
+                    AiContentPart::ImageData {
+                        mime_type,
+                        base64_data,
+                    } => {
+                        img_count += 1;
+                        if omit_fallback_note_when_extracted {
+                            images.push((mime_type.clone(), base64_data.clone()));
+                        }
+                    }
                 }
             }
-            if img_count > 0 {
+            if img_count > 0 && !omit_fallback_note_when_extracted {
                 texts.push(format!(
                     "[{img_count} image(s) attached; provider text-fallback]"
                 ));
             }
-            (AiRole::User, texts.join("\n"))
+            (AiRole::User, texts.join("\n"), images)
         }
-        AiTurnMessage::Assistant { text, tool_calls } => {
+        AiTurnMessage::Assistant {
+            text, tool_calls, ..
+        } => {
             if tool_calls.is_empty() {
-                (AiRole::Assistant, text.clone().unwrap_or_default())
+                (
+                    AiRole::Assistant,
+                    text.clone().unwrap_or_default(),
+                    Vec::new(),
+                )
             } else {
                 let payload = serde_json::json!({
                     "message": text,
                     "tool_calls": tool_calls,
                 });
-                (AiRole::Assistant, payload.to_string())
+                (AiRole::Assistant, payload.to_string(), Vec::new())
             }
         }
         AiTurnMessage::ToolResult {
@@ -1399,6 +1637,7 @@ fn render_turn_message_as_text(msg: &AiTurnMessage) -> (AiRole, String) {
             (
                 AiRole::User,
                 format!("[ToolResult {name} id={tool_call_id} status={status}]\n{content_json}"),
+                Vec::new(),
             )
         }
     }
@@ -1426,6 +1665,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                     id,
                     name: name.to_owned(),
                     arguments,
+                    thought_signature: None,
                 });
             }
         }
@@ -1436,6 +1676,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
                 .map(ToOwned::to_owned);
             return AiAgentTurnResponse {
                 text: note,
+                thinking_blocks: Vec::new(),
                 tool_calls: parsed_calls,
                 model: model.to_owned(),
                 finish_reason: Some("tool_calls".to_owned()),
@@ -1446,6 +1687,7 @@ pub(crate) fn parse_fallback_agent_response(raw_text: &str, model: &str) -> AiAg
 
     AiAgentTurnResponse {
         text: (!raw_text.trim().is_empty()).then(|| raw_text.to_owned()),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         model: model.to_owned(),
         finish_reason: Some("stop".to_owned()),
@@ -1571,16 +1813,19 @@ mod tests {
                 },
                 AiTurnMessage::Assistant {
                     text: Some("確認します".to_owned()),
+                    thinking_blocks: Vec::new(),
                     tool_calls: vec![
                         AiToolCall {
                             id: "c1".to_owned(),
                             name: "get_timeline_summary".to_owned(),
                             arguments: serde_json::json!({}),
+                            thought_signature: None,
                         },
                         AiToolCall {
                             id: "c2".to_owned(),
                             name: "get_capabilities".to_owned(),
                             arguments: serde_json::json!({ "include_schemas": true }),
+                            thought_signature: None,
                         },
                     ],
                 },
@@ -1642,5 +1887,65 @@ mod tests {
                 .contains("[ToolResult get_capabilities id=c2 status=OK]")
         );
         Ok(())
+    }
+
+    #[test]
+    fn runtime_settings_deserialize_with_backward_compatible_vision_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy_json = r#"{"max_steps_per_turn":15,"min_llm_interval_ms":250,"vision_batch_size":4,"vision_max_edge_px":512}"#;
+        let parsed: AgentRuntimeSettings = serde_json::from_str(legacy_json)?;
+        assert_eq!(parsed.vision_packing_mode, VisionPackingMode::ContactSheet);
+        assert_eq!(parsed.vision_jpeg_quality, 68);
+        assert_eq!(parsed.vision_contact_sheet_cols, 3);
+        assert_eq!(parsed.vision_contact_sheet_rows, 2);
+        assert_eq!(parsed.vision_contact_sheet_tile_px, 320);
+        Ok(())
+    }
+
+    #[test]
+    fn split_fallback_preserves_image_note_on_history_user_turns() {
+        let msgs_with_tool_tail = vec![
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("最初の画像を見て"),
+                    AiContentPart::image_bytes("image/jpeg", b"img1"),
+                ],
+            },
+            AiTurnMessage::ToolResult {
+                tool_call_id: "c1".to_owned(),
+                name: "noop".to_owned(),
+                content_json: "{}".to_owned(),
+                is_error: false,
+            },
+        ];
+        let (hist1, _prompt1, imgs1) =
+            split_fallback_messages_and_prompt(&msgs_with_tool_tail, true);
+        assert_eq!(imgs1.len(), 0);
+        assert_eq!(hist1.len(), 1);
+        assert!(hist1[0].content.contains("provider text-fallback"));
+
+        let msgs_with_new_user = vec![
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("1枚目"),
+                    AiContentPart::image_bytes("image/jpeg", b"img1"),
+                ],
+            },
+            AiTurnMessage::Assistant {
+                text: Some("確認しました".to_owned()),
+                thinking_blocks: Vec::new(),
+                tool_calls: Vec::new(),
+            },
+            AiTurnMessage::User {
+                parts: vec![
+                    AiContentPart::text("2枚目"),
+                    AiContentPart::image_bytes("image/jpeg", b"img2"),
+                ],
+            },
+        ];
+        let (hist2, prompt2, imgs2) = split_fallback_messages_and_prompt(&msgs_with_new_user, true);
+        assert_eq!(imgs2.len(), 1);
+        assert!(hist2[0].content.contains("provider text-fallback"));
+        assert!(!prompt2.contains("provider text-fallback"));
     }
 }

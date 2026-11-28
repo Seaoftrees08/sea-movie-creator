@@ -17,8 +17,8 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable as _,
     InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton,
-    MouseMoveEvent, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    Subscription, Window, WindowBounds, WindowOptions, div, px, rgba, size,
+    MouseMoveEvent, ParentElement as _, PathPromptOptions, Render, ScrollHandle, SharedString,
+    Styled as _, Subscription, Window, WindowBounds, WindowOptions, div, px, rgba, size,
 };
 
 use crate::core::ids::{AssetId, LayerId};
@@ -51,14 +51,15 @@ use crate::ui::menu_bar::{
     PreviewZoom50Action, PreviewZoom100Action, PreviewZoom200Action, PreviewZoomFitAction, QuitApp,
     RedoAction, ReloadLanguagePacksAction, RemoveMidpointAction, RotateLeftAction,
     RotateRightAction, SaveProject, SaveProjectAs, SeekEnd, SeekStart, SelectAllClips,
-    SelectLanguageAction, SetSelectionEndAction, SetSelectionStartAction, SetTimelineLengthAction,
-    ShowTabAiChatAction, ShowTabClipInspectorAction, ShowTabLayerListAction,
-    ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip, StepBackHalfSecAction,
-    StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame, StopPlaybackAction,
-    TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction, TogglePlayPause,
-    TogglePreviewGridAction, TogglePreviewGuidesAction, TogglePreviewWaveformAction,
-    ToggleReturnToStartOnStopAction, UndoAction, apply_key_config_bindings, setup_menus,
-    update_app_menus,
+    SelectLanguageAction, SetPlayheadFollowCenterAction, SetPlayheadFollowOffAction,
+    SetPlayheadFollowPageAction, SetSelectionEndAction, SetSelectionStartAction,
+    SetTimelineLengthAction, ShowTabAiChatAction, ShowTabClipInspectorAction,
+    ShowTabLayerListAction, ShowTabProjectInfoAction, SnapTimelineLengthAutoAction, SplitClip,
+    StepBackHalfSecAction, StepBackOneFrame, StepForwardHalfSecAction, StepForwardOneFrame,
+    StopPlaybackAction, TimelineZoomIn, TimelineZoomOut, ToggleFollowSelectedOnSeekAction,
+    TogglePlayPause, TogglePreviewGridAction, TogglePreviewGuidesAction,
+    TogglePreviewWaveformAction, ToggleReturnToStartOnStopAction, UndoAction,
+    apply_key_config_bindings, setup_menus, update_app_menus,
 };
 use crate::ui::preview::DragModifiers;
 use crate::ui::preview_panel::render_preview_panel;
@@ -144,6 +145,8 @@ pub struct SeaEditorWindow {
     pub(crate) workspace_focus: FocusHandle,
     /// AI チャット履歴（テキスト選択中）のショートカット誤発火防止用フォーカスハンドル。
     pub(crate) ai_chat_history_focus: FocusHandle,
+    /// AI チャット履歴の明示スクロールハンドル（質問カード表示・新ターン追加時の自動追従用）。
+    pub(crate) ai_chat_scroll_handle: ScrollHandle,
     /// プレビュー領域ポインタ・パン修飾入力モード。
     pub(crate) preview_pointer_mode: PreviewPointerInputMode,
     /// 直近のポインタウィンドウ座標 (px)。
@@ -165,6 +168,9 @@ impl SeaEditorWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut controller = AppController::new();
+        if let Some(prefs_path) = crate::core::user_config_file_path("editor_prefs.json") {
+            controller.load_editor_prefs_from(prefs_path);
+        }
         controller.ai_chat.enable_user_session_store();
         controller.try_start_audio_output();
         if let Some(path) = open_project
@@ -245,6 +251,7 @@ impl SeaEditorWindow {
             font_select_needs_refresh: false,
             workspace_focus,
             ai_chat_history_focus,
+            ai_chat_scroll_handle: ScrollHandle::new(),
             preview_pointer_mode: PreviewPointerInputMode::Idle,
             last_mouse_window: (0.0, 0.0),
             dynamic_input_sub: None,
@@ -787,6 +794,7 @@ impl SeaEditorWindow {
                 waveform: self.controller.show_preview_waveform,
             },
             follow_selected_on_seek: self.controller.follow_selected_on_seek,
+            playhead_follow_mode: self.controller.playhead_follow_mode,
             return_to_start_on_stop: self.controller.return_playhead_to_start_on_stop,
             preview_zoom: self.controller.preview_zoom,
             right_tab: self.controller.right_tab,
@@ -891,6 +899,19 @@ impl SeaEditorWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        match self.controller.ai_chat.take_scroll_request() {
+            crate::ui::ai_chat_panel::ChatScrollRequest::None => {}
+            crate::ui::ai_chat_panel::ChatScrollRequest::ForceBottom => {
+                self.ai_chat_scroll_handle.scroll_to_bottom();
+            }
+            crate::ui::ai_chat_panel::ChatScrollRequest::StickyIfNearBottom => {
+                let max_y = f32::from(self.ai_chat_scroll_handle.max_offset().y).max(0.0);
+                let offset_y = f32::from(self.ai_chat_scroll_handle.offset().y);
+                if max_y <= 1.0 || (max_y + offset_y) <= 48.0 {
+                    self.ai_chat_scroll_handle.scroll_to_bottom();
+                }
+            }
+        }
         let win_w = f32::from(window.viewport_size().width).max(DEFAULT_WINDOW_WIDTH);
         let default_right_w = clamp_right_panel_width(win_w, self.controller.right_panel_width);
         self.controller.timeline_viewport_canvas_width_px =
@@ -956,6 +977,7 @@ impl SeaEditorWindow {
                                 .as_ref()
                                 .map_or(&[][..], |(_, list)| list.as_slice()),
                             ai_chat_history_focus: &self.ai_chat_history_focus,
+                            ai_chat_scroll_handle: &self.ai_chat_scroll_handle,
                         },
                         cx,
                     )),
@@ -1163,6 +1185,29 @@ impl SeaEditorWindow {
                     cx.notify();
                 }),
             )
+            .on_action(cx.listener(|this, _: &SetPlayheadFollowPageAction, _, cx| {
+                this.controller.set_playhead_follow_mode(
+                    crate::ui::editor_prefs::TimelinePlayheadFollowMode::Page,
+                );
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &SetPlayheadFollowCenterAction, _, cx| {
+                    this.controller.set_playhead_follow_mode(
+                        crate::ui::editor_prefs::TimelinePlayheadFollowMode::Center,
+                    );
+                    this.reload_app_menus(cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SetPlayheadFollowOffAction, _, cx| {
+                this.controller.set_playhead_follow_mode(
+                    crate::ui::editor_prefs::TimelinePlayheadFollowMode::Off,
+                );
+                this.reload_app_menus(cx);
+                cx.notify();
+            }))
             .on_action(
                 cx.listener(|this, _: &ToggleReturnToStartOnStopAction, _, cx| {
                     this.controller.toggle_return_playhead_to_start_on_stop();
