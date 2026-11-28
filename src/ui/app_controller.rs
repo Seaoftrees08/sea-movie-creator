@@ -1406,7 +1406,13 @@ impl AppController {
         {
             if self.last_rendered_frame != Some(now_frame.get()) {
                 self.apply_follow_selected_on_seek();
-                if self.playback_state == PlaybackState::Playing || reached_end {
+                let is_ruler_scrubbing = matches!(
+                    self.timeline_gesture,
+                    Some(crate::ui::timeline::state::TimelinePointerGesture::RulerScrub)
+                );
+                if !is_ruler_scrubbing
+                    && (self.playback_state == PlaybackState::Playing || reached_end)
+                {
                     self.ensure_playhead_visible_in_timeline(false);
                 }
             }
@@ -4598,6 +4604,40 @@ mod tests {
         controller.seek_to_frame(FrameIndex::new(109));
         assert_eq!(controller.timeline_scroll_x_frames, 108);
         let _ = FrameCount::new(1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tick_playback_skips_auto_scroll_during_ruler_scrub() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::core::ids::LayerId;
+        use crate::core::time::FrameCount;
+        use crate::timeline::document::{Layer, TimelineLengthMode};
+        use crate::ui::editor_prefs::TimelinePlayheadFollowMode;
+        use crate::ui::timeline::state::TimelinePointerGesture;
+
+        let mut controller = AppController::new();
+        controller.timeline_viewport_canvas_width_px = 600.0;
+        controller.timeline_px_per_frame = 2.0; // visible = 300f
+        controller
+            .document
+            .layers
+            .push(Layer::new(LayerId::new("L_SCRUB")?, "Track"));
+        controller.document.timeline_length = TimelineLengthMode::Manual {
+            end_frame: FrameCount::new(1800)?,
+        };
+        controller.playhead_follow_mode = TimelinePlayheadFollowMode::Center;
+        controller.seek_to_frame(FrameIndex::new(600));
+        controller.play();
+        controller.timeline_scroll_x_frames = 0;
+        controller.timeline_gesture = Some(TimelinePointerGesture::RulerScrub);
+
+        controller.tick_playback(0.1);
+        assert_eq!(controller.timeline_scroll_x_frames, 0);
+
+        controller.timeline_gesture = None;
+        controller.tick_playback(0.1);
+        assert!(controller.timeline_scroll_x_frames > 0);
         Ok(())
     }
 

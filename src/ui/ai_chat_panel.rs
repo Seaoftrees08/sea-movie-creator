@@ -799,7 +799,8 @@ impl AiChatState {
     }
 
     /// ステップ上限・呼出間隔設定を更新・保存し、常駐エージェントにも即時反映する。
-    pub fn apply_runtime_settings(&mut self, settings: AgentRuntimeSettings) {
+    pub fn apply_runtime_settings(&mut self, mut settings: AgentRuntimeSettings) {
+        settings = settings.sanitized();
         self.runtime_settings = settings.clone();
         self.user_settings.runtime = settings;
         if let Some(store) = &self.session_store {
@@ -1622,7 +1623,6 @@ impl AppController {
             self.ai_chat.session_title = AiSessionStore::derive_title_from_prompt(&trimmed);
         }
         self.ai_chat.persist_session();
-        self.ai_chat.live_activity.begin_turn();
         let phase = tr("ai.status_responding");
         self.ai_chat.status_banner.clone_from(&phase);
         self.ai_chat.execution_state = AiExecutionState::Responding {
@@ -2291,6 +2291,8 @@ impl AppController {
                                 &mut pending_thought,
                             );
                             self.ai_chat.live_activity.on_activity_hint(&l);
+                            self.ai_chat
+                                .request_scroll(ChatScrollRequest::StickyIfNearBottom);
                         }
                         AiStreamEvent::Completed(resp) => completed = Some(resp),
                         AiStreamEvent::Failed(err) => failed = Some(err),
@@ -2641,6 +2643,12 @@ impl AppController {
         message: &str,
         recoverable: bool,
     ) -> (bool, bool) {
+        if code == "pending_interaction" {
+            let formatted = format!("[{code}] {message}");
+            self.ai_chat.last_error = Some(formatted);
+            self.ai_chat.status_banner = format!("確認待ち: {message}");
+            return (false, false);
+        }
         let activity = self
             .ai_chat
             .live_activity
@@ -5286,6 +5294,75 @@ mod tests {
             controller.ai_chat.turns.last().and_then(|t| t.status_badge),
             Some(AiTurnBadge::Error)
         );
+        assert_eq!(
+            controller.ai_chat.take_scroll_request(),
+            ChatScrollRequest::StickyIfNearBottom
+        );
+    }
+
+    #[test]
+    fn pending_interaction_preserves_cards_runtime_sanitizes_and_activity_hint_scrolls() {
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+        use super::{AiChatJobHandle, AiExecutionState, ChatScrollRequest};
+        use crate::ai::agent_host::AgentHostEvent;
+        use crate::ai::provider::{AgentRuntimeSettings, AiStreamEvent};
+
+        let mut controller = AppController::new();
+        // 1) pending_interaction エラー受信時は待機中の承認カードを破棄せず WaitingApproval を維持する
+        controller.handle_agent_host_event(AgentHostEvent::ToolApprovalRequired {
+            request_id: "req_pending".to_owned(),
+            tool_name: "apply_draft_edit_command".to_owned(),
+            arguments: serde_json::json!({}),
+            description: "desc".to_owned(),
+        });
+        assert!(controller.ai_chat.pending_tool_approval.is_some());
+        let _ = controller.ai_chat.take_scroll_request();
+
+        let (did_exit, persist) = controller.handle_agent_error_event(
+            "pending_interaction",
+            "確認カードの操作完了まで追加指示を受け付けられません",
+            true,
+        );
+        assert!(!did_exit);
+        assert!(!persist);
+        assert!(controller.ai_chat.pending_tool_approval.is_some());
+        assert!(matches!(
+            controller.ai_chat.execution_state,
+            AiExecutionState::WaitingApproval { .. }
+        ));
+        assert!(controller.ai_chat.status_banner.contains("確認待ち"));
+
+        // 2) apply_runtime_settings が範囲外値を sanitized() で丸めて保持する
+        controller
+            .ai_chat
+            .apply_runtime_settings(AgentRuntimeSettings {
+                vision_jpeg_quality: 5,
+                vision_contact_sheet_cols: 99,
+                ..AgentRuntimeSettings::default()
+            });
+        assert_eq!(controller.ai_chat.runtime_settings.vision_jpeg_quality, 40);
+        assert_eq!(
+            controller
+                .ai_chat
+                .runtime_settings
+                .vision_contact_sheet_cols,
+            4
+        );
+
+        // 3) poll_running_job の ActivityHint で StickyIfNearBottom が要求される
+        let (tx, rx) = mpsc::channel();
+        controller.ai_chat.running_job = Some(AiChatJobHandle {
+            rx,
+            prompt: "test".to_owned(),
+            estimated_input_chars: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        tx.send(AiStreamEvent::ActivityHint("検索中".to_owned()))
+            .ok();
+        let (changed, early) = controller.poll_running_job();
+        assert!(changed);
+        assert!(early.is_none());
         assert_eq!(
             controller.ai_chat.take_scroll_request(),
             ChatScrollRequest::StickyIfNearBottom
